@@ -1,0 +1,412 @@
+/**
+ * PeakInsights — Backend Test Suite
+ *
+ * Run:  npx jest --testPathPattern=tests/
+ *
+ * Setup:
+ *   npm install --save-dev jest @types/jest ts-jest supertest @types/supertest
+ *   npm install --save-dev mongodb-memory-server
+ *
+ * jest.config.ts:
+ *   export default {
+ *     preset: 'ts-jest',
+ *     testEnvironment: 'node',
+ *     setupFilesAfterFramework: ['./tests/setup.ts'],
+ *   };
+ */
+
+import mongoose from 'mongoose';
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import { TaskModel } from '../models/Task';
+import { DocumentModel } from '../models/Document';
+import { User } from '../models/User';
+import { SupervisorMapping } from '../models/SupervisorMapping';
+import { MessageModel } from '../models/Message';
+import { calculateTAT, calculateEfficiencyRatio } from '../utils/tatCalculator';
+
+let mongod: MongoMemoryServer;
+
+// ─── Setup / Teardown ─────────────────────────────────────────────
+beforeAll(async () => {
+  mongod = await MongoMemoryServer.create();
+  await mongoose.connect(mongod.getUri());
+});
+
+afterAll(async () => {
+  await mongoose.disconnect();
+  await mongod.stop();
+});
+
+afterEach(async () => {
+  // Clean all collections between tests
+  const collections = mongoose.connection.collections;
+  for (const key in collections) {
+    await collections[key].deleteMany({});
+  }
+});
+
+// ─── Helpers ──────────────────────────────────────────────────────
+async function createUser(overrides: Partial<{
+  name: string; email: string; role: string; isActive: boolean;
+}> = {}) {
+  return User.create({
+    name:      overrides.name      ?? 'Test User',
+    email:     overrides.email     ?? `user_${Date.now()}@test.com`,
+    password:  'password123',
+    role:      overrides.role      ?? 'user',
+    isActive:  overrides.isActive  ?? true,
+    accountStatus: 'active',
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 1. TAT / EFFICIENCY UTILITIES
+// ═══════════════════════════════════════════════════════════════════
+describe('TAT Calculator', () => {
+  test('calculates TAT in minutes between two dates', () => {
+    const start = new Date('2024-01-01T09:00:00Z');
+    const end   = new Date('2024-01-01T11:30:00Z');
+    expect(calculateTAT(start, end)).toBe(150);
+  });
+
+  test('returns minimum 1 minute for same-moment start/end', () => {
+    const t = new Date();
+    expect(calculateTAT(t, t)).toBe(1);
+  });
+
+  test('efficiency > 1.0 when completed faster than target', () => {
+    const ratio = calculateEfficiencyRatio(120, 60); // target 2h, took 1h
+    expect(ratio).toBeGreaterThan(1);
+    expect(ratio).toBeCloseTo(2.0, 3);
+  });
+
+  test('efficiency < 1.0 when completed slower than target', () => {
+    const ratio = calculateEfficiencyRatio(60, 120); // target 1h, took 2h
+    expect(ratio).toBeLessThan(1);
+    expect(ratio).toBeCloseTo(0.5, 3);
+  });
+
+  test('efficiency = 1.0 when exactly on target', () => {
+    const ratio = calculateEfficiencyRatio(90, 90);
+    expect(ratio).toBe(1);
+  });
+
+  test('returns 0 when actual time is 0', () => {
+    expect(calculateEfficiencyRatio(60, 0)).toBe(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 2. TASK MODEL — TAT appraisal fields
+// ═══════════════════════════════════════════════════════════════════
+describe('Task Model', () => {
+  test('creates a task with required fields', async () => {
+    const ceo  = await createUser({ role: 'ceo',  email: 'ceo@test.com' });
+    const user = await createUser({ role: 'user', email: 'u@test.com' });
+
+    const task = await TaskModel.create({
+      title:      'Review Q3 report',
+      assignedBy: ceo._id,
+      assignedTo: user._id,
+      priority:   'high',
+      status:     'pending',
+    });
+
+    expect(task.title).toBe('Review Q3 report');
+    expect(task.status).toBe('pending');
+    expect(task.tatMinutes).toBeUndefined();
+    expect(task.efficiencyRatio).toBeUndefined();
+  });
+
+  test('TAT is calculated when task transitions to completed', async () => {
+    const ceo  = await createUser({ role: 'ceo',  email: 'ceo2@test.com' });
+    const user = await createUser({ role: 'user', email: 'u2@test.com' });
+
+    const start = new Date(Date.now() - 3 * 60 * 60 * 1000); // 3 hours ago
+
+    const task = await TaskModel.create({
+      title:         'Write test cases',
+      assignedBy:    ceo._id,
+      assignedTo:    user._id,
+      status:        'in_progress',
+      startedAt:     start,
+      targetMinutes: 120,
+    });
+
+    // Simulate completion
+    const end = new Date();
+    task.completedAt    = end;
+    task.tatMinutes     = calculateTAT(start, end);
+    task.efficiencyRatio = calculateEfficiencyRatio(120, task.tatMinutes);
+    task.status = 'completed';
+    await task.save();
+
+    const saved = await TaskModel.findById(task._id);
+    expect(saved!.status).toBe('completed');
+    expect(saved!.tatMinutes).toBeGreaterThan(0);
+    expect(saved!.efficiencyRatio).toBeDefined();
+    // Target was 2h, task took 3h → efficiency < 1
+    expect(saved!.efficiencyRatio!).toBeLessThan(1);
+  });
+
+  test('efficiency is not set when no targetMinutes provided', async () => {
+    const ceo  = await createUser({ role: 'ceo',  email: 'ceo3@test.com' });
+    const user = await createUser({ role: 'user', email: 'u3@test.com' });
+
+    const start = new Date(Date.now() - 60 * 60 * 1000);
+
+    const task = await TaskModel.create({
+      title: 'Ad-hoc task', assignedBy: ceo._id, assignedTo: user._id,
+      status: 'in_progress', startedAt: start,
+      // No targetMinutes
+    });
+
+    task.completedAt = new Date();
+    task.tatMinutes  = calculateTAT(start, task.completedAt);
+    task.status      = 'completed';
+    await task.save();
+
+    const saved = await TaskModel.findById(task._id);
+    expect(saved!.tatMinutes).toBeGreaterThan(0);
+    expect(saved!.efficiencyRatio).toBeUndefined();
+  });
+
+  test('task requires title and assignedBy/assignedTo', async () => {
+    await expect(TaskModel.create({ status: 'pending' })).rejects.toThrow();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 3. DOCUMENT MODEL — CRUD operations
+// ═══════════════════════════════════════════════════════════════════
+describe('Document Model', () => {
+  test('creates a working document with in_progress status', async () => {
+    const user = await createUser({ email: 'docowner@test.com' });
+
+    const doc = await DocumentModel.create({
+      title:        'Contract Draft',
+      fileType:     'application/pdf',
+      documentType: 'working',
+      status:       'in_progress',
+      startTime:    new Date(),
+      ownerId:      user._id,
+      currentVersion: 1,
+      versionHistory: [{
+        versionNumber: 1,
+        fileName: 'contract.pdf',
+        fileKey:  'uuid-contract.pdf',
+        fileUrl:  'http://localhost:5000/uploads/uuid-contract.pdf',
+        fileSize: 12345,
+        fileType: 'application/pdf',
+        modifiedBy: user._id,
+        modifiedAt: new Date(),
+        changeNote: 'Initial upload',
+      }],
+    });
+
+    expect(doc.documentType).toBe('working');
+    expect(doc.status).toBe('in_progress');
+    expect(doc.startTime).toBeDefined();
+  });
+
+  test('storage document has no startTime or TAT fields', async () => {
+    const user = await createUser({ email: 'storageowner@test.com' });
+
+    const doc = await DocumentModel.create({
+      title: 'Archive File', fileType: 'application/pdf',
+      documentType: 'storage', status: 'draft', ownerId: user._id,
+      currentVersion: 1, versionHistory: [],
+    });
+
+    expect(doc.startTime).toBeUndefined();
+    expect(doc.tatMinutes).toBeUndefined();
+  });
+
+  test('owner can be set and retrieved correctly', async () => {
+    const user = await createUser({ email: 'ownercheck@test.com' });
+
+    const doc = await DocumentModel.create({
+      title: 'Owner Test', fileType: 'text/plain',
+      documentType: 'working', status: 'draft',
+      ownerId: user._id, currentVersion: 1, versionHistory: [],
+    });
+
+    const found = await DocumentModel.findById(doc._id).populate('ownerId', 'name email');
+    expect((found!.ownerId as unknown as { email: string }).email).toBe('ownercheck@test.com');
+  });
+
+  test('accessControlList tracks collaborators', async () => {
+    const owner = await createUser({ email: 'owner@test.com' });
+    const collab = await createUser({ email: 'collab@test.com' });
+
+    const doc = await DocumentModel.create({
+      title: 'Collab Doc', fileType: 'text/plain',
+      documentType: 'working', status: 'in_progress',
+      ownerId: owner._id,
+      accessControlList: [collab._id],
+      currentVersion: 1, versionHistory: [],
+    });
+
+    expect(doc.accessControlList).toHaveLength(1);
+    expect(doc.accessControlList[0].toString()).toBe(collab._id.toString());
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 4. SUPERVISOR MAPPING — role hierarchy
+// ═══════════════════════════════════════════════════════════════════
+describe('Supervisor Mapping', () => {
+  test('creates an active mapping between supervisor and user', async () => {
+    const sup  = await createUser({ role: 'supervisor', email: 'sup@test.com' });
+    const user = await createUser({ role: 'user',       email: 'mapped@test.com' });
+
+    const mapping = await SupervisorMapping.create({
+      supervisorId:  sup._id,
+      subordinateId: user._id,
+      status:        'active',
+      assignmentDate: new Date(),
+    });
+
+    expect(mapping.status).toBe('active');
+  });
+
+  test('archiving a mapping sets it to historical', async () => {
+    const sup  = await createUser({ role: 'supervisor', email: 'sup2@test.com' });
+    const user = await createUser({ role: 'user',       email: 'mapped2@test.com' });
+
+    const mapping = await SupervisorMapping.create({
+      supervisorId:  sup._id,
+      subordinateId: user._id,
+      status:        'active',
+      assignmentDate: new Date(),
+    });
+
+    mapping.status = 'historical';
+    mapping.deactivationDate = new Date();
+    await mapping.save();
+
+    const found = await SupervisorMapping.findById(mapping._id);
+    expect(found!.status).toBe('historical');
+    expect(found!.deactivationDate).toBeDefined();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 5. MESSAGE MODEL — communication rules
+// ═══════════════════════════════════════════════════════════════════
+describe('Message Model', () => {
+  test('creates a message between two users', async () => {
+    const sender   = await createUser({ email: 'sender@test.com' });
+    const receiver = await createUser({ email: 'receiver@test.com' });
+
+    const msg = await MessageModel.create({
+      senderId:   sender._id,
+      receiverId: receiver._id,
+      subject:    'Hello',
+      body:       'Can you review this document?',
+    });
+
+    expect(msg.isRead).toBe(false);
+    expect(msg.body).toBe('Can you review this document?');
+  });
+
+  test('message can be marked as read', async () => {
+    const sender   = await createUser({ email: 'sender2@test.com' });
+    const receiver = await createUser({ email: 'receiver2@test.com' });
+
+    const msg = await MessageModel.create({
+      senderId: sender._id, receiverId: receiver._id, body: 'Test',
+    });
+
+    msg.isRead = true;
+    msg.readAt = new Date();
+    await msg.save();
+
+    const found = await MessageModel.findById(msg._id);
+    expect(found!.isRead).toBe(true);
+    expect(found!.readAt).toBeDefined();
+  });
+
+  test('reply links to parent via parentId', async () => {
+    const a = await createUser({ email: 'a@test.com' });
+    const b = await createUser({ email: 'b@test.com' });
+
+    const parent = await MessageModel.create({
+      senderId: a._id, receiverId: b._id, body: 'Original message',
+    });
+
+    const reply = await MessageModel.create({
+      senderId: b._id, receiverId: a._id,
+      body:     'Reply here',
+      parentId: parent._id,
+    });
+
+    expect(reply.parentId!.toString()).toBe(parent._id.toString());
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// 6. APPRAISAL AGGREGATION
+// ═══════════════════════════════════════════════════════════════════
+describe('Task appraisal aggregation', () => {
+  test('correctly aggregates avg efficiency for a user', async () => {
+    const ceo  = await createUser({ role: 'ceo',  email: 'ceoappraise@test.com' });
+    const user = await createUser({ role: 'user', email: 'appraisee@test.com' });
+
+    // Three completed tasks with known efficiency
+    await TaskModel.insertMany([
+      {
+        title: 'T1', assignedBy: ceo._id, assignedTo: user._id,
+        status: 'completed', priority: 'medium',
+        targetMinutes: 60, tatMinutes: 30, efficiencyRatio: 2.0, // fast
+        startedAt: new Date(), completedAt: new Date(),
+      },
+      {
+        title: 'T2', assignedBy: ceo._id, assignedTo: user._id,
+        status: 'completed', priority: 'high',
+        targetMinutes: 60, tatMinutes: 60, efficiencyRatio: 1.0, // on time
+        startedAt: new Date(), completedAt: new Date(),
+      },
+      {
+        title: 'T3', assignedBy: ceo._id, assignedTo: user._id,
+        status: 'completed', priority: 'low',
+        targetMinutes: 60, tatMinutes: 120, efficiencyRatio: 0.5, // slow
+        startedAt: new Date(), completedAt: new Date(),
+      },
+    ]);
+
+    const result = await TaskModel.aggregate([
+      { $match: { assignedTo: user._id, status: 'completed' } },
+      { $group: { _id: null, avgEfficiency: { $avg: '$efficiencyRatio' }, count: { $sum: 1 } } },
+    ]);
+
+    expect(result[0].count).toBe(3);
+    expect(result[0].avgEfficiency).toBeCloseTo((2.0 + 1.0 + 0.5) / 3, 3);
+  });
+
+  test('on-time rate is 2/3 when 2 of 3 tasks met target', async () => {
+    const ceo  = await createUser({ role: 'ceo',  email: 'ceo2appraise@test.com' });
+    const user = await createUser({ role: 'user', email: 'appraisee2@test.com' });
+
+    await TaskModel.insertMany([
+      { title: 'A', assignedBy: ceo._id, assignedTo: user._id, status: 'completed', priority: 'medium', efficiencyRatio: 1.2, tatMinutes: 50, startedAt: new Date(), completedAt: new Date() },
+      { title: 'B', assignedBy: ceo._id, assignedTo: user._id, status: 'completed', priority: 'medium', efficiencyRatio: 0.8, tatMinutes: 75, startedAt: new Date(), completedAt: new Date() },
+      { title: 'C', assignedBy: ceo._id, assignedTo: user._id, status: 'completed', priority: 'medium', efficiencyRatio: 1.0, tatMinutes: 60, startedAt: new Date(), completedAt: new Date() },
+    ]);
+
+    const result = await TaskModel.aggregate([
+      { $match: { assignedTo: user._id, status: 'completed', efficiencyRatio: { $exists: true } } },
+      {
+        $group: {
+          _id: null,
+          total:      { $sum: 1 },
+          onTime:     { $sum: { $cond: [{ $gte: ['$efficiencyRatio', 1] }, 1, 0] } },
+        },
+      },
+      { $addFields: { onTimeRate: { $multiply: [{ $divide: ['$onTime', '$total'] }, 100] } } },
+    ]);
+
+    expect(result[0].onTime).toBe(2);
+    expect(result[0].onTimeRate).toBeCloseTo(66.67, 1);
+  });
+});

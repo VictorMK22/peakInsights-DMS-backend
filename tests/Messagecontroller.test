@@ -1,0 +1,214 @@
+// tests/messageController.test.ts
+import request from 'supertest';
+import mongoose from 'mongoose';
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import app from '../index';
+import { MessageModel } from '../models/Message';
+import { User } from '../models/User';
+import { SupervisorMapping } from '../models/SupervisorMapping';
+import { generateToken } from '../services/authService';
+
+let mongod: MongoMemoryServer;
+let ceoToken: string;
+let supervisorToken: string;
+let userToken: string;
+let otherUserToken: string;
+let ceoId: string;
+let supervisorId: string;
+let userId: string;
+let otherUserId: string;
+
+beforeAll(async () => {
+  mongod = await MongoMemoryServer.create();
+  await mongoose.connect(mongod.getUri());
+
+  const ceo = await User.create({ name: 'CEO', email: 'ceo@test.com', password: 'Password123!', role: 'ceo', accountStatus: 'active', isActive: true });
+  const sup  = await User.create({ name: 'Supervisor', email: 'sup@test.com', password: 'Password123!', role: 'supervisor', accountStatus: 'active', isActive: true });
+  const usr  = await User.create({ name: 'User', email: 'user@test.com', password: 'Password123!', role: 'user', accountStatus: 'active', isActive: true });
+  const usr2 = await User.create({ name: 'Other User', email: 'other@test.com', password: 'Password123!', role: 'user', accountStatus: 'active', isActive: true });
+
+  ceoId = ceo._id.toString(); supervisorId = sup._id.toString();
+  userId = usr._id.toString(); otherUserId = usr2._id.toString();
+
+  // usr → mapped to sup
+  await SupervisorMapping.create({ supervisorId: sup._id, subordinateId: usr._id, status: 'active', assignmentDate: new Date() });
+
+  ceoToken        = generateToken(ceo);
+  supervisorToken = generateToken(sup);
+  userToken       = generateToken(usr);
+  otherUserToken  = generateToken(usr2);
+});
+
+afterAll(async () => { await mongoose.disconnect(); await mongod.stop(); });
+afterEach(async () => { await MessageModel.deleteMany({}); });
+
+describe('POST /api/messages — communication rules', () => {
+  it('CEO can message any user', async () => {
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${ceoToken}`)
+      .send({ receiverId: userId, body: 'Hello from CEO', subject: 'Hi' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.success).toBe(true);
+  });
+
+  it('CEO can message any supervisor', async () => {
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${ceoToken}`)
+      .send({ receiverId: supervisorId, body: 'Supervisor check-in' });
+
+    expect(res.status).toBe(201);
+  });
+
+  it('Supervisor can message their team member', async () => {
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${supervisorToken}`)
+      .send({ receiverId: userId, body: 'Task update' });
+
+    expect(res.status).toBe(201);
+  });
+
+  it('Supervisor can message the CEO', async () => {
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${supervisorToken}`)
+      .send({ receiverId: ceoId, body: 'Report ready' });
+
+    expect(res.status).toBe(201);
+  });
+
+  it('Supervisor cannot message another supervisor', async () => {
+    const sup2 = await User.create({ name: 'Sup2', email: 'sup2@test.com', password: 'Password123!', role: 'supervisor', accountStatus: 'active', isActive: true });
+
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${supervisorToken}`)
+      .send({ receiverId: sup2._id.toString(), body: 'Hey peer' });
+
+    expect(res.status).toBe(403);
+  });
+
+  it('User can message their supervisor', async () => {
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ receiverId: supervisorId, body: 'Question about task' });
+
+    expect(res.status).toBe(201);
+  });
+
+  it('User cannot message another user directly', async () => {
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ receiverId: otherUserId, body: 'Hey!' });
+
+    expect(res.status).toBe(403);
+  });
+
+  it('User cannot message the CEO directly', async () => {
+    const res = await request(app)
+      .post('/api/messages')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ receiverId: ceoId, body: 'Hello CEO' });
+
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('GET /api/messages/inbox', () => {
+  it('Returns only messages addressed to the current user', async () => {
+    await MessageModel.create([
+      { senderId: supervisorId, receiverId: userId, body: 'For user' },
+      { senderId: ceoId, receiverId: supervisorId, body: 'For supervisor' },
+    ]);
+
+    const res = await request(app)
+      .get('/api/messages/inbox')
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.messages).toHaveLength(1);
+    expect(res.body.data.messages[0].body).toBe('For user');
+  });
+});
+
+describe('GET /api/messages/unread-count', () => {
+  it('Returns correct unread count', async () => {
+    await MessageModel.create([
+      { senderId: supervisorId, receiverId: userId, body: 'Unread 1', isRead: false },
+      { senderId: supervisorId, receiverId: userId, body: 'Unread 2', isRead: false },
+      { senderId: supervisorId, receiverId: userId, body: 'Read',    isRead: true },
+    ]);
+
+    const res = await request(app)
+      .get('/api/messages/unread-count')
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.unreadCount).toBe(2);
+  });
+});
+
+describe('PATCH /api/messages/:id/read', () => {
+  it('Marks a message as read', async () => {
+    const msg = await MessageModel.create({
+      senderId: supervisorId, receiverId: userId, body: 'Read me', isRead: false,
+    });
+
+    const res = await request(app)
+      .patch(`/api/messages/${msg._id}/read`)
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(200);
+    const updated = await MessageModel.findById(msg._id);
+    expect(updated?.isRead).toBe(true);
+    expect(updated?.readAt).toBeDefined();
+  });
+
+  it('Cannot mark someone else\'s message as read', async () => {
+    const msg = await MessageModel.create({
+      senderId: ceoId, receiverId: supervisorId, body: 'Not mine', isRead: false,
+    });
+
+    const res = await request(app)
+      .patch(`/api/messages/${msg._id}/read`)
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('GET /api/messages/thread/:id', () => {
+  it('Returns parent and replies for a thread participant', async () => {
+    const parent = await MessageModel.create({
+      senderId: supervisorId, receiverId: userId, body: 'Parent message',
+    });
+    await MessageModel.create({
+      senderId: userId, receiverId: supervisorId, body: 'Reply 1', parentId: parent._id,
+    });
+
+    const res = await request(app)
+      .get(`/api/messages/thread/${parent._id}`)
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.parent.body).toBe('Parent message');
+    expect(res.body.data.replies).toHaveLength(1);
+  });
+
+  it('Non-participant cannot read a thread', async () => {
+    const parent = await MessageModel.create({
+      senderId: ceoId, receiverId: supervisorId, body: 'Private thread',
+    });
+
+    const res = await request(app)
+      .get(`/api/messages/thread/${parent._id}`)
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(403);
+  });
+});

@@ -1,0 +1,310 @@
+// tests/taskController.test.ts
+import request from 'supertest';
+import mongoose from 'mongoose';
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import app from '../index';
+import { TaskModel } from '../models/Task';
+import { User } from '../models/User';
+import { SupervisorMapping } from '../models/SupervisorMapping';
+import { generateToken } from '../services/authService';
+
+let mongod: MongoMemoryServer;
+let ceoToken: string;
+let supervisorToken: string;
+let userToken: string;
+let ceoId: string;
+let supervisorId: string;
+let userId: string;
+let mappingId: string;
+
+beforeAll(async () => {
+  mongod = await MongoMemoryServer.create();
+  await mongoose.connect(mongod.getUri());
+
+  // Seed users
+  const ceo = await User.create({
+    name: 'CEO User', email: 'ceo@test.com', password: 'Password123!',
+    role: 'ceo', accountStatus: 'active', isActive: true,
+  });
+  const supervisor = await User.create({
+    name: 'Supervisor User', email: 'supervisor@test.com', password: 'Password123!',
+    role: 'supervisor', accountStatus: 'active', isActive: true,
+  });
+  const normalUser = await User.create({
+    name: 'Normal User', email: 'user@test.com', password: 'Password123!',
+    role: 'user', accountStatus: 'active', isActive: true,
+  });
+
+  ceoId        = ceo._id.toString();
+  supervisorId = supervisor._id.toString();
+  userId       = normalUser._id.toString();
+
+  // Create mapping so supervisor can assign to user
+  const mapping = await SupervisorMapping.create({
+    supervisorId: supervisor._id,
+    subordinateId: normalUser._id,
+    status: 'active',
+    assignmentDate: new Date(),
+  });
+  mappingId = mapping._id.toString();
+
+  ceoToken        = generateToken(ceo);
+  supervisorToken = generateToken(supervisor);
+  userToken       = generateToken(normalUser);
+});
+
+afterAll(async () => {
+  await mongoose.disconnect();
+  await mongod.stop();
+});
+
+afterEach(async () => {
+  await TaskModel.deleteMany({});
+});
+
+// ─── CREATE ───────────────────────────────────────────────────────
+
+describe('POST /api/tasks — createTask', () => {
+  it('CEO can assign task to any user', async () => {
+    const res = await request(app)
+      .post('/api/tasks')
+      .set('Authorization', `Bearer ${ceoToken}`)
+      .send({ assignedTo: userId, title: 'CEO Task', priority: 'high' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.success).toBe(true);
+    expect(res.body.data.task.title).toBe('CEO Task');
+    expect(res.body.data.task.status).toBe('pending');
+  });
+
+  it('Supervisor can assign task to their own team member', async () => {
+    const res = await request(app)
+      .post('/api/tasks')
+      .set('Authorization', `Bearer ${supervisorToken}`)
+      .send({ assignedTo: userId, title: 'Supervisor Task' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.task.assignedBy._id).toBe(supervisorId);
+  });
+
+  it('Supervisor cannot assign task to a non-team member', async () => {
+    const outsider = await User.create({
+      name: 'Outsider', email: 'outsider@test.com', password: 'Password123!',
+      role: 'user', accountStatus: 'active', isActive: true,
+    });
+
+    const res = await request(app)
+      .post('/api/tasks')
+      .set('Authorization', `Bearer ${supervisorToken}`)
+      .send({ assignedTo: outsider._id.toString(), title: 'Not Allowed' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.message).toMatch(/own team members/);
+  });
+
+  it('Normal user cannot assign tasks', async () => {
+    const res = await request(app)
+      .post('/api/tasks')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ assignedTo: supervisorId, title: 'User Task' });
+
+    expect(res.status).toBe(403);
+  });
+
+  it('Returns 400 when required fields are missing', async () => {
+    const res = await request(app)
+      .post('/api/tasks')
+      .set('Authorization', `Bearer ${ceoToken}`)
+      .send({ assignedTo: userId }); // missing title
+
+    expect(res.status).toBe(400);
+  });
+});
+
+// ─── STATUS TRANSITIONS + TAT ─────────────────────────────────────
+
+describe('PATCH /api/tasks/:id/status — TAT calculation', () => {
+  it('Assignee must set targetMinutes before starting a task', async () => {
+    const task = await TaskModel.create({
+      title: 'Test Task', assignedBy: supervisorId, assignedTo: userId, status: 'pending',
+    });
+
+    const res = await request(app)
+      .patch(`/api/tasks/${task._id}/status`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ status: 'in_progress' }); // no targetMinutes
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/targetMinutes/);
+  });
+
+  it('Moving to in_progress records startedAt and targetMinutes', async () => {
+    const task = await TaskModel.create({
+      title: 'Test Task', assignedBy: supervisorId, assignedTo: userId, status: 'pending',
+    });
+
+    const res = await request(app)
+      .patch(`/api/tasks/${task._id}/status`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ status: 'in_progress', targetMinutes: 60 });
+
+    expect(res.status).toBe(200);
+    const updated = res.body.data.task;
+    expect(updated.status).toBe('in_progress');
+    expect(updated.targetMinutes).toBe(60);
+    expect(updated.startedAt).toBeDefined();
+  });
+
+  it('Completing a task calculates tatMinutes and efficiencyRatio', async () => {
+    // Manually create a task already in progress with a known startedAt
+    const startedAt = new Date(Date.now() - 30 * 60 * 1000); // 30 minutes ago
+    const task = await TaskModel.create({
+      title: 'In Progress Task',
+      assignedBy: supervisorId,
+      assignedTo: userId,
+      status: 'in_progress',
+      targetMinutes: 60,
+      startedAt,
+    });
+
+    const res = await request(app)
+      .patch(`/api/tasks/${task._id}/status`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ status: 'completed' });
+
+    expect(res.status).toBe(200);
+    const updated = res.body.data.task;
+    expect(updated.status).toBe('completed');
+    expect(updated.tatMinutes).toBeGreaterThanOrEqual(29);
+    expect(updated.tatMinutes).toBeLessThanOrEqual(31);
+    // efficiencyRatio = 60 / ~30 ≈ 2.0 (finished in half the target time)
+    expect(updated.efficiencyRatio).toBeGreaterThan(1.5);
+    expect(updated.completedAt).toBeDefined();
+  });
+
+  it('Only assignee can start and complete tasks', async () => {
+    const task = await TaskModel.create({
+      title: 'Test Task', assignedBy: supervisorId, assignedTo: userId,
+      status: 'pending', targetMinutes: 60, startedAt: new Date(),
+    });
+
+    const res = await request(app)
+      .patch(`/api/tasks/${task._id}/status`)
+      .set('Authorization', `Bearer ${supervisorToken}`)
+      .send({ status: 'in_progress', targetMinutes: 60 });
+
+    expect(res.status).toBe(403);
+  });
+
+  it('Only assigner or CEO can cancel a task', async () => {
+    const task = await TaskModel.create({
+      title: 'Test Task', assignedBy: supervisorId, assignedTo: userId, status: 'pending',
+    });
+
+    // User (assignee) tries to cancel — should fail
+    const res = await request(app)
+      .patch(`/api/tasks/${task._id}/status`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ status: 'cancelled' });
+
+    expect(res.status).toBe(403);
+
+    // Supervisor (assigner) cancels — should succeed
+    const res2 = await request(app)
+      .patch(`/api/tasks/${task._id}/status`)
+      .set('Authorization', `Bearer ${supervisorToken}`)
+      .send({ status: 'cancelled' });
+
+    expect(res2.status).toBe(200);
+    expect(res2.body.data.task.status).toBe('cancelled');
+  });
+});
+
+// ─── LEADERBOARD ──────────────────────────────────────────────────
+
+describe('GET /api/tasks/analytics/leaderboard', () => {
+  it('Returns ranked list by efficiency ratio', async () => {
+    await TaskModel.create([
+      { title: 'Task 1', assignedBy: supervisorId, assignedTo: userId, status: 'completed',
+        targetMinutes: 60, tatMinutes: 30, efficiencyRatio: 2.0, startedAt: new Date(), completedAt: new Date() },
+      { title: 'Task 2', assignedBy: supervisorId, assignedTo: userId, status: 'completed',
+        targetMinutes: 60, tatMinutes: 90, efficiencyRatio: 0.667, startedAt: new Date(), completedAt: new Date() },
+    ]);
+
+    const res = await request(app)
+      .get('/api/tasks/analytics/leaderboard')
+      .set('Authorization', `Bearer ${ceoToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.leaderboard).toHaveLength(1); // grouped by user
+    expect(res.body.data.leaderboard[0].avgEfficiency).toBeCloseTo(1.333, 1);
+  });
+});
+
+// ─── APPRAISAL ────────────────────────────────────────────────────
+
+describe('GET /api/tasks/analytics/appraisal/:userId', () => {
+  it('Returns correct appraisal stats for a user', async () => {
+    await TaskModel.create([
+      { title: 'Done Fast', assignedBy: supervisorId, assignedTo: userId, status: 'completed',
+        targetMinutes: 60, tatMinutes: 45, efficiencyRatio: 1.333, startedAt: new Date(), completedAt: new Date() },
+      { title: 'Done Late', assignedBy: supervisorId, assignedTo: userId, status: 'completed',
+        targetMinutes: 60, tatMinutes: 80, efficiencyRatio: 0.75, startedAt: new Date(), completedAt: new Date() },
+      { title: 'Pending', assignedBy: supervisorId, assignedTo: userId, status: 'pending' },
+    ]);
+
+    const res = await request(app)
+      .get(`/api/tasks/analytics/appraisal/${userId}`)
+      .set('Authorization', `Bearer ${supervisorToken}`);
+
+    expect(res.status).toBe(200);
+    const { appraisal } = res.body.data;
+    expect(appraisal.totalTasks).toBe(3);
+    expect(appraisal.completedTasks).toBe(2);
+    expect(appraisal.onTimeTasks).toBe(1); // only the first (efficiency >= 1)
+    expect(appraisal.avgEfficiency).toBeCloseTo(1.042, 1);
+  });
+
+  it('User can only view their own appraisal', async () => {
+    const other = await User.create({
+      name: 'Other', email: 'other@test.com', password: 'Password123!',
+      role: 'user', accountStatus: 'active', isActive: true,
+    });
+
+    const res = await request(app)
+      .get(`/api/tasks/analytics/appraisal/${other._id}`)
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─── DELETE ───────────────────────────────────────────────────────
+
+describe('DELETE /api/tasks/:id', () => {
+  it('Assigner can delete their own task', async () => {
+    const task = await TaskModel.create({
+      title: 'To Delete', assignedBy: supervisorId, assignedTo: userId, status: 'pending',
+    });
+
+    const res = await request(app)
+      .delete(`/api/tasks/${task._id}`)
+      .set('Authorization', `Bearer ${supervisorToken}`);
+
+    expect(res.status).toBe(200);
+    const found = await TaskModel.findById(task._id);
+    expect(found).toBeNull();
+  });
+
+  it('Assignee cannot delete a task', async () => {
+    const task = await TaskModel.create({
+      title: 'Cannot Delete', assignedBy: supervisorId, assignedTo: userId, status: 'pending',
+    });
+
+    const res = await request(app)
+      .delete(`/api/tasks/${task._id}`)
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(403);
+  });
+});

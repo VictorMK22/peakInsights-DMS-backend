@@ -1,0 +1,182 @@
+// tests/authAndUser.test.ts
+import request from 'supertest';
+import mongoose from 'mongoose';
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import app from '../index';
+import { User } from '../models/User';
+import { generateToken } from '../services/authService';
+
+let mongod: MongoMemoryServer;
+let ceoToken: string;
+let supervisorToken: string;
+let userToken: string;
+
+beforeAll(async () => {
+  mongod = await MongoMemoryServer.create();
+  await mongoose.connect(mongod.getUri());
+
+  const ceo = await User.create({ name: 'CEO', email: 'ceo@test.com', password: 'Password123!', role: 'ceo', accountStatus: 'active', isActive: true });
+  const sup = await User.create({ name: 'Supervisor', email: 'sup@test.com', password: 'Password123!', role: 'supervisor', accountStatus: 'active', isActive: true });
+  const usr = await User.create({ name: 'User', email: 'user@test.com', password: 'Password123!', role: 'user', accountStatus: 'active', isActive: true });
+
+  ceoToken        = generateToken(ceo);
+  supervisorToken = generateToken(sup);
+  userToken       = generateToken(usr);
+});
+
+afterAll(async () => { await mongoose.disconnect(); await mongod.stop(); });
+
+// ─── Login ────────────────────────────────────────────────────────
+
+describe('POST /api/auth/login', () => {
+  it('Returns token on valid credentials', async () => {
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'ceo@test.com', password: 'Password123!' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.token).toBeDefined();
+    expect(res.body.data.user.role).toBe('ceo');
+  });
+
+  it('Returns 401 on wrong password', async () => {
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'ceo@test.com', password: 'WrongPass123!' });
+
+    expect(res.status).toBe(401);
+  });
+
+  it('Returns 403 for pending account', async () => {
+    await User.create({ name: 'Pending', email: 'pending@test.com', password: 'Password123!', role: 'user', accountStatus: 'pending', isActive: false });
+
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'pending@test.com', password: 'Password123!' });
+
+    expect(res.status).toBe(403);
+    expect(res.body.message).toMatch(/pending/i);
+  });
+});
+
+// ─── Registration ─────────────────────────────────────────────────
+
+describe('POST /api/users/register — self-registration', () => {
+  it('Creates a pending account (not active)', async () => {
+    const res = await request(app)
+      .post('/api/users/register')
+      .send({ name: 'New Person', email: 'new@test.com', password: 'Password123!' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.user.accountStatus).toBe('pending');
+    expect(res.body.data.user.isActive).toBe(false);
+    expect(res.body.data.user.role).toBe('user'); // always forced to user
+  });
+
+  it('Cannot register with an existing email', async () => {
+    const res = await request(app)
+      .post('/api/users/register')
+      .send({ name: 'Duplicate', email: 'ceo@test.com', password: 'Password123!' });
+
+    expect(res.status).toBe(409);
+  });
+});
+
+// ─── CEO-only account creation ────────────────────────────────────
+
+describe('POST /api/users/create-user — CEO creates user', () => {
+  it('CEO can create an immediately-active user account', async () => {
+    const res = await request(app)
+      .post('/api/users/create-user')
+      .set('Authorization', `Bearer ${ceoToken}`)
+      .send({ name: 'Direct User', email: 'direct@test.com', password: 'Password123!' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.user.accountStatus).toBe('active');
+    expect(res.body.data.user.isActive).toBe(true);
+  });
+
+  it('Supervisor cannot create user accounts', async () => {
+    const res = await request(app)
+      .post('/api/users/create-user')
+      .set('Authorization', `Bearer ${supervisorToken}`)
+      .send({ name: 'Sup Created', email: 'supcreated@test.com', password: 'Password123!' });
+
+    expect(res.status).toBe(403);
+  });
+
+  it('Normal user cannot create user accounts', async () => {
+    const res = await request(app)
+      .post('/api/users/create-user')
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ name: 'User Created', email: 'usercreated@test.com', password: 'Password123!' });
+
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('POST /api/users/supervisor — CEO creates supervisor', () => {
+  it('CEO can create a supervisor account', async () => {
+    const res = await request(app)
+      .post('/api/users/supervisor')
+      .set('Authorization', `Bearer ${ceoToken}`)
+      .send({ name: 'New Supervisor', email: 'newsup@test.com', password: 'Password123!' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.user.role).toBe('supervisor');
+    expect(res.body.data.user.isActive).toBe(true);
+  });
+
+  it('Supervisor cannot create supervisor accounts', async () => {
+    const res = await request(app)
+      .post('/api/users/supervisor')
+      .set('Authorization', `Bearer ${supervisorToken}`)
+      .send({ name: 'Peer Sup', email: 'peersup@test.com', password: 'Password123!' });
+
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─── CEO approve/reject ───────────────────────────────────────────
+
+describe('PATCH /api/users/:id/approve', () => {
+  it('CEO approves a pending user', async () => {
+    const pending = await User.create({ name: 'Pending2', email: 'p2@test.com', password: 'Password123!', role: 'user', accountStatus: 'pending', isActive: false });
+
+    const res = await request(app)
+      .patch(`/api/users/${pending._id}/approve`)
+      .set('Authorization', `Bearer ${ceoToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.user.accountStatus).toBe('active');
+    expect(res.body.data.user.isActive).toBe(true);
+  });
+
+  it('Supervisor cannot approve users', async () => {
+    const pending = await User.create({ name: 'Pending3', email: 'p3@test.com', password: 'Password123!', role: 'user', accountStatus: 'pending', isActive: false });
+
+    const res = await request(app)
+      .patch(`/api/users/${pending._id}/approve`)
+      .set('Authorization', `Bearer ${supervisorToken}`);
+
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─── GET /api/auth/me ─────────────────────────────────────────────
+
+describe('GET /api/auth/me', () => {
+  it('Returns current user for valid token', async () => {
+    const res = await request(app)
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${ceoToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.user.email).toBe('ceo@test.com');
+  });
+
+  it('Returns 401 for missing token', async () => {
+    const res = await request(app).get('/api/auth/me');
+    expect(res.status).toBe(401);
+  });
+});

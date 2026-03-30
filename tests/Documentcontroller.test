@@ -1,0 +1,446 @@
+/**
+ * documentController.test.ts
+ *
+ * Covers:
+ *   - Document upload (single file)
+ *   - Metadata CRUD (update title/desc, delete document)
+ *   - Version CRUD (upload new version, list, restore, delete)
+ *   - Comment CRUD (create, list, update, delete)
+ *   - Access control (owner, CEO, supervisor, collaborator via task, learning)
+ *   - Confirms NO TAT fields are ever set on documents
+ */
+
+import request from 'supertest';
+import mongoose from 'mongoose';
+import { MongoMemoryServer } from 'mongodb-memory-server';
+import path from 'path';
+import fs from 'fs';
+import app from '../index';
+import { DocumentModel } from '../models/Document';
+import { TaskModel } from '../models/Task';
+import { CommentModel } from '../models/Comment';
+import { User } from '../models/User';
+import { SupervisorMapping } from '../models/SupervisorMapping';
+import { generateToken } from '../services/authService';
+
+let mongod: MongoMemoryServer;
+let ceoToken: string, supervisorToken: string, userToken: string, collaboratorToken: string;
+let ceoId: string, supervisorId: string, userId: string, collaboratorId: string;
+
+const FIXTURE = path.join(__dirname, 'fixtures', 'test.txt');
+
+/** Helper: create a minimal doc directly in the DB */
+const makeDoc = (overrides = {}) =>
+  DocumentModel.create({
+    title: 'Test Doc',
+    ownerId: userId,
+    documentType: 'working',
+    status: 'draft',
+    fileType: 'text/plain',
+    currentVersion: 1,
+    versionHistory: [{
+      versionNumber: 1,
+      fileName: 'test.txt',
+      fileKey: 'test.txt',
+      fileUrl: 'http://localhost:5000/uploads/test.txt',
+      fileSize: 100,
+      fileType: 'text/plain',
+      modifiedBy: userId,
+      modifiedAt: new Date(),
+    }],
+    ...overrides,
+  });
+
+beforeAll(async () => {
+  mongod = await MongoMemoryServer.create();
+  await mongoose.connect(mongod.getUri());
+
+  fs.mkdirSync(path.dirname(FIXTURE), { recursive: true });
+  fs.writeFileSync(FIXTURE, 'Hello test document content.');
+
+  const ceo   = await User.create({ name: 'CEO',   email: 'ceo@t.com',   password: 'Pass123!', role: 'ceo',        accountStatus: 'active', isActive: true });
+  const sup   = await User.create({ name: 'Sup',   email: 'sup@t.com',   password: 'Pass123!', role: 'supervisor', accountStatus: 'active', isActive: true });
+  const usr   = await User.create({ name: 'User',  email: 'usr@t.com',   password: 'Pass123!', role: 'user',       accountStatus: 'active', isActive: true });
+  const collab = await User.create({ name: 'Collab', email: 'col@t.com', password: 'Pass123!', role: 'user',       accountStatus: 'active', isActive: true });
+
+  ceoId = ceo._id.toString(); supervisorId = sup._id.toString();
+  userId = usr._id.toString(); collaboratorId = collab._id.toString();
+
+  await SupervisorMapping.create({
+    supervisorId: sup._id, subordinateId: usr._id, status: 'active', assignmentDate: new Date(),
+  });
+
+  ceoToken        = generateToken(ceo);
+  supervisorToken = generateToken(sup);
+  userToken       = generateToken(usr);
+  collaboratorToken = generateToken(collab);
+});
+
+afterAll(async () => {
+  await mongoose.disconnect();
+  await mongod.stop();
+  if (fs.existsSync(FIXTURE)) fs.unlinkSync(FIXTURE);
+});
+
+afterEach(async () => {
+  await DocumentModel.deleteMany({});
+  await CommentModel.deleteMany({});
+  await TaskModel.deleteMany({});
+});
+
+// ─────────────────────────────────────────────────────────────────
+// UPLOAD
+// ─────────────────────────────────────────────────────────────────
+
+describe('POST /api/documents — upload', () => {
+  it('Creates a document with status draft and NO TAT fields', async () => {
+    const res = await request(app)
+      .post('/api/documents')
+      .set('Authorization', `Bearer ${userToken}`)
+      .attach('files', FIXTURE)
+      .field('documentType', 'working');
+
+    expect(res.status).toBe(201);
+    const doc = res.body.data[0];
+    expect(doc.status).toBe('draft');
+    expect(doc.startTime).toBeUndefined();
+    expect(doc.tatMinutes).toBeUndefined();
+    expect(doc.efficiencyRatio).toBeUndefined();
+    expect(doc.targetTatMinutes).toBeUndefined();
+    expect(doc.supervisorApprovedBy).toBeUndefined();
+  });
+
+  it('Returns 400 with no files', async () => {
+    const res = await request(app)
+      .post('/api/documents')
+      .set('Authorization', `Bearer ${userToken}`)
+      .field('documentType', 'working');
+    expect(res.status).toBe(400);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// METADATA CRUD
+// ─────────────────────────────────────────────────────────────────
+
+describe('PUT /api/documents/:id — update metadata', () => {
+  it('Owner can update title and description', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .put(`/api/documents/${doc._id}`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ title: 'New Title', description: 'New Desc' });
+    expect(res.status).toBe(200);
+    expect(res.body.data.document.title).toBe('New Title');
+  });
+
+  it('Non-owner cannot update metadata', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .put(`/api/documents/${doc._id}`)
+      .set('Authorization', `Bearer ${collaboratorToken}`)
+      .send({ title: 'Hacked' });
+    expect(res.status).toBe(403);
+  });
+
+  it('CEO can update any document metadata', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .put(`/api/documents/${doc._id}`)
+      .set('Authorization', `Bearer ${ceoToken}`)
+      .send({ title: 'CEO Changed' });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('PATCH /api/documents/:id/content — inline text', () => {
+  it('Owner can patch content text', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .patch(`/api/documents/${doc._id}/content`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ content: 'Updated content body' });
+    expect(res.status).toBe(200);
+    expect(res.body.data.document.contentText).toBe('Updated content body');
+  });
+
+  it('Non-owner cannot patch content', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .patch(`/api/documents/${doc._id}/content`)
+      .set('Authorization', `Bearer ${collaboratorToken}`)
+      .send({ content: 'Should fail' });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('DELETE /api/documents/:id', () => {
+  it('Owner deletes their document', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .delete(`/api/documents/${doc._id}`)
+      .set('Authorization', `Bearer ${userToken}`);
+    expect(res.status).toBe(200);
+    expect(await DocumentModel.findById(doc._id)).toBeNull();
+  });
+
+  it('CEO can delete any document', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .delete(`/api/documents/${doc._id}`)
+      .set('Authorization', `Bearer ${ceoToken}`);
+    expect(res.status).toBe(200);
+  });
+
+  it('Collaborator cannot delete a document', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .delete(`/api/documents/${doc._id}`)
+      .set('Authorization', `Bearer ${collaboratorToken}`);
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// VERSION CRUD
+// ─────────────────────────────────────────────────────────────────
+
+describe('Version history CRUD', () => {
+  it('GET /:id/versions returns version list', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .get(`/api/documents/${doc._id}/versions`)
+      .set('Authorization', `Bearer ${userToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.data.versions).toHaveLength(1);
+    expect(res.body.data.versions[0].versionNumber).toBe(1);
+  });
+
+  it('POST /:id/versions uploads new version', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .post(`/api/documents/${doc._id}/versions`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .attach('file', FIXTURE)
+      .field('changeNote', 'Fixed typos');
+    expect(res.status).toBe(200);
+    expect(res.body.data.document.currentVersion).toBe(2);
+    expect(res.body.data.document.versionHistory).toHaveLength(2);
+    expect(res.body.data.document.versionHistory[1].changeNote).toBe('Fixed typos');
+  });
+
+  it('Non-owner cannot upload new version', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .post(`/api/documents/${doc._id}/versions`)
+      .set('Authorization', `Bearer ${collaboratorToken}`)
+      .attach('file', FIXTURE);
+    expect(res.status).toBe(403);
+  });
+
+  it('PATCH /:id/versions/:vNum/restore promotes older version', async () => {
+    const doc = await makeDoc({
+      currentVersion: 2,
+      versionHistory: [
+        { versionNumber: 1, fileName: 'v1.txt', fileKey: 'v1.txt', fileUrl: 'http://localhost:5000/uploads/v1.txt', fileSize: 50, fileType: 'text/plain', modifiedBy: userId, modifiedAt: new Date() },
+        { versionNumber: 2, fileName: 'v2.txt', fileKey: 'v2.txt', fileUrl: 'http://localhost:5000/uploads/v2.txt', fileSize: 80, fileType: 'text/plain', modifiedBy: userId, modifiedAt: new Date() },
+      ],
+    });
+
+    const res = await request(app)
+      .patch(`/api/documents/${doc._id}/versions/1/restore`)
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.document.currentVersion).toBe(3);
+    const latest = res.body.data.document.versionHistory.at(-1);
+    expect(latest.fileName).toBe('v1.txt');
+    expect(latest.changeNote).toMatch(/restored from version 1/i);
+  });
+
+  it('DELETE /:id/versions/:vNum removes a version', async () => {
+    const doc = await makeDoc({
+      currentVersion: 2,
+      versionHistory: [
+        { versionNumber: 1, fileName: 'v1.txt', fileKey: 'v1_unique.txt', fileUrl: 'u', fileSize: 50, fileType: 'text/plain', modifiedBy: userId, modifiedAt: new Date() },
+        { versionNumber: 2, fileName: 'v2.txt', fileKey: 'v2_unique.txt', fileUrl: 'u', fileSize: 80, fileType: 'text/plain', modifiedBy: userId, modifiedAt: new Date() },
+      ],
+    });
+
+    const res = await request(app)
+      .delete(`/api/documents/${doc._id}/versions/1`)
+      .set('Authorization', `Bearer ${userToken}`);
+
+    expect(res.status).toBe(200);
+    const updated = await DocumentModel.findById(doc._id);
+    expect(updated?.versionHistory).toHaveLength(1);
+    expect(updated?.versionHistory[0].versionNumber).toBe(2);
+  });
+
+  it('Cannot delete the last remaining version', async () => {
+    const doc = await makeDoc(); // only 1 version
+    const res = await request(app)
+      .delete(`/api/documents/${doc._id}/versions/1`)
+      .set('Authorization', `Bearer ${userToken}`);
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/only version/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// COMMENT CRUD
+// ─────────────────────────────────────────────────────────────────
+
+describe('Comment CRUD', () => {
+  it('POST /:id/comments — owner creates a comment', async () => {
+    const doc = await makeDoc();
+    const res = await request(app)
+      .post(`/api/documents/${doc._id}/comments`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ text: 'Great document!' });
+    expect(res.status).toBe(201);
+    expect(res.body.data.comment.text).toBe('Great document!');
+  });
+
+  it('GET /:id/comments — lists all comments on a document', async () => {
+    const doc = await makeDoc();
+    await CommentModel.create([
+      { documentId: doc._id, user: userId, text: 'First' },
+      { documentId: doc._id, user: userId, text: 'Second' },
+    ]);
+    const res = await request(app)
+      .get(`/api/documents/${doc._id}/comments`)
+      .set('Authorization', `Bearer ${userToken}`);
+    expect(res.status).toBe(200);
+    expect(res.body.data.comments).toHaveLength(2);
+  });
+
+  it('PUT /:id/comments/:commentId — author updates their comment', async () => {
+    const doc     = await makeDoc();
+    const comment = await CommentModel.create({ documentId: doc._id, user: userId, text: 'Original' });
+    const res = await request(app)
+      .put(`/api/documents/${doc._id}/comments/${comment._id}`)
+      .set('Authorization', `Bearer ${userToken}`)
+      .send({ text: 'Edited text' });
+    expect(res.status).toBe(200);
+    expect(res.body.data.comment.text).toBe('Edited text');
+  });
+
+  it('PUT /:id/comments/:commentId — non-author cannot edit', async () => {
+    const doc     = await makeDoc();
+    const comment = await CommentModel.create({ documentId: doc._id, user: userId, text: 'Mine' });
+    const res = await request(app)
+      .put(`/api/documents/${doc._id}/comments/${comment._id}`)
+      .set('Authorization', `Bearer ${supervisorToken}`)
+      .send({ text: 'Hijacked' });
+    expect(res.status).toBe(403);
+  });
+
+  it('DELETE /:id/comments/:commentId — author deletes own comment', async () => {
+    const doc     = await makeDoc();
+    const comment = await CommentModel.create({ documentId: doc._id, user: userId, text: 'Delete me' });
+    const res = await request(app)
+      .delete(`/api/documents/${doc._id}/comments/${comment._id}`)
+      .set('Authorization', `Bearer ${userToken}`);
+    expect(res.status).toBe(200);
+    expect(await CommentModel.findById(comment._id)).toBeNull();
+  });
+
+  it('DELETE /:id/comments/:commentId — CEO deletes any comment', async () => {
+    const doc     = await makeDoc();
+    const comment = await CommentModel.create({ documentId: doc._id, user: userId, text: 'User comment' });
+    const res = await request(app)
+      .delete(`/api/documents/${doc._id}/comments/${comment._id}`)
+      .set('Authorization', `Bearer ${ceoToken}`);
+    expect(res.status).toBe(200);
+  });
+
+  it('DELETE /:id/comments/:commentId — document owner deletes any comment on their doc', async () => {
+    const doc     = await makeDoc();
+    const comment = await CommentModel.create({ documentId: doc._id, user: collaboratorId, text: 'Someone else' });
+    const res = await request(app)
+      .delete(`/api/documents/${doc._id}/comments/${comment._id}`)
+      .set('Authorization', `Bearer ${userToken}`); // doc owner
+    expect(res.status).toBe(200);
+  });
+
+  it('Non-participant cannot add a comment', async () => {
+    const doc = await makeDoc(); // owned by userId, not learning type
+    const res = await request(app)
+      .post(`/api/documents/${doc._id}/comments`)
+      .set('Authorization', `Bearer ${collaboratorToken}`)
+      .send({ text: 'Should fail' });
+    expect(res.status).toBe(403);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// ACCESS CONTROL
+// ─────────────────────────────────────────────────────────────────
+
+describe('Document access control', () => {
+  it('Supervisor can read their team member\'s document', async () => {
+    const doc = await makeDoc({ supervisorId });
+    const res = await request(app)
+      .get(`/api/documents/${doc._id}`)
+      .set('Authorization', `Bearer ${supervisorToken}`);
+    expect(res.status).toBe(200);
+  });
+
+  it('Task collaborator can read the linked document while task is in_progress', async () => {
+    const doc = await makeDoc();
+    await TaskModel.create({
+      title: 'Linked Task',
+      assignedBy: supervisorId, assignedTo: userId,
+      status: 'in_progress',
+      documentId: doc._id,
+      targetMinutes: 60, startedAt: new Date(),
+      collaborators: [{ userId: collaboratorId, invitedAt: new Date(), status: 'active' }],
+    });
+
+    const res = await request(app)
+      .get(`/api/documents/${doc._id}`)
+      .set('Authorization', `Bearer ${collaboratorToken}`);
+    expect(res.status).toBe(200);
+  });
+
+  it('Collaborator loses access when task is completed (revoked)', async () => {
+    const doc = await makeDoc();
+    await TaskModel.create({
+      title: 'Done Task',
+      assignedBy: supervisorId, assignedTo: userId,
+      status: 'completed',
+      documentId: doc._id,
+      targetMinutes: 60, startedAt: new Date(), completedAt: new Date(),
+      collaborators: [{
+        userId: collaboratorId, invitedAt: new Date(),
+        revokedAt: new Date(), status: 'revoked',
+      }],
+    });
+
+    const res = await request(app)
+      .get(`/api/documents/${doc._id}`)
+      .set('Authorization', `Bearer ${collaboratorToken}`);
+    expect(res.status).toBe(403);
+  });
+
+  it('Learning documents are accessible to all authenticated users', async () => {
+    const doc = await makeDoc({ documentType: 'learning', ownerId: ceoId });
+    const res = await request(app)
+      .get(`/api/documents/${doc._id}`)
+      .set('Authorization', `Bearer ${collaboratorToken}`);
+    expect(res.status).toBe(200);
+  });
+
+  it('Document never has TAT or workflow fields regardless of type', async () => {
+    const doc = await makeDoc();
+    const raw = await DocumentModel.findById(doc._id).lean();
+    expect(raw).not.toHaveProperty('tatMinutes');
+    expect(raw).not.toHaveProperty('efficiencyRatio');
+    expect(raw).not.toHaveProperty('startTime');
+    expect(raw).not.toHaveProperty('targetTatMinutes');
+    expect(raw).not.toHaveProperty('supervisorApprovedBy');
+    expect(raw).not.toHaveProperty('completionRequestedAt');
+    expect(raw).not.toHaveProperty('accessControlList');
+  });
+});
