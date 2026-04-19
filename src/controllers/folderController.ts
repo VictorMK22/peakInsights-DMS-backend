@@ -5,6 +5,8 @@ import { FolderModel } from "../models/Folder"
 import { DocumentModel } from "../models/Document"
 import { AuditLog } from "../models/AuditLog";
 
+const escapeRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 export const createFolder = async (req: AuthRequest, res: Response) => {
 
   const { name, parentFolderId } = req.body
@@ -125,7 +127,7 @@ export const moveFolder = async (req: AuthRequest, res: Response) => {
 
     // 🔥 Update all subfolders
     const subfolders = await FolderModel.find({
-      path: { $regex: `^${oldPath}` }
+      path: { $regex: `^${escapeRegex(oldPath)}(/|$)` }
     });
 
     for (const sub of subfolders) {
@@ -161,7 +163,7 @@ export const deleteFolderRecursive = async (req: AuthRequest, res: Response) => 
 
     // 🔥 Find all nested folders
     const foldersToDelete = await FolderModel.find({
-      path: { $regex: `^${folder.path}` }
+      path: { $regex: `^${escapeRegex(folder.path)}(/|$)` }
     });
 
     const folderIds = foldersToDelete.map(f => f._id);

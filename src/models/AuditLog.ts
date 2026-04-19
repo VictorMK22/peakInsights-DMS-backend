@@ -16,7 +16,7 @@ export interface IAuditLog extends Document {
 const AuditLogSchema = new Schema<IAuditLog>({
   documentId: { type: Schema.Types.ObjectId, ref: 'Document' },
   actorId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-  action: { type: String, enum: ['created','viewed','edited','submitted','completed','invited','access_revoked','deleted','downloaded'], required: true },
+  action: { type: String, enum: ['created','viewed','edited','submitted','completed','invited','access_revoked','deleted','downloaded', 'email_sent'], required: true },
   targetUserId: { type: Schema.Types.ObjectId, ref: 'User' },
   supervisorIdAtTime: { type: Schema.Types.ObjectId, ref: 'User' },
   details: { type: Schema.Types.Mixed },
@@ -30,5 +30,7 @@ AuditLogSchema.pre('findOneAndUpdate', function() { throw new Error('Audit logs 
 AuditLogSchema.index({ actorId: 1, timestamp: -1 });
 AuditLogSchema.index({ documentId: 1, timestamp: -1 });
 AuditLogSchema.index({ supervisorIdAtTime: 1, timestamp: -1 });
+AuditLogSchema.index({ action: 1, timestamp: -1 });
+AuditLogSchema.index({ targetUserId: 1, action: 1 });
 
 export const AuditLog = mongoose.model<IAuditLog>('AuditLog', AuditLogSchema);

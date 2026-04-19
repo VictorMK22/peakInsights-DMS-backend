@@ -1,11 +1,13 @@
 import { Router } from 'express';
 import { authenticate, authorize } from '../middleware/auth';
+import { uploadToLocal } from '../middleware/upload';
 import {
   createTask,
   getTasks,
   getTask,
   updateTask,
   updateTaskStatus,
+  approveTask,
   deleteTask,
   inviteTaskCollaborator,
   revokeTaskCollaborator,
@@ -13,26 +15,19 @@ import {
   getUserAppraisal,
 } from '../controllers/taskController';
 
-// ─── Tasks own TAT, efficiency, and collaboration ─────────────────
-//
-//  CRUD:
-//    GET    /                  list tasks (role-scoped)
-//    POST   /                  create / assign (CEO or Supervisor)
-//    GET    /:id               get one
-//    PUT    /:id               update metadata / set target
-//    PATCH  /:id/status        advance status (pending→in_progress→completed)
-//    DELETE /:id               delete (assigner or CEO)
-//
-//  Collaboration:
-//    POST   /:id/invite                        invite a collaborator
-//    DELETE /:id/collaborators/:collaboratorId  manually revoke access early
-//    (Access is auto-revoked when task is completed or cancelled)
-//
-//  Appraisal:
-//    GET    /analytics/leaderboard             ranked efficiency (CEO/Supervisor)
-//    GET    /analytics/appraisal/:userId       individual report
-//
-// ─────────────────────────────────────────────────────────────────
+/**
+ * Tasks — own TAT, efficiency, collaboration, file uploads, document linking.
+ *
+ * Lifecycle:
+ *   POST   /              CEO/Supervisor creates task (can upload briefing files)
+ *   PATCH  /:id/status    Drives TAT state machine:
+ *                           pending → in_progress (assignee sets targetMinutes)
+ *                           in_progress → submitted (assignee attaches docs)
+ *                           submitted → completed   (approver approves)
+ *                           submitted → rejected    (approver rejects, back to in_progress)
+ *                           any → cancelled
+ *   PATCH  /:id/approve   Convenience shortcut: directly approve a submitted task
+ */
 
 const router = Router();
 router.use(authenticate);
@@ -42,15 +37,19 @@ router.get('/analytics/leaderboard',       authorize('ceo', 'supervisor'), getTa
 router.get('/analytics/appraisal/:userId', getUserAppraisal);
 
 // ── CRUD ──────────────────────────────────────────────────────────
-router.get('/',              getTasks);
-router.post('/',             createTask);
-router.get('/:id',           getTask);
-router.put('/:id',           updateTask);
-router.patch('/:id/status',  updateTaskStatus);
-router.delete('/:id',        deleteTask);
+router.get('/',    getTasks);
+// CEO/Supervisor can upload briefing files when creating a task.
+// uploadToLocal.any() accepts any field name and any number of files.
+router.post('/',   uploadToLocal.any(), createTask);
+
+router.get('/:id',            getTask);
+router.put('/:id',            updateTask);
+router.patch('/:id/status',   updateTaskStatus);
+router.patch('/:id/approve',  approveTask);
+router.delete('/:id',         deleteTask);
 
 // ── Collaboration ─────────────────────────────────────────────────
-router.post('/:id/invite',                            inviteTaskCollaborator);
-router.delete('/:id/collaborators/:collaboratorId',   revokeTaskCollaborator);
+router.post('/:id/invite',                           inviteTaskCollaborator);
+router.delete('/:id/collaborators/:collaboratorId',  revokeTaskCollaborator);
 
 export default router;

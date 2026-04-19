@@ -132,13 +132,44 @@ export const createDocument = async (
       return res.status(400).json({ success: false, message: 'No files uploaded' });
     }
 
-    const { description, priority, tags, department, documentType } = req.body;
+    // Working documents only carry: title (filename), description, date.
+    // Priority is a storage/learning-only field — working docs have no priority
+    // because they are task-driven and task priority governs urgency.
+    const { description, tags, department, documentType: rawDocumentType, priority: rawPriority } = req.body;
+
+    // Document type rules:
+    //   CEO / Supervisor → 'learning' by default (they upload training materials).
+    //                      They may explicitly choose 'storage' to override.
+    //   User             → 'working' always (task documents; cannot set learning).
+    //                      They may explicitly choose 'storage' for reference files.
+    const uploaderRole = req.user!.role;
+    let documentType: string;
+    if (uploaderRole === 'ceo' || uploaderRole === 'supervisor') {
+      documentType = rawDocumentType === 'storage' ? 'storage' : 'learning';
+    } else {
+      documentType = rawDocumentType === 'storage' ? 'storage' : 'working';
+    }
 
     let relativePaths: string[] = [];
-    try {
-      relativePaths = req.body.webkitRelativePaths
-        ? JSON.parse(req.body.webkitRelativePaths) : [];
-    } catch { relativePaths = []; }
+    const raw = req.body.webkitRelativePaths;
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+          return res.status(400).json({ success: false, message: 'webkitRelativePaths must be an array' });
+        }
+        relativePaths = parsed;
+      } catch (e) {
+        return res.status(400).json({ success: false, message: 'Invalid webkitRelativePaths: ' + (e as Error).message });
+      }
+    }
+
+    if (relativePaths.length > 0 && relativePaths.length !== files.length) {
+      return res.status(400).json({
+        success: false,
+        message: `Path count (${relativePaths.length}) does not match file count (${files.length})`
+      });
+    }
 
     const mapping = await SupervisorMapping.findOne({
       subordinateId: req.user!.userId, status: 'active',
@@ -149,24 +180,32 @@ export const createDocument = async (
       const parts        = relativePath.split('/');
       const fileName     = parts.pop() ?? file.originalname;
 
-      // Rebuild folder hierarchy
+      // Rebuild folder hierarchy using upsert to avoid race conditions.
+      // When multiple files in a folder upload run concurrently (Promise.all),
+      // two files may both try to create the same parent folder at the same time.
+      // findOneAndUpdate with upsert:true is atomic — whichever wins creates the
+      // folder; the loser gets back the existing one instead of a duplicate key error.
       let parentFolderId = null;
       let currentPath    = '';
       for (const segment of parts) {
         currentPath += `/${segment}`;
-        let folder = await FolderModel.findOne({
-          path: currentPath, ownerId: req.user!.userId,
-        });
+        const folder = await FolderModel.findOneAndUpdate(
+          { path: currentPath, ownerId: req.user!.userId },
+          {
+            $setOnInsert: {
+              name: segment,
+              path: currentPath,
+              parentFolderId,
+              ownerId: req.user!.userId,
+            },
+          },
+          { upsert: true, new: true, setDefaultsOnInsert: true }
+        ) as any;
         if (!folder) {
-          folder = await FolderModel.create({
-            name: segment, path: currentPath,
-            parentFolderId, ownerId: req.user!.userId,
-          });
+          throw new Error('Folder creation failed unexpectedly');
         }
         parentFolderId = folder._id;
       }
-
-      const filePath = file.path;
 
       const fileUrl = getLocalFileUrl(file.filename);
 
@@ -175,14 +214,14 @@ export const createDocument = async (
         description,
         folderId:     parentFolderId,
         fileType:     file.mimetype,
-        priority:     priority ?? 'medium',
+        // Priority only applies to storage/learning docs (not working docs — tasks drive urgency)
+        priority:     documentType !== 'working' ? (rawPriority ?? 'medium') : undefined,
         ownerId:      req.user!.userId,
         supervisorId: mapping?.supervisorId,
         departmentId: department ?? mapping?.departmentName,
         tags:         tags ? (Array.isArray(tags) ? tags : [tags]) : [],
         documentType: documentType ?? 'working',
         status:       'draft',       // always draft — no TAT timer
-        filePath,
         currentVersion: 1,
         versionHistory: [{
           versionNumber: 1,
@@ -197,20 +236,11 @@ export const createDocument = async (
         }],
       });
 
-      const queued = await enqueueDocumentProcessing({
+      await enqueueDocumentProcessing({
         documentId: doc._id.toString(),
         fileKey:    file.filename,
         fileType:   file.mimetype,
       });
-
-      if (!queued) {
-        const { processDocumentDirectly } = await import("../services/documentProcessor");
-        await processDocumentDirectly({
-          documentId: doc._id.toString(),
-          fileKey:    file.filename,
-          fileType:   file.mimetype,
-        });
-      }
       await invalidateCache(req.user!.userId);
       await createAuditLog({
         documentId: doc._id.toString(),
@@ -330,7 +360,8 @@ export const getDocument = async (
 
 // ─────────────────────────────────────────────────────────────────
 // UPDATE METADATA
-// Owner or CEO: title, description, tags, priority
+// Working docs: title, description only.
+// Storage/learning: title, description, priority, tags.
 // ─────────────────────────────────────────────────────────────────
 export const updateDocument = async (
   req: AuthRequest,
@@ -353,8 +384,11 @@ export const updateDocument = async (
 
     if (title)       doc.title       = title;
     if (description !== undefined) doc.description = description;
-    if (priority)    doc.priority    = priority;
-    if (tags)        doc.tags        = tags;
+    // Priority and tags only apply to non-working documents
+    if (doc.documentType !== 'working') {
+      if (priority) doc.priority = priority;
+      if (tags)     doc.tags     = tags;
+    }
 
     await doc.save();
     await createAuditLog({ documentId: req.params.id, actorId: req.user!.userId, action: 'edited' });
@@ -737,49 +771,34 @@ export const previewDocument = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    const document = await DocumentModel.findById(req.params.id);
+    const doc = await DocumentModel.findById(req.params.id);
+    if (!doc) { res.status(404).json({ success: false }); return; }
 
-    if (!document) {
-      res.status(404).json({ success: false });
-      return;
+    const access = await canAccess(doc as Parameters<typeof canAccess>[0], req.user!.userId, req.user!.role);
+    if (!access) { res.status(403).json({ success: false, message: 'Access denied' }); return; }
+
+    const latest   = doc.versionHistory[doc.versionHistory.length - 1];
+    if (!latest) { res.status(404).json({ success: false, message: 'No file found' }); return; }
+
+    const filePath = path.join(process.env.UPLOAD_DIR ?? './uploads', latest.fileKey);
+    const mimeType = latest.fileType;
+
+    // DOCX → HTML via mammoth (no LibreOffice)
+    const isDocx = mimeType.includes('wordprocessingml') || mimeType.includes('msword');
+    if (isDocx && fs.existsSync(filePath)) {
+      try {
+        const mammoth = await import('mammoth');
+        const result  = await mammoth.convertToHtml({ path: filePath });
+        res.json({ success: true, type: 'html', html: result.value, url: latest.fileUrl });
+        return;
+      } catch (e) {
+        console.error('mammoth failed, falling back:', e);
+      }
     }
 
-    const latest = document.versionHistory.at(-1);
-
-    if (!latest) {
-      res.status(404).json({ success: false });
-      return;
-    }
-
-    const filePath = path.resolve(
-      process.env.UPLOAD_DIR ?? './uploads',
-      latest.fileKey
-    );
-
-    const fileUrl = `http://localhost:5000/uploads/${latest.fileKey}`;
-    const fileType = document.fileType;
-
-    if (fileType.includes('word') || fileType.includes('docx')) {
-      const mammoth = await import('mammoth');
-      const result = await mammoth.convertToHtml({ path: filePath });
-
-      res.json({
-        success: true,
-        type: 'html',
-        html: result.value,
-      });
-      return;
-    }
-
-    res.json({
-      success: true,
-      type: fileType,
-      url: fileUrl,
-    });
-  } catch (error) {
-    console.error(error);
-    next(error);
-  }
+    // PDF / images / everything else → return URL for browser rendering
+    res.json({ success: true, type: mimeType, url: latest.fileUrl });
+  } catch (err) { next(err); }
 };
 
 export const downloadDocument = async (

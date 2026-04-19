@@ -1,39 +1,28 @@
 import mongoose, { Document, Schema } from 'mongoose';
 
-export type TaskStatus   = 'pending' | 'in_progress' | 'submitted' | 'completed' | 'cancelled';
+export type TaskStatus   = 'pending' | 'in_progress' | 'submitted' | 'completed' | 'rejected' | 'cancelled';
 export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';
 
-// ─── System design ────────────────────────────────────────────────
-//
-// ALL measurement and collaboration lives on Tasks, not Documents.
-//
-// Documents are purely for file storage and reference — they have
-// no status workflow, no TAT, no efficiency, no completion approval,
-// and no collaborators.
-//
-// Tasks drive everything performance-related:
-//
-//   TAT lifecycle:
-//     1. CEO/Supervisor assigns task            → status = pending
-//     2. Assignee sets targetMinutes + starts   → status = in_progress
-//                                                  startedAt recorded
-//     3. Assignee marks complete                → status = completed
-//                                                  completedAt, tatMinutes,
-//                                                  efficiencyRatio calculated
-//
-//   efficiencyRatio = targetMinutes / tatMinutes
-//     > 1.0  finished faster than committed  (excellent)
-//     = 1.0  exactly on target
-//     < 1.0  overran target                  (needs attention)
-//
-//   Task collaboration:
-//     - Assignee can invite other users to help with the task
-//     - Invited users appear in collaborators[] and gain read access
-//       to any linked document
-//     - When the task moves to completed or cancelled, ALL collaborator
-//       access is immediately and automatically revoked
-//
-// ─────────────────────────────────────────────────────────────────
+/**
+ * Design:
+ *
+ * TAT lifecycle:
+ *   1. CEO/Supervisor creates task (optionally uploads supporting files)
+ *   2. Assignee sets targetMinutes + starts        → in_progress, startedAt recorded
+ *   3. Assignee submits with supporting documents  → submitted
+ *   4. Supervisor/CEO reviews linked documents     → completed OR rejected
+ *
+ * efficiencyRatio = targetMinutes / tatMinutes
+ *   > 1.0  finished faster than committed (excellent)
+ *   = 1.0  exactly on target
+ *   < 1.0  overran target (needs attention)
+ *
+ * Task-to-Document linking:
+ *   - documentId: primary document this task is about
+ *   - submissionDocuments: documents the assignee attaches when submitting
+ *   - taskFiles: files uploaded by CEO/Supervisor when creating the task
+ *     (context/brief/requirements for the assignee)
+ */
 
 export interface ITaskCollaborator {
   userId:    mongoose.Types.ObjectId;
@@ -43,55 +32,78 @@ export interface ITaskCollaborator {
 }
 
 export interface IApprovalHistory {
-  action: 'approved' | 'rejected';
-  by: mongoose.Types.ObjectId;
-  at: Date;
-  reason?: string;
+  action:   'approved' | 'rejected';
+  by:       mongoose.Types.ObjectId;
+  at:       Date;
+  reason?:  string;
+}
+
+export interface ITaskFile {
+  fileName:  string;
+  fileKey:   string;
+  fileUrl:   string;
+  fileSize:  number;
+  fileType:  string;
+  uploadedBy: mongoose.Types.ObjectId;
+  uploadedAt: Date;
 }
 
 export interface ITask extends Document {
-  _id: mongoose.Types.ObjectId;
-  title: string;
+  _id:         mongoose.Types.ObjectId;
+  title:       string;
   description?: string;
-  assignedBy: mongoose.Types.ObjectId;
-  assignedTo: mongoose.Types.ObjectId;
+  assignedBy:  mongoose.Types.ObjectId;
+  assignedTo:  mongoose.Types.ObjectId;
+
+  // Primary linked document (e.g. a working doc the task is about)
   documentId?: mongoose.Types.ObjectId;
 
-  status: TaskStatus;
+  // Files uploaded by CEO/Supervisor when creating the task
+  // (context files, briefs, requirements for the assignee)
+  taskFiles:   ITaskFile[];
+
+  // Documents attached by the assignee when submitting for approval
+  // The reviewer can open these to approve/reject the task
+  submissionDocuments: mongoose.Types.ObjectId[];
+
+  status:   TaskStatus;
   priority: TaskPriority;
   dueDate?: Date;
 
-  targetMinutes?: number;
-  startedAt?: Date;
-  completedAt?: Date;
-  tatMinutes?: number;
+  // TAT
+  targetMinutes?:  number;
+  startedAt?:      Date;
+  submittedAt?:    Date;
+  completedAt?:    Date;
+  tatMinutes?:     number;
   efficiencyRatio?: number;
 
-  // ✅ APPROVAL FLOW FIELDS
-  submittedAt?: Date;
-
-  approvedBy?: mongoose.Types.ObjectId;
-  approvedAt?: Date;
-  approvalHistory?: IApprovalHistory[];
-
-  // SLA tracking
-  approvalDurationMinutes?: number;
-
-  // Proof of work
-  proofFiles?: string[];
-
+  // Submission
   submissionComment?: string;
+  rejectionReason?:   string;
 
-  rejectedBy?: mongoose.Types.ObjectId;
-  rejectedAt?: Date;
-  rejectionReason?: string;
+  // Approval history (full trail)
+  approvalHistory: IApprovalHistory[];
 
+  // Collaboration
   collaborators: ITaskCollaborator[];
 
   notes?: string;
   createdAt: Date;
   updatedAt: Date;
+  approvedAt?: Date;
+  approvalDurationMinutes?: number;
 }
+
+const TaskFileSchema = new Schema<ITaskFile>({
+  fileName:   { type: String, required: true },
+  fileKey:    { type: String, required: true },
+  fileUrl:    { type: String, required: true },
+  fileSize:   { type: Number, required: true },
+  fileType:   { type: String, required: true },
+  uploadedBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  uploadedAt: { type: Date, default: Date.now },
+}, { _id: false });
 
 const TaskCollaboratorSchema = new Schema<ITaskCollaborator>({
   userId:    { type: Schema.Types.ObjectId, ref: 'User', required: true },
@@ -100,76 +112,43 @@ const TaskCollaboratorSchema = new Schema<ITaskCollaborator>({
   status:    { type: String, enum: ['active', 'revoked'], default: 'active' },
 }, { _id: false });
 
+const ApprovalHistorySchema = new Schema<IApprovalHistory>({
+  action: { type: String, enum: ['approved', 'rejected'], required: true },
+  by:     { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  at:     { type: Date, default: Date.now },
+  reason: { type: String },
+}, { _id: false });
+
 const TaskSchema = new Schema<ITask>({
-  title: { type: String, required: true, trim: true },
+  title:       { type: String, required: true, trim: true },
   description: { type: String },
+  assignedBy:  { type: Schema.Types.ObjectId, ref: 'User', required: true },
+  assignedTo:  { type: Schema.Types.ObjectId, ref: 'User', required: true },
 
-  assignedBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-  assignedTo: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-  documentId: { type: Schema.Types.ObjectId, ref: 'Document' },
+  documentId:           { type: Schema.Types.ObjectId, ref: 'Document' },
+  taskFiles:            { type: [TaskFileSchema], default: [] },
+  submissionDocuments:  [{ type: Schema.Types.ObjectId, ref: 'Document' }],
 
-  status: {
-    type: String,
-    enum: ['pending', 'in_progress', 'submitted', 'completed', 'cancelled'],
-    default: 'pending'
-  },
-
-  priority: {
-    type: String,
-    enum: ['low', 'medium', 'high', 'critical'],
-    default: 'medium'
-  },
-
-  dueDate: { type: Date },
+  status:   { type: String, enum: ['pending', 'in_progress', 'submitted', 'completed', 'rejected', 'cancelled'], default: 'pending' },
+  priority: { type: String, enum: ['low', 'medium', 'high', 'critical'], default: 'medium' },
+  dueDate:  { type: Date },
 
   // TAT
-  targetMinutes: { type: Number, min: 1 },
-  startedAt: { type: Date },
-  completedAt: { type: Date },
-  tatMinutes: { type: Number },
+  targetMinutes:   { type: Number, min: 1 },
+  startedAt:       { type: Date },
+  submittedAt:     { type: Date },
+  completedAt:     { type: Date },
+  tatMinutes:      { type: Number },
   efficiencyRatio: { type: Number },
-
-  // ✅ Approval workflow
-  submittedAt: { type: Date },
-
-  approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },
   approvedAt: { type: Date },
-
-  rejectedBy: { type: Schema.Types.ObjectId, ref: 'User' },
-  rejectedAt: { type: Date },
-  rejectionReason: { type: String },
-
-  approvalHistory: [
-    {
-      action: {
-        type: String,
-        enum: ['approved', 'rejected'],
-        required: true,
-      },
-      by: {
-        type: Schema.Types.ObjectId,
-        ref: 'User',
-        required: true,
-      },
-      at: {
-        type: Date,
-        default: Date.now,
-      },
-      reason: {
-        type: String,
-      },
-    }
-  ],
-
   approvalDurationMinutes: { type: Number },
 
-  proofFiles: [
-    {
-      url: String,
-      uploadedAt: Date,
-    }
-  ],
+  // Submission
   submissionComment: { type: String },
+  rejectionReason:   { type: String },
+
+  // Approval trail
+  approvalHistory: { type: [ApprovalHistorySchema], default: [] },
 
   // Collaboration
   collaborators: { type: [TaskCollaboratorSchema], default: [] },
@@ -180,6 +159,7 @@ const TaskSchema = new Schema<ITask>({
 TaskSchema.index({ assignedTo: 1, status: 1 });
 TaskSchema.index({ assignedBy: 1, createdAt: -1 });
 TaskSchema.index({ documentId: 1 });
+TaskSchema.index({ submissionDocuments: 1 });
 TaskSchema.index({ assignedTo: 1, efficiencyRatio: -1 });
 TaskSchema.index({ 'collaborators.userId': 1 });
 

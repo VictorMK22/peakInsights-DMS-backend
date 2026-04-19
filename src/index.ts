@@ -20,6 +20,7 @@ import analyticsRoutes from './routes/analytics';
 import folderRoutes    from './routes/folders';
 import taskRoutes      from './routes/tasks';
 import messageRoutes   from './routes/messages';
+import emailRoutes   from './routes/emails';
 
 dotenv.config();
 
@@ -27,7 +28,11 @@ const app = express();
 
 const PORT         = process.env.PORT         ?? 5000;
 const FRONTEND_URL = process.env.FRONTEND_URL ?? 'http://localhost:5173';
-const UPLOAD_DIR   = process.env.UPLOAD_DIR   ?? './uploads';
+const UPLOAD_DIR = process.env.UPLOAD_DIR
+  ? path.resolve(process.env.UPLOAD_DIR)
+  : path.join(__dirname, '../uploads');
+
+const allowedOrigins = [FRONTEND_URL];
 
 // ── Ensure uploads directory exists ──────────────────────────────
 if (!fs.existsSync(UPLOAD_DIR)) {
@@ -40,14 +45,20 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 // IMPORTANT: This must come before helmet() to avoid CSP blocking.
 app.use(
   '/uploads',
-  express.static(path.resolve(UPLOAD_DIR), {
-    // Allow cross-origin embedding for iframes (PDF preview)
+  express.static(UPLOAD_DIR, {
     setHeaders: (res) => {
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-      res.setHeader('Access-Control-Allow-Origin', FRONTEND_URL);
+
+      const origin = res.req?.headers?.origin;
+
+      if (origin && allowedOrigins.includes(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+      }
     },
   })
 );
+
+console.log('Uploads path:', path.resolve(UPLOAD_DIR));
 
 // ── Security ──────────────────────────────────────────────────────
 app.use(
@@ -90,8 +101,9 @@ app.use('/api/users',     userRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/folders',   folderRoutes);
 app.use('/api/analytics', analyticsRoutes);
-app.use('/api/tasks',     taskRoutes);       // ← new
-app.use('/api/messages',  messageRoutes);    // ← new
+app.use('/api/tasks',     taskRoutes);      
+app.use('/api/messages',  messageRoutes);    
+app.use("/api/emails", emailRoutes);
 
 // ── Health check ──────────────────────────────────────────────────
 app.get('/api/health', (_req, res) => {

@@ -13,6 +13,7 @@ export interface IUser extends Document {
   phone?: string;
   profilePicture?: string
   isActive: boolean;
+  supervisorId?: mongoose.Types.ObjectId;
   accountStatus: 'pending' | 'active' | 'rejected' | 'disabled' ;
   rejectionReason?: string;
   approvedBy?: mongoose.Types.ObjectId;
@@ -47,6 +48,10 @@ const UserSchema = new Schema<IUser>({
     type: String
   },
   isActive: { type: Boolean, default: false }, // false until CEO approves
+  supervisorId: {
+    type: Schema.Types.ObjectId,
+    ref: 'User',
+  },
   accountStatus: { type: String, enum: ['pending', 'active', 'rejected', 'disabled'], default: 'pending' },
   rejectionReason: { type: String },
   approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },
@@ -68,6 +73,15 @@ UserSchema.methods['comparePassword'] = async function (candidatePassword: strin
 
 UserSchema.set('toJSON', {
   transform: (_doc, ret) => { delete (ret as any).password; return ret; }
+});
+
+UserSchema.index({ supervisorId: 1 });
+
+UserSchema.pre('save', function (next) {
+  if (this.role === 'ceo' && this.supervisorId) {
+    return next(new Error('CEO cannot have a supervisor'));
+  }
+  next();
 });
 
 export const User = mongoose.model<IUser>('User', UserSchema);

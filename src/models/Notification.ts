@@ -1,24 +1,51 @@
-import mongoose from "mongoose";
+import mongoose, { Document, Types } from "mongoose";
 
-const NotificationSchema = new mongoose.Schema({
+export interface INotification extends Document {
+  userId: Types.ObjectId;
+  message: string;
+  type: string;
+  read: boolean;
+  meta?: Record<string, any>;
+  createdAt: Date;
+  updatedAt: Date;
+}
 
-  userId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: "User"
+const NotificationSchema = new mongoose.Schema<INotification>(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+
+    message: {
+      type: String,
+      required: true,
+    },
+
+    type: {
+      type: String,
+      required: true,
+    },
+
+    read: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+
+    meta: {
+      type: mongoose.Schema.Types.Mixed,
+    },
   },
+  { timestamps: true }
+);
 
-  message: String,
+// Index for fast user notifications
+NotificationSchema.index({ userId: 1, createdAt: -1 });
 
-  type: String,
-
-  read: {
-    type: Boolean,
-    default: false
-  }
-
-}, { timestamps: true });
-
-export default mongoose.model(
+export default mongoose.model<INotification>(
   "Notification",
   NotificationSchema
 );

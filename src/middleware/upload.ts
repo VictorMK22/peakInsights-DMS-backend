@@ -4,7 +4,7 @@ import fs from 'fs';
 import { v4 as uuid } from 'uuid';
 import { Request } from 'express';
 
-const UPLOAD_DIR = process.env.UPLOAD_DIR ?? './uploads';
+const UPLOAD_DIR = path.resolve(__dirname, '../../uploads');
 
 // Ensure the uploads directory exists at startup
 if (!fs.existsSync(UPLOAD_DIR)) {
@@ -65,97 +65,5 @@ export const uploadToLocal = multer({
 // In production swap BACKEND_URL for your actual domain.
 export const getLocalFileUrl = (filename: string): string => {
   const base = process.env.BACKEND_URL ?? 'http://localhost:5000';
-  return `${base}/uploads/${filename}`;
+  return `${base}/uploads/${encodeURIComponent(filename)}`;
 };
-
-
-
-// import multer from "multer";
-// import multerS3 from "multer-s3";
-// import { v4 as uuid } from "uuid";
-// import { Request } from "express";
-// import { s3, BUCKET } from "../services/s3Storage";
-
-// /**
-//  * ✅ 1. S3 Upload Middleware (production storage)
-//  */
-
-// export const uploadToS3 = multer({
-
-//   storage: multerS3({
-
-//     s3,
-//     bucket: BUCKET,
-
-//     metadata: (
-//       _req: Request,
-//       file: Express.Multer.File,
-//       cb: (error: any, metadata?: any) => void
-//     ) => {
-//       cb(null, { fieldName: file.fieldname });
-//     },
-
-//     key: (
-//       _req: Request,
-//       file: Express.Multer.File,
-//       cb: (error: any, key?: string) => void
-//     ) => {
-
-//       const key = `documents/${uuid()}-${file.originalname}`;
-
-//       cb(null, key);
-//     }
-
-//   }),
-
-//   limits: {
-//     fileSize: 100 * 1024 * 1024
-//   }
-
-// });
-
-// /**
-//  * ✅ 2. Memory Upload Middleware (for text extraction)
-//  */
-// export const uploadToMemory = multer({
-//   storage: multer.memoryStorage(),
-//   limits: {
-//     fileSize: 20 * 1024 * 1024 // smaller for RAM safety
-//   }
-// });
-
-
-// import multer from "multer";
-// import path from "path";
-// import { v4 as uuid } from "uuid";
-
-// /**
-//  * ✅ LOCAL DISK STORAGE (NO AWS REQUIRED)
-//  */
-
-// const storage = multer.diskStorage({
-//   destination: (req, file, cb) => {
-//     cb(null, "uploads/"); // make sure folder exists
-//   },
-//   filename: (req, file, cb) => {
-//     const uniqueName = `${uuid()}-${file.originalname}`;
-//     cb(null, uniqueName);
-//   },
-// });
-
-// export const uploadToLocal = multer({
-//   storage,
-//   limits: {
-//     fileSize: 100 * 1024 * 1024,
-//   },
-// });
-
-// /**
-//  * ✅ Memory (keep this)
-//  */
-// export const uploadToMemory = multer({
-//   storage: multer.memoryStorage(),
-//   limits: {
-//     fileSize: 20 * 1024 * 1024,
-//   },
-// });

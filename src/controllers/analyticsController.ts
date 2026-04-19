@@ -7,6 +7,7 @@ import { AuditLog } from '../models/AuditLog';
 import { SupervisorMapping } from '../models/SupervisorMapping';
 import { Collaboration } from '../models/Collaboration';
 import mongoose from 'mongoose';
+import { EmailLog } from '../models/EmailLog';
 
 // ─── Design note ─────────────────────────────────────────────────
 //
@@ -135,7 +136,7 @@ export const getDashboardStats = async (req: AuthRequest, res: Response, next: N
 
     const [
       totalDocs, completedDocs, inProgressDocs,
-      totalTasks, completedTasks, pendingTasks,
+      totalTasks, completedTasks, pendingTasks, submittedTasks, inProgressTasks,
       totalUsers, recentAudit, collaborationStats,
     ] = await Promise.all([
       DocumentModel.countDocuments(docFilter),
@@ -144,6 +145,8 @@ export const getDashboardStats = async (req: AuthRequest, res: Response, next: N
       TaskModel.countDocuments(taskFilter),
       TaskModel.countDocuments({ ...taskFilter, status: 'completed' }),
       TaskModel.countDocuments({ ...taskFilter, status: 'pending' }),
+      TaskModel.countDocuments({ ...taskFilter, status: 'submitted' }),
+      TaskModel.countDocuments({ ...taskFilter, status: 'in_progress' }),
       role === 'ceo' ? User.countDocuments({ isActive: true }) : 0,
       AuditLog.find(userId && role === 'user' ? { actorId: new mongoose.Types.ObjectId(userId) } : {})
         .populate('actorId', 'name email').populate('documentId', 'title')
@@ -176,7 +179,7 @@ export const getDashboardStats = async (req: AuthRequest, res: Response, next: N
           totalDocs, completedDocs, inProgressDocs,
           docCompletionRate: totalDocs > 0 ? ((completedDocs / totalDocs) * 100).toFixed(1) : '0',
           // Task performance stats (the appraisal dimension)
-          totalTasks, completedTasks, pendingTasks,
+          totalTasks, completedTasks, pendingTasks, submittedTasks, inProgressTasks,
           taskCompletionRate: totalTasks > 0 ? ((completedTasks / totalTasks) * 100).toFixed(1) : '0',
           avgTaskEfficiency: taskEfficiency[0]?.avgEfficiency?.toFixed(3) ?? 'N/A',
           avgTaskTatMinutes: Math.round(taskEfficiency[0]?.avgTat ?? 0),
@@ -218,6 +221,7 @@ export const getAuditTrail = async (req: AuthRequest, res: Response, next: NextF
     const [logs, total] = await Promise.all([
       AuditLog.find(filter)
         .populate('actorId', 'name email role')
+        .populate('targetUserId', 'name email')
         .populate('documentId', 'title')
         .populate('supervisorIdAtTime', 'name email')
         .sort({ timestamp: -1 }).skip(skip).limit(Number(limit)),
@@ -256,4 +260,87 @@ export const getCollaborationFrequency = async (req: AuthRequest, res: Response,
 
     res.json({ success: true, message: 'Collaboration frequency retrieved', data: { stats: stats[0] } });
   } catch (err) { next(err); }
+};
+
+
+// ─────────────────────────────────────────────────────────────────
+// EMAIL ANALYTICS
+// ─────────────────────────────────────────────────────────────────
+export const getEmailAnalytics = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const match = req.user?.role === 'ceo'
+      ? {}
+      : { senderId: req.user!.userId };
+
+    const stats = await EmailLog.aggregate([
+      { $match: match },
+
+      {
+        $facet: {
+          statusBreakdown: [
+            { $group: { _id: '$status', count: { $sum: 1 } } }
+          ],
+
+          volumeOverTime: [
+            {
+              $group: {
+                _id: {
+                  $dateToString: { format: "%Y-%m", date: "$createdAt" }
+                },
+                sent: { $sum: { $cond: [{ $eq: ["$status", "sent"] }, 1, 0] } },
+                failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } },
+              }
+            },
+            { $sort: { _id: 1 } }
+          ],
+
+          topSenders: [
+            {
+              $group: {
+                _id: "$senderId",
+                total: { $sum: 1 },
+                failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } }
+              }
+            },
+            { $sort: { total: -1 } },
+            { $limit: 10 },
+            {
+              $lookup: {
+                from: "users",
+                localField: "_id",
+                foreignField: "_id",
+                as: "user"
+              }
+            },
+            { $unwind: "$user" }
+          ],
+
+          failureRate: [
+            {
+              $group: {
+                _id: null,
+                total: { $sum: 1 },
+                failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } }
+              }
+            },
+            {
+              $project: {
+                failureRate: {
+                  $divide: ["$failed", "$total"]
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]);
+
+    res.json({
+      success: true,
+      data: stats[0]
+    });
+
+  } catch (err) {
+    next(err);
+  }
 };

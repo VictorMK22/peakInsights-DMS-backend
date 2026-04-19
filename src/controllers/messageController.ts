@@ -3,13 +3,14 @@ import { AuthRequest } from '../types/auth';
 import { MessageModel } from '../models/Message';
 import { User } from '../models/User';
 import { SupervisorMapping } from '../models/SupervisorMapping';
+import { createNotification } from '../services/notificationService';
 import { getIO } from '../socket/socketServer';
-import mongoose from 'mongoose';
+
 
 /**
  * 🔒 RBAC Messaging Rules
  */
-const canSendTo = async (
+export const canSendTo = async (
   senderId: string,
   senderRole: string,
   receiverId: string
@@ -123,6 +124,19 @@ export const sendMessage = async (
       const io = getIO();
       io.to(`user:${receiverId}`).emit('new-message', populated);
     } catch {}
+
+    // 🔔 NOTIFICATION + EMAIL
+    const sender = await User.findById(senderId).select('name');
+    await createNotification(
+      receiverId,
+      `New message from ${sender?.name ?? 'Someone'}: ${subject ?? body.slice(0, 60)}`,
+      'new_message',
+      {
+        senderName:     sender?.name ?? 'Someone',
+        messageSubject: subject,
+        messageBody:    body,
+      }
+    );
 
     res.status(201).json({
       success: true,
@@ -246,6 +260,16 @@ export const markRead = async (req: AuthRequest, res: Response) => {
     msg.readAt = new Date();
     await msg.save();
 
+    // Notify the sender in real-time that their message was read.
+    // The sender's UI can then show a "read" indicator immediately.
+    try {
+      const io = getIO();
+      io.to(`user:${msg.senderId.toString()}`).emit('chat:read', {
+        messageId: id,
+        readAt:    msg.readAt,
+      });
+    } catch { /* socket not initialised in tests */ }
+
     res.json({ success: true });
   } catch (err) {
     console.error('❌ markRead:', err);
@@ -264,9 +288,11 @@ export const getUnreadCount = async (req: AuthRequest, res: Response) => {
       isRead: false,
     });
 
+    // NOTE: response key is `unreadCount` (not `count`) to match
+    // AppLayout.tsx which reads r.data.data.unreadCount
     res.json({
       success: true,
-      data: { count },
+      data: { unreadCount: count },
     });
   } catch (err) {
     console.error('❌ unreadCount:', err);
@@ -276,7 +302,7 @@ export const getUnreadCount = async (req: AuthRequest, res: Response) => {
 
 
 // =====================================================
-// 👥 CONTACTS (FIXED FOR UI)
+// 👥 CONTACTS
 // =====================================================
 export const getContacts = async (req: AuthRequest, res: Response) => {
   try {
@@ -325,3 +351,5 @@ export const getContacts = async (req: AuthRequest, res: Response) => {
     res.status(500).json({ success: false });
   }
 };
+
+

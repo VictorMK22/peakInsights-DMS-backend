@@ -1,9 +1,11 @@
 import { Response, NextFunction } from 'express';
 import { AuthRequest } from '../types/auth';
-import { TaskModel, ITask } from '../models/Task';
+import { TaskModel, TaskStatus, ITask } from '../models/Task';
 import { SupervisorMapping } from '../models/SupervisorMapping';
 import { User } from '../models/User';
+import { DocumentModel } from '../models/Document';
 import { createNotification } from '../services/notificationService';
+import { getLocalFileUrl } from '../middleware/upload';
 import mongoose from 'mongoose';
 
 // ─── Helpers ─────────────────────────────────────────────────────
@@ -21,13 +23,11 @@ const canViewTask = (task: ITask, userId: string, role: string): boolean =>
   task.collaborators.some((c) => c.userId.toString() === userId && c.status === 'active');
 
 // ─────────────────────────────────────────────────────────────────
-// CREATE — CEO assigns to anyone; Supervisor to their team only
+// CREATE TASK
+// CEO/Supervisor can upload files when creating the task.
+// These files serve as context/brief/requirements for the assignee.
 // ─────────────────────────────────────────────────────────────────
-export const createTask = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+export const createTask = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const role    = req.user!.role;
     const actorId = req.user!.userId;
@@ -63,41 +63,63 @@ export const createTask = async (
       }
     }
 
+    // Build taskFiles from any uploaded files
+    const uploadedFiles = (req.files as Express.Multer.File[]) ?? [];
+    const taskFiles = uploadedFiles.map((file) => ({
+      fileName:   file.originalname,
+      fileKey:    file.filename,
+      fileUrl:    getLocalFileUrl(file.filename),
+      fileSize:   file.size,
+      fileType:   file.mimetype,
+      uploadedBy: new mongoose.Types.ObjectId(actorId),
+      uploadedAt: new Date(),
+    }));
+
     const task = await TaskModel.create({
       title, description,
       assignedBy:   new mongoose.Types.ObjectId(actorId),
       assignedTo:   new mongoose.Types.ObjectId(assignedTo),
       documentId:   documentId ? new mongoose.Types.ObjectId(documentId) : undefined,
+      taskFiles,
+      submissionDocuments: [],
       priority:     priority ?? 'medium',
       dueDate:      dueDate ? new Date(dueDate) : undefined,
       status:       'pending',
       collaborators: [],
+      approvalHistory: [],
     });
+
+    const assigner = await User.findById(actorId).select('name').lean();
 
     await createNotification(
       assignedTo,
       `You have been assigned a new task: "${title}"`,
-      'task_assigned'
+      'task_assigned',
+      {
+        taskTitle:       title,
+        taskDescription: description,
+        taskPriority:    priority ?? 'medium',
+        taskDueDate:     dueDate,
+        taskId:          task._id.toString(),
+        assignerName:    assigner?.name ?? 'Your manager',
+      }
     );
 
     const populated = await TaskModel.findById(task._id)
       .populate('assignedBy', 'name email role')
       .populate('assignedTo', 'name email role')
       .populate('collaborators.userId', 'name email')
-      .populate('documentId', 'title');
+      .populate('documentId', 'title fileType')
+      .populate('submissionDocuments', 'title fileType createdAt');
 
     res.status(201).json({ success: true, message: 'Task created', data: { task: populated } });
   } catch (err) { next(err); }
 };
 
 // ─────────────────────────────────────────────────────────────────
-// READ ALL
+// READ ALL — role-scoped, paginated
 // ─────────────────────────────────────────────────────────────────
-export const getTasks = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+export const getTasks = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const role   = req.user!.role;
     const userId = new mongoose.Types.ObjectId(req.user!.userId);
@@ -108,7 +130,6 @@ export const getTasks = async (
     if (priority) filter['priority'] = priority;
 
     if (role === 'user') {
-      // User sees tasks assigned to them + tasks where they are an active collaborator
       filter['$or'] = [
         { assignedTo: userId },
         { 'collaborators': { $elemMatch: { userId, status: 'active' } } },
@@ -116,7 +137,6 @@ export const getTasks = async (
     } else if (role === 'supervisor') {
       filter['$or'] = [{ assignedTo: userId }, { assignedBy: userId }];
     }
-    // CEO: no filter
 
     const skip = (Number(page) - 1) * Number(limit);
     const [tasks, total] = await Promise.all([
@@ -124,7 +144,8 @@ export const getTasks = async (
         .populate('assignedBy', 'name email role')
         .populate('assignedTo', 'name email role')
         .populate('collaborators.userId', 'name email')
-        .populate('documentId', 'title')
+        .populate('documentId', 'title fileType')
+        .populate('submissionDocuments', 'title fileType createdAt')
         .sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),
       TaskModel.countDocuments(filter),
     ]);
@@ -138,19 +159,17 @@ export const getTasks = async (
 };
 
 // ─────────────────────────────────────────────────────────────────
-// READ ONE
+// READ ONE — includes all linked documents for review
 // ─────────────────────────────────────────────────────────────────
-export const getTask = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+export const getTask = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const task = await TaskModel.findById(req.params.id)
       .populate('assignedBy', 'name email role')
       .populate('assignedTo', 'name email role')
       .populate('collaborators.userId', 'name email')
-      .populate('documentId', 'title');
+      .populate('documentId', 'title fileType versionHistory')
+      .populate('submissionDocuments', 'title fileType versionHistory createdAt')
+      .populate('approvalHistory.by', 'name role');
 
     if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }
     if (!canViewTask(task, req.user!.userId, req.user!.role)) {
@@ -161,13 +180,9 @@ export const getTask = async (
 };
 
 // ─────────────────────────────────────────────────────────────────
-// UPDATE METADATA — assigner edits meta; assignee sets target/notes
+// UPDATE METADATA
 // ─────────────────────────────────────────────────────────────────
-export const updateTask = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+export const updateTask = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const task = await TaskModel.findById(req.params.id);
     if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }
@@ -209,211 +224,191 @@ export const updateTask = async (
 };
 
 // ─────────────────────────────────────────────────────────────────
-// UPDATE STATUS — drives TAT measurement
+// UPDATE STATUS — TAT lifecycle
 //
-//  pending     → in_progress : assignee commits targetMinutes; startedAt recorded
-//  in_progress → completed   : tatMinutes + efficiencyRatio calculated;
-//                              ALL collaborator access immediately revoked
-//  any         → cancelled   : assigner or CEO only; collaborators revoked
+//  pending     → in_progress : assignee commits targetMinutes
+//  in_progress → submitted   : assignee attaches supporting documents
+//  submitted   → completed   : approver (supervisor/CEO) reviews docs + approves
+//  submitted   → rejected    : approver rejects with reason (goes back to in_progress)
+//  any         → cancelled   : assigner or CEO only
 // ─────────────────────────────────────────────────────────────────
-export const updateTaskStatus = async (
-  req: AuthRequest,
-  res: Response
-): Promise<void> => {
+export const updateTaskStatus = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
-    const { taskId } = req.params;
-    const { status, submissionComment } = req.body;
-    const userId = req.user?.userId;
+    const task = await TaskModel.findById(req.params.id);
+    if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }
 
-    const task = await TaskModel.findById(taskId);
+    const userId     = req.user!.userId;
+    const isAssignee = task.assignedTo.toString() === userId;
+    const isAssigner = task.assignedBy.toString() === userId;
+    const isCEO      = req.user!.role === 'ceo';
+    const isSupervisor = req.user!.role === 'supervisor';
 
-    if (!task) {
-      res.status(404).json({ success: false, message: "Task not found" });
-      return;
-    }
-
-    if (task.assignedTo.toString() !== userId) {
-      res.status(403).json({ success: false, message: "Unauthorized" });
-      return;
-    }
-
-    if (status === "in_progress" && task.status === "pending") {
-      task.status = "in_progress";
-      task.startedAt = new Date();
-    } else if (status === "submitted" && task.status === "in_progress") {
-      if (!task.proofFiles?.length && !submissionComment) {
-        res.status(400).json({
-          success: false,
-          message: "Attach proof of work or add a submission comment",
-        });
-        return;
-      }
-    
-      const now = new Date();
-    
-      task.status = "submitted";
-      task.submittedAt = now;
-      task.completedAt = now; // ✅ IMPORTANT
-      task.submissionComment = submissionComment;
-    
-      // ✅ CALCULATE WORK METRICS HERE
-      if (task.startedAt) {
-        task.tatMinutes = calcTAT(task.startedAt, now);
-      }
-    
-      if (task.targetMinutes && task.tatMinutes) {
-        task.efficiencyRatio = calcEfficiency(
-          task.targetMinutes,
-          task.tatMinutes
-        );
-      }
-    
-      await createNotification(
-        task.assignedBy.toString(),
-        `Task "${task.title}" submitted for approval`,
-        "task_submitted"
-      );
-    } else {
-      res.status(400).json({
-        success: false,
-        message: "Invalid status transition",
-      });
-      return;
-    }
-
-    await task.save();
-
-    res.json({ success: true, data: task });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ success: false, message: "Server error" });
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────
-// UPDATE TASK
-// ─────────────────────────────────────────────────────────────────
-export const approveTask = async (
-  req: AuthRequest,
-  res: Response
-): Promise<void> => {
-  try {
-    const { taskId } = req.params;
-    const { action, rejectionReason } = req.body as {
-      action: "approve" | "reject";
+    const {
+      status,
+      targetMinutes,
+      notes,
+      submissionComment,
+      submissionDocumentIds, // array of existing document IDs to attach
+      rejectionReason,
+    } = req.body as {
+      status: TaskStatus;
+      targetMinutes?: number;
+      notes?: string;
+      submissionComment?: string;
+      submissionDocumentIds?: string[];
       rejectionReason?: string;
     };
 
-    const userId = req.user?.userId;
-
-    const task = await TaskModel.findById(taskId);
-
-    // ❌ Task not found
-    if (!task) {
-      res.status(404).json({ success: false, message: "Task not found" });
-      return;
+    const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'submitted', 'completed', 'rejected', 'cancelled'];
+    if (!validStatuses.includes(status)) {
+      res.status(400).json({ success: false, message: 'Invalid status' }); return;
     }
 
-    // ❌ Only assigner can approve/reject
-    if (task.assignedBy.toString() !== userId) {
-      res.status(403).json({ success: false, message: "Unauthorized" });
-      return;
+    if (status === 'cancelled' && !isAssigner && !isCEO) {
+      res.status(403).json({ success: false, message: 'Only the task creator or CEO can cancel tasks' }); return;
     }
 
-    // ❌ Must be submitted first
-    if (task.status !== "submitted") {
-      res.status(400).json({
-        success: false,
-        message: "Task must be submitted before approval",
-      });
-      return;
+    if (['in_progress', 'submitted'].includes(status) && !isAssignee && !isCEO) {
+      res.status(403).json({ success: false, message: 'Only the task assignee can start or submit tasks' }); return;
+    }
+
+    if (['completed', 'rejected'].includes(status) && !isAssigner && !isCEO && !isSupervisor) {
+      res.status(403).json({ success: false, message: 'Only the task creator, supervisor, or CEO can approve/reject tasks' }); return;
     }
 
     const now = new Date();
 
-    if (!task.approvalHistory) {
-      task.approvalHistory = [];
+    // ── pending → in_progress ────────────────────────────────────
+    if (status === 'in_progress' && task.status === 'pending') {
+      const target = targetMinutes ?? task.targetMinutes;
+      if (!target || target < 1) {
+        res.status(400).json({
+          success: false,
+          message: 'You must set targetMinutes before starting. This is your personal commitment.',
+        }); return;
+      }
+      task.targetMinutes = target;
+      task.startedAt     = now;
+      task.status        = 'in_progress';
     }
 
-    // ✅ APPROVE
-    if (action === "approve") {
-      task.status = "completed";
-      task.approvedAt = now;
+    // ── in_progress → submitted ───────────────────────────────────
+    // Assignee submits for approval and can link supporting documents
+    else if (status === 'submitted' && task.status === 'in_progress') {
+      task.status           = 'submitted';
+      task.submittedAt      = now;
+      if (submissionComment) task.submissionComment = submissionComment;
 
-      // ✅ approval duration
-      if (task.submittedAt) {
-        task.approvalDurationMinutes = calcTAT(task.submittedAt, now);
+      // Attach documents the assignee is submitting as proof of work
+      if (submissionDocumentIds?.length) {
+        const validIds = submissionDocumentIds.map(id => new mongoose.Types.ObjectId(id));
+        task.submissionDocuments = validIds;
       }
 
-      // ✅ history
-      task.approvalHistory.push({
-        action: "approved",
-        by: new mongoose.Types.ObjectId(userId),
-        at: now,
-      });
-
       await createNotification(
-        task.assignedTo.toString(),
-        `Task "${task.title}" has been approved and completed`,
-        "task_completed"
+        task.assignedBy.toString(),
+        `Task "${task.title}" has been submitted for your review`,
+        'task_submitted'
       );
     }
 
-    // ❌ REJECT
-    else if (action === "reject") {
-      if (!rejectionReason) {
-        res.status(400).json({
-          success: false,
-          message: "Rejection reason is required",
-        });
-        return;
+    // ── submitted → completed (APPROVAL) ─────────────────────────
+    else if (status === 'completed' && task.status === 'submitted') {
+      task.completedAt = now;
+      task.status      = 'completed';
+
+      if (task.startedAt) {
+        task.tatMinutes = calcTAT(task.startedAt, now);
+        if (task.targetMinutes) {
+          task.efficiencyRatio = calcEfficiency(task.targetMinutes, task.tatMinutes);
+        }
       }
 
-      task.status = "in_progress";
+      // Revoke all collaborators
+      const revokedAt = now;
+      task.collaborators = task.collaborators.map((c) => ({
+        ...c, status: 'revoked' as const, revokedAt,
+      }));
+
+      task.approvalHistory.push({
+        action: 'approved',
+        by:     new mongoose.Types.ObjectId(userId),
+        at:     now,
+      });
+
+      const assigneeUser = await User.findById(task.assignedTo).select('name').lean();
+      await createNotification(
+        task.assignedTo.toString(),
+        `Task "${task.title}" has been approved and marked complete`,
+        'task_completed',
+        {
+          taskTitle:       task.title,
+          assigneeName:    assigneeUser?.name ?? 'The assignee',
+          efficiencyRatio: task.efficiencyRatio,
+        }
+      );
+    }
+
+    // ── submitted → rejected ──────────────────────────────────────
+    else if (status === 'rejected' && task.status === 'submitted') {
+      if (!rejectionReason) {
+        res.status(400).json({ success: false, message: 'A rejection reason is required' }); return;
+      }
+      task.status          = 'in_progress'; // returns to in_progress so assignee can rework
       task.rejectionReason = rejectionReason;
 
-      // ✅ history
       task.approvalHistory.push({
-        action: "rejected",
-        by: new mongoose.Types.ObjectId(userId),
-        at: now,
+        action: 'rejected',
+        by:     new mongoose.Types.ObjectId(userId),
+        at:     now,
         reason: rejectionReason,
       });
 
       await createNotification(
         task.assignedTo.toString(),
         `Task "${task.title}" was rejected: ${rejectionReason}`,
-        "task_rejected"
+        'task_rejected'
       );
     }
 
-    // ❌ Invalid action
-    else {
-      res.status(400).json({
-        success: false,
-        message: "Invalid action",
-      });
-      return;
+    // ── cancellation ─────────────────────────────────────────────
+    else if (status === 'cancelled') {
+      task.status = 'cancelled';
+      const revokedAt = now;
+      task.collaborators = task.collaborators.map((c) => ({
+        ...c, status: 'revoked' as const, revokedAt,
+      }));
     }
 
+    else if (task.status === status) {
+      res.status(400).json({ success: false, message: `Task is already ${status}` }); return;
+    } else {
+      res.status(400).json({
+        success: false,
+        message: `Cannot transition from "${task.status}" to "${status}"`,
+      }); return;
+    }
+
+    if (notes !== undefined) task.notes = notes;
     await task.save();
 
-    res.json({ success: true, data: task });
+    // Return fully populated task so the reviewer can see all linked docs
+    const populated = await TaskModel.findById(task._id)
+      .populate('assignedBy', 'name email role')
+      .populate('assignedTo', 'name email role')
+      .populate('collaborators.userId', 'name email')
+      .populate('documentId', 'title fileType versionHistory')
+      .populate('submissionDocuments', 'title fileType versionHistory createdAt')
+      .populate('approvalHistory.by', 'name role');
 
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ success: false, message: "Server error" });
-  }
+    res.json({ success: true, message: 'Task updated', data: { task: populated } });
+  } catch (err) { next(err); }
 };
 
 // ─────────────────────────────────────────────────────────────────
 // DELETE
 // ─────────────────────────────────────────────────────────────────
-export const deleteTask = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+export const deleteTask = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const task = await TaskModel.findById(req.params.id);
     if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }
@@ -432,22 +427,8 @@ export const deleteTask = async (
 
 // ─────────────────────────────────────────────────────────────────
 // INVITE COLLABORATOR
-//
-// The task assignee (or CEO) can invite another user to help.
-// Rules:
-//   - Task must be in_progress
-//   - Invitee must be in the same team (supervisor mapping) OR CEO inviting anyone
-//   - Cannot invite someone already an active collaborator
-//   - Cannot invite the assignee themselves
-//
-// When the task is completed or cancelled, access is auto-revoked
-// in updateTaskStatus — no manual revocation needed.
 // ─────────────────────────────────────────────────────────────────
-export const inviteTaskCollaborator = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+export const inviteTaskCollaborator = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { id } = req.params as { id: string };
     const { inviteeId } = req.body as { inviteeId: string };
@@ -459,75 +440,57 @@ export const inviteTaskCollaborator = async (
     const isCEO      = req.user!.role === 'ceo';
 
     if (!isAssignee && !isCEO) {
-      res.status(403).json({ success: false, message: 'Only the task assignee or CEO can invite collaborators' });
-      return;
+      res.status(403).json({ success: false, message: 'Only the task assignee or CEO can invite collaborators' }); return;
     }
 
     if (task.status !== 'in_progress') {
-      res.status(400).json({ success: false, message: 'Collaborators can only be invited to tasks that are in progress' });
-      return;
+      res.status(400).json({ success: false, message: 'Collaborators can only be invited to in-progress tasks' }); return;
     }
 
     if (inviteeId === req.user!.userId) {
-      res.status(400).json({ success: false, message: 'You cannot invite yourself as a collaborator' });
-      return;
+      res.status(400).json({ success: false, message: 'You cannot invite yourself' }); return;
     }
 
-    if (inviteeId === task.assignedTo.toString()) {
-      res.status(400).json({ success: false, message: 'The assignee is already the task owner' });
-      return;
-    }
-
-    // Check invitee is already an active collaborator
-    const alreadyCollaborating = task.collaborators.some(
+    const alreadyActive = task.collaborators.some(
       (c) => c.userId.toString() === inviteeId && c.status === 'active'
     );
-    if (alreadyCollaborating) {
-      res.status(400).json({ success: false, message: 'This user is already an active collaborator' });
-      return;
+    if (alreadyActive) {
+      res.status(400).json({ success: false, message: 'This user is already an active collaborator' }); return;
     }
 
-    // Verify the invitee exists and is active
     const invitee = await User.findById(inviteeId).select('name isActive');
     if (!invitee?.isActive) {
-      res.status(404).json({ success: false, message: 'Invitee not found or inactive' });
-      return;
+      res.status(404).json({ success: false, message: 'Invitee not found or inactive' }); return;
     }
 
-    // Supervisors can only invite from their own team
     if (req.user!.role === 'supervisor') {
       const mapping = await SupervisorMapping.findOne({
-        supervisorId: req.user!.userId,
-        subordinateId: inviteeId,
-        status: 'active',
+        supervisorId: req.user!.userId, subordinateId: inviteeId, status: 'active',
       });
       if (!mapping) {
-        res.status(403).json({ success: false, message: 'You can only invite members of your own team' });
-        return;
+        res.status(403).json({ success: false, message: 'You can only invite members of your own team' }); return;
       }
     }
 
-    // Add collaborator (re-add if previously revoked, otherwise push new)
     const existingIdx = task.collaborators.findIndex((c) => c.userId.toString() === inviteeId);
     if (existingIdx >= 0) {
-      // Re-invite a previously revoked collaborator
       task.collaborators[existingIdx].status    = 'active';
       task.collaborators[existingIdx].invitedAt = new Date();
       task.collaborators[existingIdx].revokedAt = undefined;
     } else {
       task.collaborators.push({
-        userId:    new mongoose.Types.ObjectId(inviteeId),
-        invitedAt: new Date(),
-        status:    'active',
+        userId: new mongoose.Types.ObjectId(inviteeId), invitedAt: new Date(), status: 'active',
       });
     }
 
     await task.save();
 
+    const inviter = await User.findById(req.user!.userId).select('name').lean();
     await createNotification(
       inviteeId,
       `You have been invited to collaborate on task: "${task.title}"`,
-      'task_collaboration_invite'
+      'task_collaboration_invite',
+      { taskTitle: task.title, inviterName: inviter?.name ?? 'A colleague' }
     );
 
     res.json({ success: true, message: `${invitee.name} invited as a collaborator` });
@@ -535,17 +498,11 @@ export const inviteTaskCollaborator = async (
 };
 
 // ─────────────────────────────────────────────────────────────────
-// REVOKE COLLABORATOR — manual early revocation
-// Assignee or CEO can revoke before task completion.
+// REVOKE COLLABORATOR
 // ─────────────────────────────────────────────────────────────────
-export const revokeTaskCollaborator = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+export const revokeTaskCollaborator = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { id, collaboratorId } = req.params as { id: string; collaboratorId: string };
-
     const task = await TaskModel.findById(id);
     if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }
 
@@ -553,16 +510,14 @@ export const revokeTaskCollaborator = async (
     const isCEO      = req.user!.role === 'ceo';
 
     if (!isAssignee && !isCEO) {
-      res.status(403).json({ success: false, message: 'Only the task assignee or CEO can revoke collaborator access' });
-      return;
+      res.status(403).json({ success: false, message: 'Only the task assignee or CEO can revoke collaborator access' }); return;
     }
 
     const collaborator = task.collaborators.find(
       (c) => c.userId.toString() === collaboratorId && c.status === 'active'
     );
     if (!collaborator) {
-      res.status(404).json({ success: false, message: 'Active collaborator not found' });
-      return;
+      res.status(404).json({ success: false, message: 'Active collaborator not found' }); return;
     }
 
     collaborator.status    = 'revoked';
@@ -574,18 +529,13 @@ export const revokeTaskCollaborator = async (
 };
 
 // ─────────────────────────────────────────────────────────────────
-// TASK LEADERBOARD
+// LEADERBOARD
 // ─────────────────────────────────────────────────────────────────
-export const getTaskLeaderboard = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+export const getTaskLeaderboard = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { limit = '10' } = req.query as Record<string, string>;
     const matchStage: Record<string, unknown> = {
-      status: 'completed',
-      efficiencyRatio: { $exists: true },
+      status: 'completed', efficiencyRatio: { $exists: true },
     };
 
     if (req.user!.role === 'supervisor') {
@@ -615,13 +565,9 @@ export const getTaskLeaderboard = async (
 };
 
 // ─────────────────────────────────────────────────────────────────
-// INDIVIDUAL APPRAISAL REPORT
+// INDIVIDUAL APPRAISAL
 // ─────────────────────────────────────────────────────────────────
-export const getUserAppraisal = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+export const getUserAppraisal = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const { userId } = req.params as { userId: string };
 
@@ -648,12 +594,9 @@ export const getUserAppraisal = async (
           avgEfficiency:    { $avg: '$efficiencyRatio' },
           avgTatMinutes:    { $avg: '$tatMinutes' },
           avgTargetMinutes: { $avg: '$targetMinutes' },
-          onTimeTasks: { $sum: {
-            $cond: [{ $and: [
-              { $gte: ['$efficiencyRatio', 1] },
-              { $eq:  ['$status', 'completed'] },
-            ]}, 1, 0],
-          }},
+          onTimeTasks: { $sum: { $cond: [{ $and: [
+            { $gte: ['$efficiencyRatio', 1] }, { $eq: ['$status', 'completed'] },
+          ]}, 1, 0] }},
         }},
       ]),
       TaskModel.find({ assignedTo: targetId, status: 'completed' })
@@ -672,10 +615,10 @@ export const getUserAppraisal = async (
       data: {
         appraisal: {
           ...stats,
-          completionRate:  stats.totalTasks > 0 ? `${((stats.completedTasks / stats.totalTasks) * 100).toFixed(1)}%` : '0%',
-          onTimeRate:      stats.completedTasks > 0 ? `${((stats.onTimeTasks / stats.completedTasks) * 100).toFixed(1)}%` : '0%',
-          avgEfficiency:   stats.avgEfficiency ? Number(stats.avgEfficiency.toFixed(3)) : null,
-          avgTatMinutes:   stats.avgTatMinutes ? Math.round(stats.avgTatMinutes) : null,
+          completionRate: stats.totalTasks > 0 ? `${((stats.completedTasks / stats.totalTasks) * 100).toFixed(1)}%` : '0%',
+          onTimeRate:     stats.completedTasks > 0 ? `${((stats.onTimeTasks / stats.completedTasks) * 100).toFixed(1)}%` : '0%',
+          avgEfficiency:  stats.avgEfficiency ? Number(stats.avgEfficiency.toFixed(3)) : null,
+          avgTatMinutes:  stats.avgTatMinutes ? Math.round(stats.avgTatMinutes) : null,
         },
         recentTasks,
       },
@@ -683,31 +626,75 @@ export const getUserAppraisal = async (
   } catch (err) { next(err); }
 };
 
-
-export const supervisorApproveTask = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-): Promise<void> => {
+// ─────────────────────────────────────────────────────────────────
+// APPROVE TASK  (PATCH /:id/approve)
+// Convenience endpoint: CEO or Supervisor can approve a submitted
+// task without going through the full updateTaskStatus flow.
+// Equivalent to PATCH /:id/status with { status: 'completed' }.
+// ─────────────────────────────────────────────────────────────────
+export const approveTask = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {
   try {
     const task = await TaskModel.findById(req.params.id);
+    if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }
 
-    if (!task) {
-      res.status(404).json({ message: "Task not found" });
-      return;
+    const userId = req.user!.userId;
+    const role   = req.user!.role;
+
+    if (role !== 'ceo' && role !== 'supervisor') {
+      res.status(403).json({ success: false, message: 'Only CEO or Supervisor can approve tasks' }); return;
     }
 
-    task.status = "completed"; // ⚠️ see issue #3 below
-    task.set("approvedBy", req.user!.userId);
-    task.set("approvedAt", new Date());
+    if (task.status !== 'submitted') {
+      res.status(400).json({
+        success: false,
+        message: `Cannot approve a task that is "${task.status}" — task must be submitted first`,
+      }); return;
+    }
+
+    const now = new Date();
+    task.status      = 'completed';
+    task.completedAt = now;
+
+    if (task.startedAt) {
+      task.tatMinutes = calcTAT(task.startedAt, now);
+      if (task.targetMinutes) {
+        task.efficiencyRatio = calcEfficiency(task.targetMinutes, task.tatMinutes);
+      }
+    }
+
+    // Auto-revoke all active collaborators on completion
+    task.collaborators = task.collaborators.map((c) => ({
+      ...c, status: 'revoked' as const, revokedAt: now,
+    }));
+
+    task.approvalHistory.push({
+      action: 'approved',
+      by:     new mongoose.Types.ObjectId(userId),
+      at:     now,
+    });
 
     await task.save();
 
-    res.json({
-      message: "Task approved successfully",
-      task,
-    });
-  } catch (error) {
-    next(error);
-  }
+    const assigneeUser = await User.findById(task.assignedTo).select('name').lean();
+    await createNotification(
+      task.assignedTo.toString(),
+      `Task "${task.title}" has been approved and marked complete`,
+      'task_completed',
+      {
+        taskTitle:       task.title,
+        assigneeName:    assigneeUser?.name ?? 'The assignee',
+        efficiencyRatio: task.efficiencyRatio,
+      }
+    );
+
+    const populated = await TaskModel.findById(task._id)
+      .populate('assignedBy', 'name email role')
+      .populate('assignedTo', 'name email role')
+      .populate('collaborators.userId', 'name email')
+      .populate('documentId', 'title fileType versionHistory')
+      .populate('submissionDocuments', 'title fileType versionHistory createdAt')
+      .populate('approvalHistory.by', 'name role');
+
+    res.json({ success: true, message: 'Task approved and completed', data: { task: populated } });
+  } catch (err) { next(err); }
 };
