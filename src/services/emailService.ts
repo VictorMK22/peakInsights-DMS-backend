@@ -57,8 +57,6 @@ function getTransporter(): Transporter | null {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
-
-const FROM    = `"PeakInsights" <${process.env.SMTP_USER ?? 'noreply@peakinsights.com'}>`;
 const APP_URL = process.env.FRONTEND_URL ?? 'http://localhost:5173';
 
 /** Send a single email. Never throws — logs on failure. */
@@ -71,11 +69,19 @@ async function send(
   const t = getTransporter();
   if (!t) return null;
 
+  const from = `"PeakInsights" <${process.env.SMTP_USER}>`;
+
   try {
-    const info = await t.sendMail({ from: FROM, to, subject, html, replyTo });
+    const info = await t.sendMail({
+      from: from,        // 🔥 FIXED (ONLY AUTH USER)
+      to,
+      subject,
+      html,
+      replyTo,           
+    });
 
     console.log(`📧 Email sent → ${to}: ${subject}`);
-    return info; // ✅ IMPORTANT
+    return info;
   } catch (err) {
     console.error(`❌ Email failed → ${to}: ${subject}`, err);
     return null;
@@ -339,33 +345,26 @@ export async function sendDirectUserEmail(options: DirectEmailOptions): Promise<
     toEmail,
     toName,
     fromName = 'A colleague',
-    fromEmail = '',
+    fromEmail,
     subject,
     body,
   } = options;
 
-  const MAX_SUBJECT_LENGTH = 150;
-  const MAX_BODY_LENGTH = 5000;
+  const safeSubject = subject.slice(0, 150);
+  const trimmedBody = body.slice(0, 5000);
 
-  const safeSubject = subject.slice(0, MAX_SUBJECT_LENGTH);
-  const trimmedBody = body.slice(0, MAX_BODY_LENGTH);
-
-  function escapeHtml(input: string): string {
-    return input
+  const escapeHtml = (input: string) =>
+    input
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#039;');
-  }
 
   const safeBody = escapeHtml(trimmedBody).replace(/\n/g, '<br/>');
+  
+  const senderLine = fromName;
 
-  const senderLine = fromEmail
-    ? `${fromName} (${fromEmail})`
-    : fromName;
-
-  // ✅ Audit log
   console.log('📨 Direct Email Sent', {
     to: toEmail,
     from: fromEmail,
@@ -381,16 +380,12 @@ export async function sendDirectUserEmail(options: DirectEmailOptions): Promise<
       ${p('<strong>From:</strong> ' + senderLine)}
       ${p(safeBody)}
       ${highlight('Reply directly to respond to the sender.')}
-    `),
-    fromEmail || undefined 
+    `)
   );
 
   if (!result?.messageId) {
-    console.error('Email failed: SMTP rejected sender or send failed');
+    throw new Error('SMTP send failed');
   }
 
-  return {
-    messageId: result?.messageId,
-  };
-
+  return { messageId: result.messageId };
 }

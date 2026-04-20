@@ -6,166 +6,129 @@ import { SupervisorMapping } from '../models/SupervisorMapping';
 import { createNotification } from '../services/notificationService';
 import { getIO } from '../socket/socketServer';
 
-
-/**
- * 🔒 RBAC Messaging Rules
- */
 export const canSendTo = async (
   senderId: string,
   senderRole: string,
   receiverId: string
 ) => {
   const receiver = await User.findById(receiverId).select('role isActive');
-  if (!receiver || !receiver.isActive) {
+  if (!receiver || !receiver.isActive)
     return { allowed: false, message: 'Recipient not found or inactive' };
-  }
-
   if (senderRole === 'ceo') return { allowed: true };
-
   if (senderRole === 'supervisor') {
     if (receiver.role === 'ceo') return { allowed: true };
-
     if (receiver.role === 'user') {
       const mapping = await SupervisorMapping.findOne({
-        supervisorId: senderId,
-        subordinateId: receiverId,
-        status: 'active',
+        supervisorId: senderId, subordinateId: receiverId, status: 'active',
       });
       if (mapping) return { allowed: true };
     }
-
     return { allowed: false, message: 'You can only message your team or CEO' };
   }
-
   if (senderRole === 'user') {
     const mapping = await SupervisorMapping.findOne({
-      subordinateId: senderId,
-      supervisorId: receiverId,
-      status: 'active',
+      subordinateId: senderId, supervisorId: receiverId, status: 'active',
     });
-
     if (mapping) return { allowed: true };
-
     return { allowed: false, message: 'You can only message your supervisor' };
   }
-
   return { allowed: false, message: 'Not allowed' };
 };
 
-
-// =====================================================
-// 📩 SEND MESSAGE
-// =====================================================
-export const sendMessage = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-) => {
+export const sendMessage = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const senderId = req.user!.userId;
+    const senderId   = req.user!.userId;
     const senderRole = req.user!.role;
-
     const { receiverId, subject, body, parentId } = req.body;
 
-    if (!receiverId || !body) {
-      return res.status(400).json({
-        success: false,
-        message: 'receiverId and body are required',
-      });
-    }
+    if (!receiverId || !body)
+      return res.status(400).json({ success: false, message: 'receiverId and body are required' });
 
-    // 🔒 THREAD REPLY LOGIC
     if (parentId) {
-      const parent = await MessageModel.findById(parentId);
-      if (!parent) {
-        return res.status(404).json({ success: false, message: 'Parent not found' });
-      }
-
+      const parent = await MessageModel.findById(parentId).select('senderId receiverId');
+      if (!parent) return res.status(404).json({ success: false, message: 'Parent not found' });
       const isParticipant =
         parent.senderId.toString() === senderId ||
         parent.receiverId.toString() === senderId;
-
-      if (!isParticipant) {
-        return res.status(403).json({
-          success: false,
-          message: 'Not part of this conversation',
-        });
-      }
+      if (!isParticipant)
+        return res.status(403).json({ success: false, message: 'Not part of this conversation' });
     } else {
-      const { allowed, message } = await canSendTo(
-        senderId,
-        senderRole,
-        receiverId
-      );
-
-      if (!allowed) {
-        return res.status(403).json({
-          success: false,
-          message,
-        });
-      }
+      const { allowed, message } = await canSendTo(senderId, senderRole, receiverId);
+      if (!allowed) return res.status(403).json({ success: false, message });
     }
 
     const message = await MessageModel.create({
-      senderId,
-      receiverId,
-      subject,
-      body,
+      senderId, receiverId, subject, body,
       parentId: parentId || null,
       isRead: false,
     });
 
+    // Only select the fields the frontend actually needs
     const populated = await MessageModel.findById(message._id)
-      .populate('senderId', 'name role profilePicture')
-      .populate('receiverId', 'name role profilePicture');
+      .select('senderId receiverId subject body isRead createdAt parentId')
+      .populate('senderId',   'name role profilePicture')
+      .populate('receiverId', 'name role');
 
-    // 🔌 SOCKET
     try {
       const io = getIO();
       io.to(`user:${receiverId}`).emit('new-message', populated);
     } catch {}
 
-    // 🔔 NOTIFICATION + EMAIL
     const sender = await User.findById(senderId).select('name');
     await createNotification(
       receiverId,
       `New message from ${sender?.name ?? 'Someone'}: ${subject ?? body.slice(0, 60)}`,
       'new_message',
-      {
-        senderName:     sender?.name ?? 'Someone',
-        messageSubject: subject,
-        messageBody:    body,
-      }
+      { senderName: sender?.name ?? 'Someone', messageSubject: subject, messageBody: body }
     );
 
-    res.status(201).json({
-      success: true,
-      data: { message: populated },
-    });
+    res.status(201).json({ success: true, data: { message: populated } });
   } catch (err) {
     console.error('❌ sendMessage:', err);
     next(err);
   }
 };
 
+// ── Shared pagination helper ───────────────────────────────────────
+const parsePage = (q: Record<string, string>) => ({
+  page:  Math.max(1, parseInt(q.page  ?? '1',  10)),
+  limit: Math.min(50, parseInt(q.limit ?? '20', 10)),  // cap at 50
+});
 
-// =====================================================
-// 📥 INBOX
-// =====================================================
 export const getInbox = async (req: AuthRequest, res: Response) => {
   try {
+    const { page, limit } = parsePage(req.query as Record<string, string>);
+    const skip = (page - 1) * limit;
     const userId = req.user!.userId;
 
-    const messages = await MessageModel.find({
-      receiverId: userId,
-      parentId: null,
-    })
-      .populate('senderId', 'name role profilePicture')
-      .sort({ createdAt: -1 });
+    // Find all root messages where this user is involved (sent or received)
+    // Then for each, get the latest activity (reply or the message itself)
+    const [messages, total] = await Promise.all([
+      MessageModel.find({
+        $or: [
+          { receiverId: userId, parentId: null },  // received top-level
+          { senderId:   userId, parentId: null },  // sent top-level (so replies to them show)
+        ],
+      })
+        .select('senderId receiverId subject body isRead createdAt')
+        .populate('senderId',   'name role profilePicture')
+        .populate('receiverId', 'name role')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      MessageModel.countDocuments({
+        $or: [
+          { receiverId: userId, parentId: null },
+          { senderId:   userId, parentId: null },
+        ],
+      }),
+    ]);
 
     res.json({
       success: true,
       data: { messages },
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err) {
     console.error('❌ getInbox:', err);
@@ -173,24 +136,27 @@ export const getInbox = async (req: AuthRequest, res: Response) => {
   }
 };
 
-
-// =====================================================
-// 📤 SENT
-// =====================================================
 export const getSent = async (req: AuthRequest, res: Response) => {
   try {
-    const userId = req.user!.userId;
+    const { page, limit } = parsePage(req.query as Record<string, string>);
+    const skip = (page - 1) * limit;
 
-    const messages = await MessageModel.find({
-      senderId: userId,
-      parentId: null,
-    })
-      .populate('receiverId', 'name role profilePicture')
-      .sort({ createdAt: -1 });
+    const [messages, total] = await Promise.all([
+      MessageModel.find({ senderId: req.user!.userId, parentId: null })
+        .select('senderId receiverId subject body isRead createdAt')
+        .populate('senderId',   'name role profilePicture')
+        .populate('receiverId', 'name role')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      MessageModel.countDocuments({ senderId: req.user!.userId, parentId: null }),
+    ]);
 
     res.json({
       success: true,
       data: { messages },
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err) {
     console.error('❌ getSent:', err);
@@ -198,41 +164,43 @@ export const getSent = async (req: AuthRequest, res: Response) => {
   }
 };
 
-
-// =====================================================
-// 🧵 THREAD
-// =====================================================
 export const getThread = async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const userId = req.user!.userId;
+    const userId  = req.user!.userId;
+    const { page, limit } = parsePage(req.query as Record<string, string>);
+    const skip = (page - 1) * limit;
 
+    // Fetch parent with minimal fields — no lean() so _id toString works
     const parent = await MessageModel.findById(id)
-      .populate('senderId', 'name role profilePicture')
-      .populate('receiverId', 'name role profilePicture');
+      .select('senderId receiverId subject body isRead createdAt')
+      .populate('senderId',   'name role profilePicture')
+      .populate('receiverId', 'name role');
 
-    if (!parent) {
-      return res.status(404).json({ success: false });
-    }
+    if (!parent) return res.status(404).json({ success: false });
 
     const isParticipant =
       parent.senderId._id.toString() === userId ||
       parent.receiverId._id.toString() === userId;
+    if (!isParticipant) return res.status(403).json({ success: false });
 
-    if (!isParticipant) {
-      return res.status(403).json({ success: false });
-    }
-
-    const replies = await MessageModel.find({ parentId: id })
-      .populate('senderId', 'name role profilePicture')
-      .sort({ createdAt: 1 });
+    // Paginate replies — oldest first (natural chat order)
+    const [replies, totalReplies] = await Promise.all([
+      MessageModel.find({ parentId: id })
+        .select('senderId receiverId body isRead createdAt parentId')
+        .populate('senderId',   'name role profilePicture')
+        .populate('receiverId', 'name role')
+        .sort({ createdAt: 1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      MessageModel.countDocuments({ parentId: id }),
+    ]);
 
     res.json({
       success: true,
-      data: {
-        parent,
-        replies,
-      },
+      data: { parent, replies },
+      pagination: { page, limit, total: totalReplies, totalPages: Math.ceil(totalReplies / limit) },
     });
   } catch (err) {
     console.error('❌ getThread:', err);
@@ -240,35 +208,27 @@ export const getThread = async (req: AuthRequest, res: Response) => {
   }
 };
 
-
-// =====================================================
-// ✅ MARK READ
-// =====================================================
 export const markRead = async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const userId = req.user!.userId;
+    const userId  = req.user!.userId;
 
-    const msg = await MessageModel.findById(id);
+    const msg = await MessageModel.findById(id).select('receiverId senderId isRead readAt');
     if (!msg) return res.status(404).json({ success: false });
-
-    if (msg.receiverId.toString() !== userId) {
+    if (msg.receiverId.toString() !== userId)
       return res.status(403).json({ success: false });
-    }
 
     msg.isRead = true;
     msg.readAt = new Date();
     await msg.save();
 
-    // Notify the sender in real-time that their message was read.
-    // The sender's UI can then show a "read" indicator immediately.
     try {
       const io = getIO();
       io.to(`user:${msg.senderId.toString()}`).emit('chat:read', {
         messageId: id,
         readAt:    msg.readAt,
       });
-    } catch { /* socket not initialised in tests */ }
+    } catch {}
 
     res.json({ success: true });
   } catch (err) {
@@ -277,79 +237,46 @@ export const markRead = async (req: AuthRequest, res: Response) => {
   }
 };
 
-
-// =====================================================
-// 🔢 UNREAD COUNT
-// =====================================================
 export const getUnreadCount = async (req: AuthRequest, res: Response) => {
   try {
     const count = await MessageModel.countDocuments({
       receiverId: req.user!.userId,
       isRead: false,
     });
-
-    // NOTE: response key is `unreadCount` (not `count`) to match
-    // AppLayout.tsx which reads r.data.data.unreadCount
-    res.json({
-      success: true,
-      data: { unreadCount: count },
-    });
+    res.json({ success: true, data: { unreadCount: count } });
   } catch (err) {
     console.error('❌ unreadCount:', err);
     res.status(500).json({ success: false });
   }
 };
 
-
-// =====================================================
-// 👥 CONTACTS
-// =====================================================
 export const getContacts = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user!.userId;
-    const role = req.user!.role;
-
+    const role   = req.user!.role;
     let contacts: any[] = [];
 
     if (role === 'ceo') {
-      contacts = await User.find({ _id: { $ne: userId } }).select(
-        '_id name email role profilePicture department'
-      );
+      contacts = await User.find({ _id: { $ne: userId }, isActive: true })
+        .select('_id name email role profilePicture department')
+        .lean();
     }
-
     if (role === 'supervisor') {
-      const mappings = await SupervisorMapping.find({
-        supervisorId: userId,
-        status: 'active',
-      }).populate('subordinateId');
-
-      const ceo = await User.findOne({ role: 'ceo' });
-
-      contacts = [
-        ...(ceo ? [ceo] : []),
-        ...mappings.map((m: any) => m.subordinateId),
-      ];
+      const mappings = await SupervisorMapping.find({ supervisorId: userId, status: 'active' })
+        .populate('subordinateId', '_id name email role profilePicture department');
+      const ceo = await User.findOne({ role: 'ceo' })
+        .select('_id name email role profilePicture department').lean();
+      contacts = [...(ceo ? [ceo] : []), ...mappings.map((m: any) => m.subordinateId)];
     }
-
     if (role === 'user') {
-      const mapping = await SupervisorMapping.findOne({
-        subordinateId: userId,
-        status: 'active',
-      }).populate('supervisorId');
-
-      if (mapping?.supervisorId) {
-        contacts = [mapping.supervisorId];
-      }
+      const mapping = await SupervisorMapping.findOne({ subordinateId: userId, status: 'active' })
+        .populate('supervisorId', '_id name email role profilePicture department');
+      if (mapping?.supervisorId) contacts = [mapping.supervisorId];
     }
 
-    res.json({
-      success: true,
-      data: { contacts },
-    });
+    res.json({ success: true, data: { contacts } });
   } catch (err) {
     console.error('❌ getContacts:', err);
     res.status(500).json({ success: false });
   }
 };
-
-

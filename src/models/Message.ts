@@ -23,8 +23,9 @@ const MessageSchema = new Schema<IMessage>({
   parentId:   { type: Schema.Types.ObjectId, ref: 'Message' },
 }, { timestamps: true });
 
-MessageSchema.index({ receiverId: 1, isRead: 1, createdAt: -1 });
-MessageSchema.index({ senderId: 1, createdAt: -1 });
-MessageSchema.index({ parentId: 1 });
+MessageSchema.index({ receiverId: 1, parentId: 1, createdAt: -1 });
+MessageSchema.index({ senderId: 1,   parentId: 1, createdAt: -1 });
+MessageSchema.index({ parentId: 1,   createdAt:  1 });
+MessageSchema.index({ receiverId: 1, isRead: 1 });
 
 export const MessageModel = mongoose.model<IMessage>('Message', MessageSchema);

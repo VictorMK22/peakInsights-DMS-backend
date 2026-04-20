@@ -38,26 +38,55 @@ export const createFolder = async (req: AuthRequest, res: Response) => {
   })
 }
 
+// ─────────────────────────────────────────────────────────────────
+// GET ROOT CONTENTS
+// Returns top-level folders (parentFolderId === null) owned by the
+// requesting user. Documents at root level are also included.
+// This route must be registered BEFORE /:folderId/contents so that
+// the literal string "root" is not swallowed by the param matcher.
+// ─────────────────────────────────────────────────────────────────
+export const getRootContents = async (req: AuthRequest, res: Response) => {
+  try {
+    const folders = await FolderModel.find({
+      ownerId: req.user!.userId,
+      parentFolderId: null,
+    }).sort({ name: 1 });
+
+    // Root-level documents (not inside any folder)
+    const documents = await DocumentModel.find({
+      ownerId: req.user!.userId,
+      folderId: null,
+    })
+      .select('title fileType documentType createdAt folderId')
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    res.json({ success: true, data: { folders, documents } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false });
+  }
+};
+
 export const getFolderContents = async (req: AuthRequest, res: Response) => {
+  try {
+    const { folderId } = req.params;
 
-  const { folderId } = req.params
+    const [folders, documents] = await Promise.all([
+      FolderModel.find({ parentFolderId: folderId }).sort({ name: 1 }),
+      DocumentModel.find({ folderId })
+        .select('title fileType documentType createdAt folderId')
+        .sort({ createdAt: -1 })
+        .lean(),
+    ]);
 
-  const folders = await FolderModel.find({
-    parentFolderId: folderId
-  })
-
-  const documents = await mongoose.model("Document").find({
-    folderId
-  })
-
-  res.json({
-    success: true,
-    data: {
-      folders,
-      documents
-    }
-  })
-}
+    res.json({ success: true, data: { folders, documents } });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false });
+  }
+};
 
 export const getFolderActivity = async (req: AuthRequest, res: Response) => {
   try {

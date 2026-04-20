@@ -45,7 +45,7 @@ export const sendEmailDirect = async (req: AuthRequest, res: Response, next: Nex
       return res.status(404).json({ success: false, message: 'Recipient not found' });
     }
 
-    const result = await sendTrackedEmail({
+    sendTrackedEmail({
       senderId,
       receiverId,
       receiverEmail: receiver.email,
@@ -57,18 +57,13 @@ export const sendEmailDirect = async (req: AuthRequest, res: Response, next: Nex
       ipAddress: req.ip,
       userAgent: req.headers['user-agent'],
       supervisorId: sender?.supervisorId,
+    }).catch(err => {
+      console.error('Background email failed:', err);
     });
-
-    if (!result?.messageId) {
-      return res.status(500).json({
-        success: false,
-        message: 'Email failed to send',
-      });
-    }
 
     return res.json({
       success: true,
-      message: `Email sent to ${receiver.name}`,
+      message: `Email queued to ${receiver.name}`,
     });
 
   } catch (err) {
@@ -112,8 +107,7 @@ export const retryEmail = async (req: AuthRequest, res: Response, next: NextFunc
     const result = await sendDirectUserEmail({
       toEmail: email.toEmail,
       toName: (email.receiverId as any).name,
-      fromName: 'Retry System',
-      fromEmail: (email.senderId as any).email,
+      fromName: 'PeakInsights',
       subject: email.subject,
       body: email.body,
     });

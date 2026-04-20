@@ -28,7 +28,6 @@ export async function sendTrackedEmail({
   });
 
   try {
-    // 2. send email
     const result = await sendDirectUserEmail({
       toEmail: receiverEmail,
       toName: receiverName,
@@ -38,14 +37,11 @@ export async function sendTrackedEmail({
       body,
     });
 
-    // 3. mark success
-    await EmailLog.findByIdAndUpdate(log._id, {
-      status: 'sent',
-      sentAt: new Date(),
-      messageId: result?.messageId,
-    });
+    log.status = 'sent';
+    log.sentAt = new Date();
+    log.messageId = result?.messageId;
+    await log.save();
 
-    // 4. audit success
     await AuditLog.create({
       actorId: senderId,
       action: 'email_sent',
@@ -56,23 +52,18 @@ export async function sendTrackedEmail({
       userAgent,
     });
 
-    return { success: true, logId: log._id, messageId: result?.messageId };
-
   } catch (err: any) {
 
-    // 5. mark failure
-    await EmailLog.findByIdAndUpdate(log._id, {
-      status: 'failed',
-      error: err.message,
-    });
+    log.status = 'failed';
+    log.error = err?.message || 'Unknown email error';
+    await log.save();
 
-    // 6. audit failure
     await AuditLog.create({
       actorId: senderId,
       action: 'email_failed',
       targetUserId: receiverId,
       supervisorIdAtTime: supervisorId,
-      details: { toEmail: receiverEmail, subject, error: err.message },
+      details: { toEmail: receiverEmail, subject, error: log.error },
       ipAddress,
       userAgent,
     });

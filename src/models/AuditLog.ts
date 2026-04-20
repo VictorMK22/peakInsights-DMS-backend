@@ -16,7 +16,7 @@ export interface IAuditLog extends Document {
 const AuditLogSchema = new Schema<IAuditLog>({
   documentId: { type: Schema.Types.ObjectId, ref: 'Document' },
   actorId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-  action: { type: String, enum: ['created','viewed','edited','submitted','completed','invited','access_revoked','deleted','downloaded', 'email_sent'], required: true },
+  action: { type: String, enum: ['created','viewed','edited','submitted','completed','invited','access_revoked','deleted','downloaded', 'email_sent', 'email_failed'], required: true },
   targetUserId: { type: Schema.Types.ObjectId, ref: 'User' },
   supervisorIdAtTime: { type: Schema.Types.ObjectId, ref: 'User' },
   details: { type: Schema.Types.Mixed },

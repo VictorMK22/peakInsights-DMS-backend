@@ -107,7 +107,9 @@ const DocumentSchema = new Schema<IDocument>({
 
 DocumentSchema.index({ folderId: 1, createdAt: -1 });
 DocumentSchema.index({ ownerId: 1, status: 1 });
-DocumentSchema.index({ supervisorId: 1 });
+DocumentSchema.index({ ownerId: 1,      documentType: 1, createdAt: -1 });
+DocumentSchema.index({ supervisorId: 1, documentType: 1, createdAt: -1 });
+DocumentSchema.index({ documentType: 1, createdAt: -1 });
 DocumentSchema.index({ accessControlList: 1 });
 DocumentSchema.index({ title: "text", description: "text", contentText: "text", tags: "text" }, { weights: { title: 5, tags: 4, description: 2, contentText: 1 }, name: "DocumentTextIndex"});
 

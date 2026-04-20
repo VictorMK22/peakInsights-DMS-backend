@@ -151,10 +151,12 @@ export const createDocument = async (
     }
 
     let relativePaths: string[] = [];
-    const raw = req.body.webkitRelativePaths;
-    if (raw) {
+    const rawPaths = (req.query.webkitRelativePaths as string | undefined)
+                  ?? (req.body.webkitRelativePaths as string | undefined);   // body fallback for backwards-compat
+
+    if (rawPaths) {
       try {
-        const parsed = JSON.parse(raw);
+        const parsed = JSON.parse(decodeURIComponent(rawPaths));
         if (!Array.isArray(parsed)) {
           return res.status(400).json({ success: false, message: 'webkitRelativePaths must be an array' });
         }
@@ -313,7 +315,13 @@ export const getDocuments = async (
       if (supF)   filter['supervisorId'] = new mongoose.Types.ObjectId(supF);
     }
 
-    if (folderId) filter['folderId'] = new mongoose.Types.ObjectId(folderId);
+    if (folderId === 'null') {
+      filter['folderId'] = null;
+    } else if (folderId) {
+      filter['folderId'] = new mongoose.Types.ObjectId(folderId);
+    } else {
+      filter['folderId'] = null;
+    }
 
     const skip = (Number(page) - 1) * Number(limit);
     const [documents, total] = await Promise.all([
