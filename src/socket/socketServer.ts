@@ -1,6 +1,7 @@
 import { Server } from "socket.io";
 import jwt from "jsonwebtoken";
-import { CommentModel } from "../models/Comment";
+import { User } from "../models/User";
+import { TokenBlacklist } from "../models/TokenBlacklist";
 
 interface Viewer {
   id: string;
@@ -8,18 +9,11 @@ interface Viewer {
   avatar?: string | null;
 }
 
-interface ViewerMap {
-  [documentId: string]: Map<string, Viewer>;
-}
-
-const viewers: ViewerMap = {};
-const locks: Record<string, string> = {};
 const onlineUsers = new Map<string, string>();
 
 let io: Server;
 
-// 🔒 Safe helper
-const getSafeUser = (socket: any) => {
+const getSafeUser = (socket: any): Viewer | null => {
   const user = socket.data.user;
   if (!user?.id) {
     console.error("❌ Missing user in socket");
@@ -37,9 +31,18 @@ export const initSocket = (server: any) => {
   });
 
   // ==========================
-  // 🔐 AUTH MIDDLEWARE (FIXED)
+  // 🔐 AUTH MIDDLEWARE
   // ==========================
-  io.use((socket, next) => {
+  // Mirrors the REST `authenticate` middleware's checks (see
+  // middleware/auth.ts) — a socket connection is just another way to
+  // act as an authenticated user, so it shouldn't skip the checks
+  // that route applies: blacklisted tokens (explicit logout) and
+  // deactivated accounts must both be rejected here too, not just on
+  // HTTP requests. The previous version only verified the JWT
+  // signature/expiry, which meant a logged-out or deactivated user
+  // could still hold a live, fully-functional socket connection for
+  // up to 7 days (the token's lifetime).
+  io.use(async (socket, next) => {
     try {
       const token =
         socket.handshake.auth?.token ||
@@ -49,17 +52,28 @@ export const initSocket = (server: any) => {
         return next(new Error("Unauthorized"));
       }
 
+      const blacklisted = await TokenBlacklist.findOne({ token });
+      if (blacklisted) {
+        return next(new Error("Unauthorized"));
+      }
+
       const decoded: any = jwt.verify(token, process.env.JWT_SECRET!);
 
-      // ✅ NORMALIZE USER STRUCTURE
+      const user = await User.findById(decoded.userId).select(
+        "name avatar isActive",
+      );
+      if (!user || !user.isActive) {
+        return next(new Error("Unauthorized"));
+      }
+
       socket.data.user = {
-        id: decoded.userId || decoded.id,
-        name: decoded.name || "User",
-        avatar: decoded.avatar || null,
+        id: decoded.userId,
+        name: user.name,
+        avatar: user.avatar || null,
       };
 
       next();
-    } catch (err) {
+    } catch {
       next(new Error("Unauthorized"));
     }
   });
@@ -68,227 +82,32 @@ export const initSocket = (server: any) => {
     const user = getSafeUser(socket);
     if (!user) return;
 
-    // ==========================
-    // 🟢 USER ONLINE
-    // ==========================
-    onlineUsers.set(user.id, socket.id);
+    console.log("⚡ User connected:", user.id);
 
-    // already exists but ensure it's here
+    onlineUsers.set(user.id, socket.id);
     socket.join(`user:${user.id}`);
 
     io.emit("presence:update", {
       userId: user.id,
       status: "online",
-    });
-
-    const COLORS = ["#7C3AED", "#06B6D4", "#10B981", "#F59E0B", "#EF4444"];
-
-    const getColor = (userId: string) =>
-      COLORS[userId.charCodeAt(0) % COLORS.length];
-
-    console.log("⚡ User connected:", user.id);
-
-    socket.join(`user:${user.id}`);
-
-    // ==========================
-    // 📄 JOIN DOCUMENT
-    // ==========================
-    socket.on("join-document", ({ documentId }) => {
-      const user = getSafeUser(socket);
-      if (!user) return;
-
-      if (!viewers[documentId]) {
-        viewers[documentId] = new Map<string, Viewer>();
-      }
-
-      // ✅ prevent duplicates
-      if (!viewers[documentId].has(user.id)) {
-        viewers[documentId].set(user.id, {
-          id: user.id,
-          name: user.name,
-          avatar: user.avatar,
-        });
-      }
-
-      socket.join(`document:${documentId}`);
-
-      io.to(`document:${documentId}`).emit(
-        "viewers-update",
-        Array.from(viewers[documentId].values())
-      );
-
-      console.log(`User ${user.id} joined document ${documentId}`);
-    });
-
-    // ==========================
-    // 🚪 LEAVE DOCUMENT (FIXED)
-    // ==========================
-    socket.on("leave-document", ({ documentId }) => {
-      const user = getSafeUser(socket);
-      if (!user) return;
-
-      const docViewers = viewers[documentId];
-      if (!docViewers) return;
-
-      docViewers.delete(user.id);
-
-      if (docViewers.size === 0) {
-        delete viewers[documentId]; // ✅ prevent memory leak
-      }
-
-      io.to(`document:${documentId}`).emit(
-        "viewers-update",
-        Array.from(docViewers.values())
-      );
-
-      socket.leave(`document:${documentId}`);
-
-      console.log(`User ${user.id} left document ${documentId}`);
     });
 
     // ==========================
     // ❌ DISCONNECT CLEANUP
     // ==========================
     socket.on("disconnect", () => {
-      const user = getSafeUser(socket);
-      if (!user) return;
-    
-      // ❗ remove from online users
       onlineUsers.delete(user.id);
-    
+
       io.emit("presence:update", {
         userId: user.id,
         status: "offline",
       });
-    
-      // 🔁 KEEP YOUR EXISTING DOCUMENT CLEANUP
-      for (const docId in viewers) {
-        const docViewers = viewers[docId];
-        if (!docViewers) continue;
-    
-        if (docViewers.has(user.id)) {
-          docViewers.delete(user.id);
-    
-          if (docViewers.size === 0) {
-            delete viewers[docId];
-          } else {
-            io.to(`document:${docId}`).emit(
-              "viewers-update",
-              Array.from(docViewers.values())
-            );
-          }
-        }
-      }
-    
+
       console.log(`🔴 User disconnected: ${user.id}`);
     });
 
     // ==========================
-    // ✍️ EDITING INDICATOR
-    // ==========================
-    socket.on("editing", ({ documentId, section }) => {
-      const user = getSafeUser(socket);
-      if (!user) return;
-
-      socket.to(`document:${documentId}`).emit("user-editing", {
-        user: { id: user.id, name: user.name },
-        section,
-      });
-    });
-
-    // ==========================
-    // 🖱 CURSOR TRACKING
-    // ==========================
-    socket.on("cursor-move", ({ documentId, x, y }) => {
-      const user = getSafeUser(socket);
-      if (!user) return;
-
-      socket.to(`document:${documentId}`).emit("cursor-update", {
-        user: {
-          id: user.id,
-          name: user.name,
-          color: getColor(user.id),
-        },
-        x,
-        y,
-      });
-    });
-
-    // ==========================
-    // 💬 COMMENTS (SAFE)
-    // ==========================
-    socket.on("add-comment", async ({ documentId, text }) => {
-      try {
-        const user = getSafeUser(socket);
-        if (!user) return;
-
-        const comment = await CommentModel.create({
-          documentId,
-          user: user.id,
-          text,
-        });
-
-        const populated = await comment.populate("user", "name email");
-
-        io.to(`document:${documentId}`).emit("new-comment", populated);
-      } catch (err) {
-        console.error("❌ Error adding comment:", err);
-      }
-    });
-
-    // ==========================
-    // 🔒 SECTION LOCKING (SAFE)
-    // ==========================
-    socket.on("lock-section", ({ documentId, section }) => {
-      const user = getSafeUser(socket);
-      if (!user) return;
-
-      const key = `${documentId}:${section}`;
-
-      if (locks[key] && locks[key] !== user.id) {
-        return; // already locked by someone else
-      }
-
-      locks[key] = user.id;
-
-      io.to(`document:${documentId}`).emit("section-locked", {
-        section,
-        userId: user.id,
-      });
-    });
-
-    socket.on("unlock-section", ({ documentId, section }) => {
-      const key = `${documentId}:${section}`;
-
-      delete locks[key];
-
-      io.to(`document:${documentId}`).emit("section-unlocked", {
-        section,
-      });
-    });
-
-    // ==========================
-    // 📝 DOCUMENT EDITING (NON-YJS SAFE)
-    // ==========================
-    socket.on("edit-document", ({ documentId, content }) => {
-      socket.to(`document:${documentId}`).emit("document-updated", content);
-    });
-
-    // ==========================
-    // 🟢 USER ONLINE
-    // ==========================
-    onlineUsers.set(user.id, socket.id);
-
-    // already exists but ensure it's here
-    socket.join(`user:${user.id}`);
-
-    io.emit("presence:update", {
-      userId: user.id,
-      status: "online",
-    });
-
-    // ==========================
-    // ✍️ TYPING
+    // ✍️ TYPING (message threads)
     // ==========================
     socket.on("chat:typing", ({ to }) => {
       const target = onlineUsers.get(to);
@@ -305,19 +124,16 @@ export const initSocket = (server: any) => {
     });
 
     // ==========================
-    // ✅ MARK READ
+    // ✅ MARK READ relay
     // ==========================
     socket.on("chat:read", ({ messageId, from }) => {
       const target = onlineUsers.get(from);
-
       if (target) {
         io.to(target).emit("chat:read", { messageId });
       }
     });
-
   });
 };
-
 
 export const getIO = () => {
   if (!io) throw new Error("Socket.io not initialized");

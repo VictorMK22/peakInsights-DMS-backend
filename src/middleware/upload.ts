@@ -1,10 +1,10 @@
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
-import { v4 as uuid } from 'uuid';
-import { Request } from 'express';
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import { v4 as uuid } from "uuid";
+import { Request } from "express";
 
-const UPLOAD_DIR = path.resolve(__dirname, '../../uploads');
+const UPLOAD_DIR = path.resolve(__dirname, "../../uploads");
 
 // Ensure the uploads directory exists at startup
 if (!fs.existsSync(UPLOAD_DIR)) {
@@ -31,10 +31,10 @@ const storage = multer.diskStorage({
 const fileFilter = (
   _req: Request,
   file: Express.Multer.File,
-  cb: multer.FileFilterCallback
+  cb: multer.FileFilterCallback,
 ) => {
   // Block known dangerous executables — allow everything else
-  const blocked = ['.exe', '.bat', '.sh', '.cmd', '.ps1', '.msi'];
+  const blocked = [".exe", ".bat", ".sh", ".cmd", ".ps1", ".msi"];
   const ext = path.extname(file.originalname).toLowerCase();
   if (blocked.includes(ext)) {
     cb(new Error(`File type ${ext} is not allowed`));
@@ -55,15 +55,17 @@ export const uploadToLocal = multer({
   storage,
   fileFilter,
   limits: {
-    fileSize: 100 * 1024 * 1024,  // 100 MB per file
-    files: 200,                    // max 200 files per request (folder uploads)
+    fileSize: 100 * 1024 * 1024, // 100 MB per file
+    files: 200, // max 200 files per request (folder uploads)
   },
 });
 
 // ─── SERVE A LOCAL FILE URL ───────────────────────────────────────
-// Builds the URL that the frontend uses to view/preview a file.
-// In production swap BACKEND_URL for your actual domain.
-export const getLocalFileUrl = (filename: string): string => {
-  const base = process.env.BACKEND_URL ?? 'http://localhost:5000';
-  return `${base}/uploads/${encodeURIComponent(filename)}`;
-};
+// Builds a short-lived, signed URL for a file (see utils/fileAccessToken.ts).
+// Files are no longer served by a public express.static mount — every
+// load requires this kind of token, generated fresh at read time by
+// an endpoint that has already run a real access check. The value
+// computed here, right at upload time, is really just a starting
+// point; documentController re-signs a fresh one on every subsequent
+// read (see attachSignedUrls), since this one will expire quickly.
+export { buildSignedFileUrl as getLocalFileUrl } from "../utils/fileAccessToken";
