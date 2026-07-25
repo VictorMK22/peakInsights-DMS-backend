@@ -22,6 +22,9 @@ import taskRoutes from "./routes/tasks";
 import messageRoutes from "./routes/messages";
 import emailRoutes from "./routes/emails";
 import clientRoutes from "./routes/clientRoutes";
+import whatsappWebhookRoutes from "./routes/whatsappWebhook";
+import emailIntegrationRoutes from "./routes/emailIntegrationRoutes";
+import { startEmailSyncScheduler } from "./config/emailSyncQueue";
 import shareRoutes from "./routes/share";
 import filesRoutes from "./routes/files";
 import departmentRoutes from "./routes/departments";
@@ -100,6 +103,9 @@ app.use("/api/tasks", taskRoutes);
 app.use("/api/messages", messageRoutes);
 app.use("/api/emails", emailRoutes);
 app.use("/api/clients", clientRoutes);
+app.use("/api/integrations", emailIntegrationRoutes);
+// Public — Meta calls this directly, must not require our app auth.
+app.use("/webhooks/whatsapp", whatsappWebhookRoutes);
 app.use("/api", shareRoutes);
 app.use("/api/files", filesRoutes);
 app.use("/api/departments", departmentRoutes);
@@ -128,6 +134,7 @@ const startServer = async () => {
     server.listen(PORT, () => {
       console.log(`✅ Server running on port ${PORT}`);
       console.log(`📁 Uploads served from ${UPLOAD_DIR} at /uploads`);
+      startEmailSyncScheduler();
     });
   } catch (error) {
     console.error("❌ Failed to start server:", error);

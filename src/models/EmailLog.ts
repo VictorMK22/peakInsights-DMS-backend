@@ -34,6 +34,20 @@ export interface IEmailLog extends Document {
   messageId?: string; // SMTP / provider ID — used as In-Reply-To for the next reply
   references?: string[]; // accumulated Message-ID chain, sent as the References header
 
+  // 'system' = composed through the app's own Emails page (real SMTP send).
+  // 'external_sync' = automatically pulled in from a staff member's real
+  // mailbox (Zoho) because the two of them emailed each other outside the
+  // app entirely. This is what gives visibility into off-platform internal
+  // communication (user↔user, user↔supervisor, user↔CEO, CEO↔supervisor).
+  source: "system" | "external_sync";
+  // Content fingerprint (hash of participants + subject + send-minute),
+  // NOT the provider's own message ID — needed because when two staff
+  // members email each other and BOTH have Zoho connected, the same
+  // message is visible in both mailboxes with two different provider
+  // IDs. This fingerprint is what lets the second sync run recognize
+  // "I've already logged this" and skip it instead of creating a duplicate.
+  dedupeKey?: string;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -120,6 +134,16 @@ const EmailLogSchema = new Schema<IEmailLog>(
       type: [String],
       default: undefined,
     },
+
+    source: {
+      type: String,
+      enum: ["system", "external_sync"],
+      default: "system",
+    },
+
+    dedupeKey: {
+      type: String,
+    },
   },
   { timestamps: true },
 );
@@ -131,5 +155,8 @@ EmailLogSchema.index({ receiverId: 1, isRead: 1 });
 EmailLogSchema.index({ receiverId: 1, parentId: 1, lastMessageAt: -1 });
 EmailLogSchema.index({ senderId: 1, parentId: 1, lastMessageAt: -1 });
 EmailLogSchema.index({ parentId: 1, createdAt: 1 });
+// Prevents the same staff-to-staff email being logged twice when both
+// participants have their mailbox connected and synced independently.
+EmailLogSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });
 
 export const EmailLog = mongoose.model<IEmailLog>("EmailLog", EmailLogSchema);

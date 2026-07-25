@@ -25,6 +25,13 @@ export interface IClientEmail extends Document {
   attachments: IClientEmailAttachment[];
   status: "sent" | "received" | "draft" | "failed";
   sentAt?: Date;
+  // 'system' = sent through the app's own compose box (SMTP).
+  // 'external_sync' = automatically pulled in from a staff member's real
+  // mailbox (e.g. Zoho Mail) because it was sent/received outside the app.
+  // This is what gives the CEO visibility into off-platform communication.
+  source: "system" | "external_sync";
+  externalMessageId?: string; // provider's message ID, for de-duplication
+  syncedFromUserId?: mongoose.Types.ObjectId; // whose connected mailbox this came from
   createdAt: Date;
   updatedAt: Date;
 }
@@ -59,12 +66,24 @@ const ClientEmailSchema = new Schema<IClientEmail>(
       default: "sent",
     },
     sentAt: { type: Date },
+    source: {
+      type: String,
+      enum: ["system", "external_sync"],
+      default: "system",
+    },
+    externalMessageId: { type: String, index: true, sparse: true },
+    syncedFromUserId: { type: Schema.Types.ObjectId, ref: "User" },
   },
   { timestamps: true },
 );
 
 ClientEmailSchema.index({ clientId: 1, createdAt: -1 });
 ClientEmailSchema.index({ authorId: 1, clientId: 1 });
+// Prevents the same external message from being logged twice across sync runs.
+ClientEmailSchema.index(
+  { externalMessageId: 1 },
+  { unique: true, sparse: true },
+);
 
 export const ClientEmailModel = mongoose.model<IClientEmail>(
   "ClientEmail",

@@ -70,6 +70,10 @@ export interface ITask extends Document {
   // Primary linked document (e.g. a working doc the task is about)
   documentId?: mongoose.Types.ObjectId;
 
+  // Optional link back to a client — surfaces this task under that
+  // client's "Tasks" tab (see clientController.getClientTasks).
+  clientId?: mongoose.Types.ObjectId;
+
   // Files uploaded by CEO/Supervisor when creating the task
   // (context files, briefs, requirements for the assignee)
   taskFiles: ITaskFile[];
@@ -153,6 +157,7 @@ const TaskSchema = new Schema<ITask>(
     assignedTo: { type: Schema.Types.ObjectId, ref: "User", required: true },
 
     documentId: { type: Schema.Types.ObjectId, ref: "Document" },
+    clientId: { type: Schema.Types.ObjectId, ref: "Client" },
     taskFiles: { type: [TaskFileSchema], default: [] },
     submissionDocuments: [{ type: Schema.Types.ObjectId, ref: "Document" }],
 
@@ -203,6 +208,7 @@ const TaskSchema = new Schema<ITask>(
 TaskSchema.index({ assignedTo: 1, status: 1 });
 TaskSchema.index({ assignedBy: 1, createdAt: -1 });
 TaskSchema.index({ documentId: 1 });
+TaskSchema.index({ clientId: 1 });
 TaskSchema.index({ submissionDocuments: 1 });
 TaskSchema.index({ assignedTo: 1, efficiencyRatio: -1 });
 TaskSchema.index({ "collaborators.userId": 1 });

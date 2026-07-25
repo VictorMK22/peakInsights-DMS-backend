@@ -103,15 +103,23 @@ export const createTask = async (
       return;
     }
 
-    const { assignedTo, title, description, priority, dueDate, documentId } =
-      req.body as {
-        assignedTo: string;
-        title: string;
-        description?: string;
-        priority?: string;
-        dueDate?: string;
-        documentId?: string;
-      };
+    const {
+      assignedTo,
+      title,
+      description,
+      priority,
+      dueDate,
+      documentId,
+      clientId,
+    } = req.body as {
+      assignedTo: string;
+      title: string;
+      description?: string;
+      priority?: string;
+      dueDate?: string;
+      documentId?: string;
+      clientId?: string;
+    };
 
     if (!assignedTo || !title) {
       res
@@ -135,12 +143,10 @@ export const createTask = async (
         status: "active",
       });
       if (!mapping) {
-        res
-          .status(403)
-          .json({
-            success: false,
-            message: "You can only assign tasks to your own team members",
-          });
+        res.status(403).json({
+          success: false,
+          message: "You can only assign tasks to your own team members",
+        });
         return;
       }
     }
@@ -165,6 +171,7 @@ export const createTask = async (
       documentId: documentId
         ? new mongoose.Types.ObjectId(documentId)
         : undefined,
+      clientId: clientId ? new mongoose.Types.ObjectId(clientId) : undefined,
       taskFiles,
       submissionDocuments: [],
       priority: priority ?? "medium",
@@ -197,13 +204,11 @@ export const createTask = async (
       .populate("documentId", "title fileType")
       .populate("submissionDocuments", "title fileType createdAt");
 
-    res
-      .status(201)
-      .json({
-        success: true,
-        message: "Task created",
-        data: { task: populated },
-      });
+    res.status(201).json({
+      success: true,
+      message: "Task created",
+      data: { task: populated },
+    });
   } catch (err) {
     next(err);
   }
@@ -349,12 +354,10 @@ export const updateTask = async (
       if (notes !== undefined) task.notes = notes;
       if (targetMinutes !== undefined && targetMinutes > 0) {
         if (!["pending", "in_progress"].includes(task.status)) {
-          res
-            .status(400)
-            .json({
-              success: false,
-              message: "Cannot change target after completion or cancellation",
-            });
+          res.status(400).json({
+            success: false,
+            message: "Cannot change target after completion or cancellation",
+          });
           return;
         }
         task.targetMinutes = targetMinutes;
@@ -425,12 +428,10 @@ export const updateTaskStatus = async (
     }
 
     if (status === "cancelled" && !isAssigner && !isCEO) {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message: "Only the task creator or CEO can cancel tasks",
-        });
+      res.status(403).json({
+        success: false,
+        message: "Only the task creator or CEO can cancel tasks",
+      });
       return;
     }
 
@@ -440,13 +441,11 @@ export const updateTaskStatus = async (
       !isCEO &&
       !isActiveCollaborator(task, userId)
     ) {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message:
-            "Only the task assignee or an accepted collaborator can start or submit tasks",
-        });
+      res.status(403).json({
+        success: false,
+        message:
+          "Only the task assignee or an accepted collaborator can start or submit tasks",
+      });
       return;
     }
 
@@ -456,13 +455,11 @@ export const updateTaskStatus = async (
       !isCEO &&
       !isSupervisor
     ) {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message:
-            "Only the task creator, supervisor, or CEO can approve/reject tasks",
-        });
+      res.status(403).json({
+        success: false,
+        message:
+          "Only the task creator, supervisor, or CEO can approve/reject tasks",
+      });
       return;
     }
 
@@ -650,12 +647,10 @@ export const deleteTask = async (
     const isCEO = req.user!.role === "ceo";
 
     if (!isAssigner && !isCEO) {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message: "Only the task creator or CEO can delete tasks",
-        });
+      res.status(403).json({
+        success: false,
+        message: "Only the task creator or CEO can delete tasks",
+      });
       return;
     }
 
@@ -691,22 +686,18 @@ export const inviteTaskCollaborator = async (
     const isCEO = req.user!.role === "ceo";
 
     if (!isAssignee && !isCEO) {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message: "Only the task assignee or CEO can invite collaborators",
-        });
+      res.status(403).json({
+        success: false,
+        message: "Only the task assignee or CEO can invite collaborators",
+      });
       return;
     }
 
     if (task.status !== "in_progress") {
-      res
-        .status(400)
-        .json({
-          success: false,
-          message: "Collaborators can only be invited to in-progress tasks",
-        });
+      res.status(400).json({
+        success: false,
+        message: "Collaborators can only be invited to in-progress tasks",
+      });
       return;
     }
 
@@ -718,12 +709,10 @@ export const inviteTaskCollaborator = async (
     }
 
     if (inviteeId === task.assignedTo.toString()) {
-      res
-        .status(400)
-        .json({
-          success: false,
-          message: "The assignee already has full access to this task",
-        });
+      res.status(400).json({
+        success: false,
+        message: "The assignee already has full access to this task",
+      });
       return;
     }
 
@@ -733,12 +722,10 @@ export const inviteTaskCollaborator = async (
         (c.status === "active" || c.status === "pending"),
     );
     if (alreadyInvited) {
-      res
-        .status(400)
-        .json({
-          success: false,
-          message: "This user already has an active or pending invitation",
-        });
+      res.status(400).json({
+        success: false,
+        message: "This user already has an active or pending invitation",
+      });
       return;
     }
 
@@ -764,12 +751,10 @@ export const inviteTaskCollaborator = async (
         status: "active",
       });
       if (!mapping) {
-        res
-          .status(403)
-          .json({
-            success: false,
-            message: "You can only invite members of your own team",
-          });
+        res.status(403).json({
+          success: false,
+          message: "You can only invite members of your own team",
+        });
         return;
       }
     } else if (req.user!.role === "user") {
@@ -781,12 +766,10 @@ export const inviteTaskCollaborator = async (
         invitee.supervisorId &&
         inviter.supervisorId.toString() === invitee.supervisorId.toString();
       if (!sameTeam) {
-        res
-          .status(403)
-          .json({
-            success: false,
-            message: "You can only invite teammates who share your supervisor",
-          });
+        res.status(403).json({
+          success: false,
+          message: "You can only invite teammates who share your supervisor",
+        });
         return;
       }
     }
@@ -884,12 +867,10 @@ export const respondToTaskCollaboratorInvite = async (
       (c) => c.userId.toString() === req.user!.userId && c.status === "pending",
     );
     if (!invite) {
-      res
-        .status(404)
-        .json({
-          success: false,
-          message: "No pending invitation found for you on this task",
-        });
+      res.status(404).json({
+        success: false,
+        message: "No pending invitation found for you on this task",
+      });
       return;
     }
 
@@ -946,13 +927,10 @@ export const revokeTaskCollaborator = async (
     const isCEO = req.user!.role === "ceo";
 
     if (!isAssignee && !isCEO) {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message:
-            "Only the task assignee or CEO can revoke collaborator access",
-        });
+      res.status(403).json({
+        success: false,
+        message: "Only the task assignee or CEO can revoke collaborator access",
+      });
       return;
     }
 
@@ -962,12 +940,10 @@ export const revokeTaskCollaborator = async (
         (c.status === "active" || c.status === "pending"),
     );
     if (!collaborator) {
-      res
-        .status(404)
-        .json({
-          success: false,
-          message: "Active or pending collaborator not found",
-        });
+      res.status(404).json({
+        success: false,
+        message: "Active or pending collaborator not found",
+      });
       return;
     }
 
@@ -1059,12 +1035,10 @@ export const getUserAppraisal = async (
     const { userId } = req.params as { userId: string };
 
     if (req.user!.role === "user" && req.user!.userId !== userId) {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message: "You can only view your own appraisal",
-        });
+      res.status(403).json({
+        success: false,
+        message: "You can only view your own appraisal",
+      });
       return;
     }
     if (req.user!.role === "supervisor") {
@@ -1183,12 +1157,10 @@ export const approveTask = async (
     const role = req.user!.role;
 
     if (role !== "ceo" && role !== "supervisor") {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message: "Only CEO or Supervisor can approve tasks",
-        });
+      res.status(403).json({
+        success: false,
+        message: "Only CEO or Supervisor can approve tasks",
+      });
       return;
     }
 

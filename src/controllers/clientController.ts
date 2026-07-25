@@ -25,7 +25,7 @@ const withSignedAttachmentUrls = (attachments: IClientEmailAttachment[] = []) =>
   }));
 
 /** Check whether this user can access a client's data */
-const canAccess = async (
+export const canAccess = async (
   clientId: string,
   userId: string,
   role: string,
@@ -189,10 +189,12 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
     (isSalesPerson(req) &&
       (await canAccess(req.params.id, req.user!.userId, req.user!.role)));
   if (!allowed)
-    return res.status(403).json({
-      success: false,
-      message: "Only CEO or the assigned sales person can update this client",
-    });
+    return res
+      .status(403)
+      .json({
+        success: false,
+        message: "Only CEO or the assigned sales person can update this client",
+      });
   try {
     const { name, email, phone, company, industry, address, notes } = req.body;
     const client = await ClientModel.findByIdAndUpdate(
@@ -459,52 +461,10 @@ export const sendClientEmail = async (req: AuthRequest, res: Response) => {
   }
 };
 
-// POST /clients/:id/emails/log-inbound  — manually log an email received from client
-// Body: { subject, body, fromEmail?, sentAt? }
-export const logInboundEmail = async (req: AuthRequest, res: Response) => {
-  try {
-    const ok = await canAccess(req.params.id, req.user!.userId, req.user!.role);
-    if (!ok)
-      return res.status(403).json({ success: false, message: "Access denied" });
-
-    const { subject, body, fromEmail, sentAt } = req.body as {
-      subject: string;
-      body: string;
-      fromEmail?: string;
-      sentAt?: string;
-    };
-    if (!subject?.trim())
-      return res
-        .status(400)
-        .json({ success: false, message: "Subject is required" });
-    if (!body?.trim())
-      return res
-        .status(400)
-        .json({ success: false, message: "Body is required" });
-
-    const client = await ClientModel.findById(req.params.id).select("email");
-    const record = await ClientEmailModel.create({
-      clientId: req.params.id,
-      authorId: req.user!.userId,
-      direction: "inbound",
-      subject: subject.trim(),
-      body: body.trim(),
-      fromEmail: fromEmail ?? client?.email,
-      status: "received",
-      sentAt: sentAt ? new Date(sentAt) : new Date(),
-    });
-
-    const populated = await record.populate(
-      "authorId",
-      "name role email profilePicture",
-    );
-    res.status(201).json({ success: true, data: { email: populated } });
-    return;
-  } catch (err) {
-    res.status(500).json({ success: false });
-    return;
-  }
-};
+// Manual inbound-logging was removed — received emails are now captured
+// exclusively through Zoho sync (see services/emailSyncService.ts). This
+// keeps ClientEmail records with direction "inbound" trustworthy as
+// actually-received mail, rather than a mix of real and self-reported ones.
 
 // DELETE /clients/:id/emails/:emailId
 export const deleteClientEmail = async (req: AuthRequest, res: Response) => {
