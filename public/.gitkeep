@@ -1,0 +1,6 @@
+This directory exists only to satisfy Vercel's build-output check for
+the "Other" framework preset. This project is a pure API backend with
+no static assets to serve — vercel.json's rewrite rule routes every
+request to api/index.ts. Deliberately not named index.html, so it
+can never be accidentally served in place of an actual API route.
+ 

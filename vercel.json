@@ -1,6 +1,7 @@
 {
   "version": 2,
   "buildCommand": "echo No project build needed - api files are compiled independently by the Vercel Node runtime",
+  "outputDirectory": "public",
   "installCommand": "npm install",
   "functions": {
     "api/index.ts": {
