@@ -5,7 +5,7 @@ import {
   createLearningCategory,
   updateLearningCategory,
   deleteLearningCategory,
-} from "../controllers/learningcategoryController";
+} from "../controllers/learningCategoryController";
 
 const router = Router();
 
