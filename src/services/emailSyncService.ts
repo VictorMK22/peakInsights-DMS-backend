@@ -1,7 +1,4 @@
-import fs from "fs";
-import path from "path";
 import crypto from "crypto";
-import { v4 as uuid } from "uuid";
 import {
   EmailIntegrationModel,
   IEmailIntegration,
@@ -13,6 +10,7 @@ import { ClientModel } from "../models/Client";
 import { ClientEmailModel } from "../models/ClientEmail";
 import { User } from "../models/User";
 import { EmailLog } from "../models/EmailLog";
+import { uploadBufferToS3 } from "./s3Storage";
 import {
   refreshZohoAccessToken,
   listFolders,
@@ -22,8 +20,6 @@ import {
   downloadAttachment,
   ZohoMessageSummary,
 } from "./zohoMailService";
-
-const UPLOAD_DIR = path.resolve(__dirname, "../../uploads");
 
 /** Refreshes the stored access token if it's expired or about to be. */
 async function ensureFreshToken(
@@ -334,9 +330,11 @@ async function syncAttachments(
         msg.messageId,
         meta.attachmentId,
       );
-      const ext = path.extname(meta.attachmentName);
-      const fileKey = `${uuid()}${ext}`;
-      fs.writeFileSync(path.join(UPLOAD_DIR, fileKey), buffer);
+      const fileKey = await uploadBufferToS3(
+        buffer,
+        meta.attachmentName,
+        meta.contentType,
+      );
       results.push({
         filename: meta.attachmentName,
         fileKey,

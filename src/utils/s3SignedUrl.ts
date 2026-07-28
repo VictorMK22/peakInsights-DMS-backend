@@ -1,15 +1,5 @@
-import { GetObjectCommand } from "@aws-sdk/client-s3"
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner"
-import { s3 } from "../services/s3Storage";
-
-export const getSignedFileUrl = async (key: string) => {
-
-  const command = new GetObjectCommand({
-    Bucket: process.env.S3_BUCKET,
-    Key: key
-  })
-
-  return await getSignedUrl(s3, command, {
-    expiresIn: 3600
-  })
-}
+// Thin re-export — the real implementation lives in services/s3Storage.ts
+// alongside the S3 client itself. Kept as a separate importable path so
+// call sites can import "the URL function" without pulling in the raw S3
+// client/upload functions too.
+export { getSignedFileUrl } from "../services/s3Storage";

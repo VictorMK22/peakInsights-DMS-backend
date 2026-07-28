@@ -1,10 +1,9 @@
 import crypto from "crypto";
-import fs from "fs";
-import path from "path";
 import { Request, Response } from "express";
 import { ShareLink } from "../models/ShareLink";
 import { DocumentModel } from "../models/Document";
 import { AuthRequest } from "../types/auth";
+import { getSignedFileUrl } from "../services/s3Storage";
 
 const DEFAULT_EXPIRY_DAYS = 7;
 const MAX_EXPIRY_DAYS = 30;
@@ -47,12 +46,10 @@ export const createShareLink = async (
     }
 
     if (!canShare(doc, req.user!.userId, req.user!.role)) {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message: "Only the owner or CEO can share this document",
-        });
+      res.status(403).json({
+        success: false,
+        message: "Only the owner or CEO can share this document",
+      });
       return;
     }
 
@@ -240,27 +237,15 @@ export const accessSharedDocument = async (
       return;
     }
 
-    const filePath = path.join(
-      process.env.UPLOAD_DIR ?? "./uploads",
-      doc.fileKey,
-    );
-    if (!fs.existsSync(filePath)) {
-      res
-        .status(404)
-        .json({ success: false, message: "File missing from disk" });
-      return;
-    }
-
     link.accessCount = (link.accessCount ?? 0) + 1;
     link.lastAccessedAt = new Date();
     await link.save();
 
-    res.setHeader(
-      "Content-Disposition",
-      `inline; filename="${encodeURIComponent(doc.fileName)}"`,
-    );
-    res.setHeader("Content-Type", doc.fileType);
-    fs.createReadStream(filePath).pipe(res);
+    const url = await getSignedFileUrl(doc.fileKey, {
+      filename: doc.fileName,
+      expiresInSeconds: 60,
+    });
+    res.redirect(302, url);
   } catch (err) {
     console.error("accessSharedDocument error:", err);
     res.status(500).json({ success: false });

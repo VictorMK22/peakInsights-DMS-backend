@@ -14,14 +14,13 @@
 import { Response } from "express";
 import { AuthRequest } from "../types/auth";
 import mongoose from "mongoose";
-import path from "path";
-import fs from "fs";
 import { FolderModel } from "../models/Folder";
 import { DocumentModel } from "../models/Document";
 import { CommentModel } from "../models/Comment";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { createAuditLog } from "../utils/auditLogger";
 import { attachSignedUrlsToMany } from "./documentController";
+import { deleteFromS3 } from "../services/s3Storage";
 
 // ─────────────────────────────────────────────────────────────────
 // GET TRASH
@@ -111,7 +110,6 @@ export const getTrash = async (req: AuthRequest, res: Response) => {
 export const emptyTrash = async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user!.userId;
-    const uploadDir = process.env.UPLOAD_DIR ?? "./uploads";
 
     const docs = await DocumentModel.find({
       ownerId: userId,
@@ -120,14 +118,7 @@ export const emptyTrash = async (req: AuthRequest, res: Response) => {
 
     for (const doc of docs) {
       if (!doc.fileKey) continue;
-      const p = path.join(uploadDir, doc.fileKey);
-      if (fs.existsSync(p)) {
-        try {
-          fs.unlinkSync(p);
-        } catch {
-          /* non-fatal */
-        }
-      }
+      await deleteFromS3(doc.fileKey);
     }
 
     const docIds = docs.map((d) => d._id);

@@ -52,8 +52,12 @@ import { buildCacheKey } from "../utils/cacheKey";
 import { enqueueDocumentProcessing } from "../queues/documentQueue";
 import { getLocalFileUrl } from "../middleware/upload";
 import { buildSignedFileUrl } from "../utils/fileAccessToken";
+import {
+  deleteFromS3,
+  downloadFromS3,
+  getSignedFileUrl,
+} from "../services/s3Storage";
 import path from "path";
-import fs from "fs";
 import { resolveFolderType, cloneDocumentRecord } from "./folderController";
 
 // ─────────────────────────────────────────────────────────────────
@@ -181,7 +185,7 @@ const canModify = (
  * weight for a best-effort feature).
  */
 const extractTextContent = async (
-  filePath: string,
+  fileBuffer: Buffer,
   fileType: string,
   originalName: string,
 ): Promise<string | undefined> => {
@@ -196,7 +200,7 @@ const extractTextContent = async (
       fileType === "text/csv" ||
       [".txt", ".md", ".csv"].includes(ext)
     ) {
-      return await fs.promises.readFile(filePath, "utf-8");
+      return fileBuffer.toString("utf-8");
     }
 
     // RTF — strip control codes/groups for a rough plain-text read.
@@ -206,7 +210,7 @@ const extractTextContent = async (
       fileType === "text/rtf" ||
       ext === ".rtf"
     ) {
-      const raw = await fs.promises.readFile(filePath, "utf-8");
+      const raw = fileBuffer.toString("utf-8");
       return raw
         .replace(/\\par[d]?/g, "\n")
         .replace(/\{\\[^{}]*\}/g, "")
@@ -223,7 +227,7 @@ const extractTextContent = async (
       ext === ".docx"
     ) {
       const mammoth = await import("mammoth");
-      const result = await mammoth.extractRawText({ path: filePath });
+      const result = await mammoth.extractRawText({ buffer: fileBuffer });
       return result.value;
     }
 
@@ -236,7 +240,7 @@ const extractTextContent = async (
       [".xlsx", ".xls"].includes(ext)
     ) {
       const XLSX = await import("xlsx");
-      const workbook = XLSX.readFile(filePath);
+      const workbook = XLSX.read(fileBuffer, { type: "buffer" });
       const sheetTexts = workbook.SheetNames.map((name) => {
         const sheet = workbook.Sheets[name];
         const csv = XLSX.utils.sheet_to_csv(sheet);
@@ -253,8 +257,7 @@ const extractTextContent = async (
       ext === ".pptx"
     ) {
       const JSZip = (await import("jszip")).default;
-      const buffer = await fs.promises.readFile(filePath);
-      const zip = await JSZip.loadAsync(buffer);
+      const zip = await JSZip.loadAsync(fileBuffer);
 
       const slideFiles = Object.keys(zip.files)
         .filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name))
@@ -466,7 +469,7 @@ export const createDocument = async (
 
         const fileUrl = getLocalFileUrl(file.filename);
         const contentText = await extractTextContent(
-          file.path,
+          file.buffer,
           file.mimetype,
           file.originalname,
         );
@@ -1190,7 +1193,11 @@ export const restoreDocument = async (
       return;
     }
     if (!doc.isDeleted) {
-      res.json({ success: true, message: "Document is not in Trash", data: { document: attachSignedUrls(doc) } });
+      res.json({
+        success: true,
+        message: "Document is not in Trash",
+        data: { document: attachSignedUrls(doc) },
+      });
       return;
     }
 
@@ -1257,14 +1264,7 @@ export const permanentlyDeleteDocument = async (
     }
 
     if (doc.fileKey) {
-      const p = path.join(process.env.UPLOAD_DIR ?? "./uploads", doc.fileKey);
-      if (fs.existsSync(p)) {
-        try {
-          fs.unlinkSync(p);
-        } catch {
-          /* non-fatal */
-        }
-      }
+      await deleteFromS3(doc.fileKey);
     }
 
     await doc.deleteOne();
@@ -1365,12 +1365,11 @@ export const copyDocument = async (
       String(targetFolderId || "") !== String(doc.folderId || "");
     const titleOverride = movingElsewhere ? doc.title : `${doc.title} (copy)`;
 
-    const uploadDir = process.env.UPLOAD_DIR ?? "./uploads";
     const copy = await cloneDocumentRecord(
       doc,
       destFolderId as any,
       req.user!.userId,
-      uploadDir,
+      "",
       titleOverride,
     );
 
@@ -1490,25 +1489,16 @@ export const replaceFile = async (
       return;
     }
 
-    // Delete the old file from disk — same missing-fileKey guard as
+    // Delete the old file from S3 — same missing-fileKey guard as
     // deleteDocument above, so replacing a file on a malformed record
     // doesn't 500 either.
     if (doc.fileKey) {
-      const oldPath = path.join(
-        process.env.UPLOAD_DIR ?? "./uploads",
-        doc.fileKey,
-      );
-      if (fs.existsSync(oldPath))
-        try {
-          fs.unlinkSync(oldPath);
-        } catch {
-          /* non-fatal */
-        }
+      await deleteFromS3(doc.fileKey);
     }
 
     const fileUrl = getLocalFileUrl(req.file.filename);
     const extracted = await extractTextContent(
-      req.file.path,
+      req.file.buffer,
       req.file.mimetype,
       req.file.originalname,
     );
@@ -1757,19 +1747,16 @@ export const previewDocument = async (
       return;
     }
 
-    const filePath = path.join(
-      process.env.UPLOAD_DIR ?? "./uploads",
-      doc.fileKey,
-    );
     const mimeType = doc.fileType;
 
     // DOCX → HTML via mammoth (no LibreOffice)
     const isDocx =
       mimeType.includes("wordprocessingml") || mimeType.includes("msword");
-    if (isDocx && fs.existsSync(filePath)) {
+    if (isDocx) {
       try {
+        const fileBuffer = await downloadFromS3(doc.fileKey);
         const mammoth = await import("mammoth");
-        const result = await mammoth.convertToHtml({ path: filePath });
+        const result = await mammoth.convertToHtml({ buffer: fileBuffer });
         res.json({
           success: true,
           type: "html",
@@ -1826,23 +1813,12 @@ export const downloadDocument = async (
       action: "downloaded",
     });
 
-    const filePath = path.join(
-      process.env.UPLOAD_DIR ?? "./uploads",
-      doc.fileKey,
-    );
-    if (!fs.existsSync(filePath)) {
-      res
-        .status(404)
-        .json({ success: false, message: "File missing from disk" });
-      return;
-    }
-
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${encodeURIComponent(doc.fileName)}"`,
-    );
-    res.setHeader("Content-Type", doc.fileType);
-    fs.createReadStream(filePath).pipe(res);
+    const url = await getSignedFileUrl(doc.fileKey, {
+      filename: doc.fileName,
+      expiresInSeconds: 60,
+      forceAttachment: true,
+    });
+    res.redirect(302, url);
   } catch (err) {
     next(err);
   }

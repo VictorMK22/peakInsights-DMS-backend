@@ -7,9 +7,7 @@ import { CommentModel } from "../models/Comment";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { createAuditLog } from "../utils/auditLogger";
 import mongoose from "mongoose";
-import path from "path";
-import fs from "fs";
-import { v4 as uuid } from "uuid";
+import { copyObjectInS3, deleteFromS3 } from "../services/s3Storage";
 
 const escapeRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -24,22 +22,12 @@ export const cloneDocumentRecord = async (
   srcDoc: InstanceType<typeof DocumentModel>,
   destFolderId: mongoose.Types.ObjectId | null,
   newOwnerId: string,
-  uploadDir: string,
+  _uploadDir: string, // kept for call-site compatibility — unused now that files live in S3, not a local directory
   titleOverride?: string,
 ): Promise<InstanceType<typeof DocumentModel>> => {
   let newFileKey: string | undefined;
   if (srcDoc.fileKey) {
-    const ext = path.extname(srcDoc.fileKey);
-    newFileKey = `${uuid()}${ext}`;
-    const srcPath = path.join(uploadDir, srcDoc.fileKey);
-    const destPath = path.join(uploadDir, newFileKey);
-    if (fs.existsSync(srcPath)) {
-      try {
-        fs.copyFileSync(srcPath, destPath);
-      } catch {
-        /* non-fatal — the DB row still gets created without a file */
-      }
-    }
+    newFileKey = await copyObjectInS3(srcDoc.fileKey);
   }
 
   return DocumentModel.create({
@@ -171,12 +159,10 @@ export const createFolder = async (req: AuthRequest, res: Response) => {
   } catch (err: any) {
     // Unique index on { ownerId, path } — same name already exists at this level
     if (err?.code === 11000) {
-      res
-        .status(409)
-        .json({
-          success: false,
-          message: "A folder with this name already exists here",
-        });
+      res.status(409).json({
+        success: false,
+        message: "A folder with this name already exists here",
+      });
       return;
     }
     console.error("createFolder error:", err);
@@ -329,7 +315,10 @@ export const getFolderContents = async (req: AuthRequest, res: Response) => {
     await resolveFolderType(folder);
 
     const [folders, documents] = await Promise.all([
-      FolderModel.find({ parentFolderId: folderId, isDeleted: { $ne: true } }).sort({
+      FolderModel.find({
+        parentFolderId: folderId,
+        isDeleted: { $ne: true },
+      }).sort({
         name: 1,
       }),
       DocumentModel.find({ folderId, isDeleted: { $ne: true } })
@@ -398,7 +387,9 @@ export const updateFolder = async (req: AuthRequest, res: Response) => {
     const { name } = req.body as { name?: string };
 
     if (!name?.trim()) {
-      res.status(400).json({ success: false, message: "Folder name is required" });
+      res
+        .status(400)
+        .json({ success: false, message: "Folder name is required" });
       return;
     }
 
@@ -420,7 +411,10 @@ export const updateFolder = async (req: AuthRequest, res: Response) => {
 
     // Recompute this folder's path from its parent + new name, then
     // rewrite every descendant's path the same way moveFolder does.
-    const parentPath = folder.path.slice(0, folder.path.length - folder.name.length - 1);
+    const parentPath = folder.path.slice(
+      0,
+      folder.path.length - folder.name.length - 1,
+    );
     const oldPath = folder.path;
     const newPath = `${parentPath}/${trimmedName}`;
 
@@ -434,7 +428,10 @@ export const updateFolder = async (req: AuthRequest, res: Response) => {
     if (clash) {
       res
         .status(409)
-        .json({ success: false, message: "A folder with this name already exists here" });
+        .json({
+          success: false,
+          message: "A folder with this name already exists here",
+        });
       return;
     }
 
@@ -456,7 +453,10 @@ export const updateFolder = async (req: AuthRequest, res: Response) => {
     if (err?.code === 11000) {
       res
         .status(409)
-        .json({ success: false, message: "A folder with this name already exists here" });
+        .json({
+          success: false,
+          message: "A folder with this name already exists here",
+        });
       return;
     }
     console.error("updateFolder error:", err);
@@ -481,12 +481,10 @@ export const moveFolder = async (req: AuthRequest, res: Response) => {
           .status(404)
           .json({ success: false, message: "Target not found" });
       if (isSameOrDescendantPath(target.path, folder.path)) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message: "Cannot move folder inside itself",
-          });
+        return res.status(400).json({
+          success: false,
+          message: "Cannot move folder inside itself",
+        });
       }
     }
 
@@ -508,7 +506,7 @@ export const moveFolder = async (req: AuthRequest, res: Response) => {
     // descendant, so the Working/Stored split stays consistent.
     const newType = newParent
       ? await resolveFolderType(newParent)
-      : folder.documentType ?? "working";
+      : (folder.documentType ?? "working");
 
     for (const sub of subfolders) {
       sub.path = sub.path.replace(oldPath, newPath);
@@ -555,11 +553,15 @@ export const deleteFolderRecursive = async (
 
     await FolderModel.updateMany(
       { _id: { $in: folderIds } },
-      { $set: { isDeleted: true, deletedAt: now, deletedBy: req.user!.userId } },
+      {
+        $set: { isDeleted: true, deletedAt: now, deletedBy: req.user!.userId },
+      },
     );
     await DocumentModel.updateMany(
       { folderId: { $in: folderIds } },
-      { $set: { isDeleted: true, deletedAt: now, deletedBy: req.user!.userId } },
+      {
+        $set: { isDeleted: true, deletedAt: now, deletedBy: req.user!.userId },
+      },
     );
 
     await createAuditLog({
@@ -602,7 +604,11 @@ export const restoreFolder = async (req: AuthRequest, res: Response) => {
       return;
     }
     if (!folder.isDeleted) {
-      res.json({ success: true, message: "Folder is not in Trash", data: folder });
+      res.json({
+        success: true,
+        message: "Folder is not in Trash",
+        data: folder,
+      });
       return;
     }
 
@@ -634,11 +640,17 @@ export const restoreFolder = async (req: AuthRequest, res: Response) => {
 
     await FolderModel.updateMany(
       { _id: { $in: folderIds } },
-      { $set: { isDeleted: false, deletedAt: null }, $unset: { deletedBy: "" } },
+      {
+        $set: { isDeleted: false, deletedAt: null },
+        $unset: { deletedBy: "" },
+      },
     );
     await DocumentModel.updateMany(
       { folderId: { $in: folderIds } },
-      { $set: { isDeleted: false, deletedAt: null }, $unset: { deletedBy: "" } },
+      {
+        $set: { isDeleted: false, deletedAt: null },
+        $unset: { deletedBy: "" },
+      },
     );
 
     // The bulk update above already persisted this in the DB — mirror
@@ -697,14 +709,7 @@ export const permanentlyDeleteFolder = async (
     }).select("fileKey");
     for (const doc of docsToDelete) {
       if (!doc.fileKey) continue;
-      const p = path.join(process.env.UPLOAD_DIR ?? "./uploads", doc.fileKey);
-      if (fs.existsSync(p)) {
-        try {
-          fs.unlinkSync(p);
-        } catch {
-          /* non-fatal */
-        }
-      }
+      await deleteFromS3(doc.fileKey);
     }
 
     const docIds = docsToDelete.map((d) => d._id);
@@ -786,7 +791,6 @@ export const copyFolder = async (req: AuthRequest, res: Response) => {
     }
 
     const userId = req.user!.userId;
-    const uploadDir = process.env.UPLOAD_DIR ?? "./uploads";
 
     let newParent: InstanceType<typeof FolderModel> | null = null;
     if (targetParentId) {
@@ -806,9 +810,7 @@ export const copyFolder = async (req: AuthRequest, res: Response) => {
     let baseName = targetParentId ? folder.name : `${folder.name} (copy)`;
     let candidate = baseName;
     let n = 2;
-    while (
-      await FolderModel.findOne({ ...siblingFilter, name: candidate })
-    ) {
+    while (await FolderModel.findOne({ ...siblingFilter, name: candidate })) {
       candidate = `${baseName} (${n++})`;
     }
 
@@ -834,11 +836,14 @@ export const copyFolder = async (req: AuthRequest, res: Response) => {
           parentFolderId: srcFolder._id,
           isDeleted: { $ne: true },
         }),
-        DocumentModel.find({ folderId: srcFolder._id, isDeleted: { $ne: true } }),
+        DocumentModel.find({
+          folderId: srcFolder._id,
+          isDeleted: { $ne: true },
+        }),
       ]);
 
       for (const doc of childDocs) {
-        await cloneDocumentRecord(doc, destFolder._id, userId, uploadDir);
+        await cloneDocumentRecord(doc, destFolder._id, userId, "");
       }
 
       for (const child of childFolders) {
@@ -858,7 +863,10 @@ export const copyFolder = async (req: AuthRequest, res: Response) => {
     await createAuditLog({
       actorId: userId,
       action: "copied",
-      details: { sourceFolderId: String(folder._id), newFolderId: String(rootCopy._id) },
+      details: {
+        sourceFolderId: String(folder._id),
+        newFolderId: String(rootCopy._id),
+      },
     });
 
     res.json({ success: true, message: "Folder copied", data: rootCopy });
@@ -920,11 +928,23 @@ export const bulkDeleteFolders = async (req: AuthRequest, res: Response) => {
       const now = new Date();
       await FolderModel.updateMany(
         { _id: { $in: idsArray } },
-        { $set: { isDeleted: true, deletedAt: now, deletedBy: req.user!.userId } },
+        {
+          $set: {
+            isDeleted: true,
+            deletedAt: now,
+            deletedBy: req.user!.userId,
+          },
+        },
       );
       await DocumentModel.updateMany(
         { folderId: { $in: idsArray } },
-        { $set: { isDeleted: true, deletedAt: now, deletedBy: req.user!.userId } },
+        {
+          $set: {
+            isDeleted: true,
+            deletedAt: now,
+            deletedBy: req.user!.userId,
+          },
+        },
       );
     }
 

@@ -1,48 +1,34 @@
 import { Request, Response } from "express";
-import fs from "fs";
-import path from "path";
-import mimeTypes from "mime-types";
 import { verifyFileToken } from "../utils/fileAccessToken";
-
-const UPLOAD_DIR = process.env.UPLOAD_DIR
-  ? path.resolve(process.env.UPLOAD_DIR)
-  : path.join(__dirname, "../../uploads");
-
-// Anything NOT in this set gets forced to download (Content-Disposition:
-// attachment) rather than rendered inline. This is what stops an
-// uploaded .html/.svg/.xml file from executing as a page in this
-// origin — a classic stored-XSS vector for file-upload features that
-// the previous implementation had no defense against at all.
-const INLINE_SAFE_EXTENSIONS = new Set([
-  ".png",
-  ".jpg",
-  ".jpeg",
-  ".gif",
-  ".webp",
-  ".pdf",
-]);
+import { getSignedFileUrl } from "../services/s3Storage";
 
 /**
  * GET /api/files/:fileKey?token=...&exp=...
  *
  * PUBLIC route (no `authenticate` middleware) — but every request
- * still requires a valid, signed, non-expired token. This replaces
- * the old public `express.static('/uploads', ...)` mount, which
- * served every uploaded file to anyone who knew its UUID filename,
- * forever, with zero access control.
+ * still requires a valid, signed, non-expired token. The token is
+ * generated fresh by the API on every authenticated, access-checked
+ * read (see documentController/taskController/clientController etc,
+ * via getLocalFileUrl / buildSignedFileUrl) — it is short-lived and
+ * tied to one specific file.
  *
- * The token is generated fresh by the API on every authenticated,
- * access-checked read (see documentController/taskController) — it
- * is short-lived and tied to one specific file.
+ * Files themselves live in S3, not on this server. Once the token is
+ * verified, this generates a fresh, very short-lived S3 presigned URL
+ * and redirects the browser straight to it — the actual file bytes
+ * are served directly by S3, never proxied through this backend. That
+ * matters specifically on Vercel: proxying file bytes through a
+ * serverless function would count against its bandwidth quota and its
+ * per-invocation execution-time limit; a redirect response is just a
+ * few bytes of headers regardless of how large the underlying file is.
  */
-export const serveFile = (req: Request, res: Response): void => {
+export const serveFile = async (req: Request, res: Response): Promise<void> => {
   try {
     const { fileKey } = req.params;
     const { token, exp } = req.query as { token?: string; exp?: string };
 
     // fileKey is always a server-generated UUID + extension (see
     // middleware/upload.ts) — reject anything that could be a path
-    // traversal attempt before it ever touches the filesystem.
+    // traversal attempt before it's used to build an S3 key.
     if (
       !fileKey ||
       fileKey.includes("/") ||
@@ -62,27 +48,11 @@ export const serveFile = (req: Request, res: Response): void => {
       return;
     }
 
-    const filePath = path.join(UPLOAD_DIR, fileKey);
-    if (!fs.existsSync(filePath)) {
-      res.status(404).json({ success: false, message: "File not found" });
-      return;
-    }
-
-    const ext = path.extname(fileKey).toLowerCase();
-    const mimeType = mimeTypes.lookup(ext) || "application/octet-stream";
-    const disposition = INLINE_SAFE_EXTENSIONS.has(ext)
-      ? "inline"
-      : "attachment";
-
-    res.setHeader("Content-Type", mimeType);
-    res.setHeader(
-      "Content-Disposition",
-      `${disposition}; filename="${encodeURIComponent(fileKey)}"`,
-    );
-    res.setHeader("X-Content-Type-Options", "nosniff");
-    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-
-    fs.createReadStream(filePath).pipe(res);
+    // Short expiry is fine and intentional — the browser follows the
+    // redirect within milliseconds of receiving it, this is never
+    // meant to be a link a person holds onto.
+    const s3Url = await getSignedFileUrl(fileKey, { expiresInSeconds: 60 });
+    res.redirect(302, s3Url);
   } catch (err) {
     console.error("serveFile error:", err);
     res.status(500).json({ success: false });
