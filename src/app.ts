@@ -47,6 +47,17 @@ dotenv.config();
 
 const app = express();
 
+// Trust the first hop in front of this app. On Vercel that's Vercel's
+// own edge network, which sets X-Forwarded-For to the real visitor
+// IP — without this, Express ignores that header by default (a
+// sensible default on an untrusted network, but wrong here), which
+// breaks express-rate-limit's ability to tell requests apart by IP
+// (see the ERR_ERL_UNEXPECTED_X_FORWARDED_FOR warning in the logs).
+// `1` means "trust exactly one hop," not "trust every proxy" — the
+// right level of trust for a single edge network in front of the app,
+// rather than blindly trusting an arbitrary chain of proxies.
+app.set("trust proxy", 1);
+
 const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
 
 // ── Security ──────────────────────────────────────────────────────
