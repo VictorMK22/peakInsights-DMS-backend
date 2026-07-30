@@ -42,7 +42,10 @@ export const connectZoho = (req: AuthRequest, res: Response) => {
     });
   }
   const state = signState(req.user!.userId);
-  res.json({ success: true, data: { authUrl: buildZohoAuthUrl(state) } });
+  return res.json({
+    success: true,
+    data: { authUrl: buildZohoAuthUrl(state) },
+  });
 };
 
 // GET /integrations/zoho/callback — PUBLIC. Zoho redirects the user's
@@ -80,10 +83,10 @@ export const zohoCallback = async (req: Request, res: Response) => {
     integration.lastError = undefined;
     await integration.save();
 
-    res.redirect(`${FRONTEND_URL}/profile?zoho=connected`);
+    return res.redirect(`${FRONTEND_URL}/profile?zoho=connected`);
   } catch (err) {
     console.error("Zoho OAuth callback failed:", err);
-    res.redirect(`${FRONTEND_URL}/profile?zoho=error`);
+    return res.redirect(`${FRONTEND_URL}/profile?zoho=error`);
   }
 };
 
@@ -92,7 +95,7 @@ export const getIntegrationStatus = async (req: AuthRequest, res: Response) => {
   const integration = await EmailIntegrationModel.findOne({
     userId: req.user!.userId,
   }).select("emailAddress status lastSyncedAt lastError");
-  res.json({
+  return res.json({
     success: true,
     data: {
       configured: isZohoConfigured(),
@@ -107,7 +110,7 @@ export const disconnectZoho = async (req: AuthRequest, res: Response) => {
     { userId: req.user!.userId },
     { status: "disconnected" },
   );
-  res.json({ success: true });
+  return res.json({ success: true });
 };
 
 // GET /integrations/zoho/all — CEO-only. Lets the executive see who on
@@ -121,5 +124,5 @@ export const getAllIntegrations = async (req: AuthRequest, res: Response) => {
     .populate("userId", "name email role")
     .select("userId emailAddress status lastSyncedAt lastError")
     .lean();
-  res.json({ success: true, data: { integrations } });
+  return res.json({ success: true, data: { integrations } });
 };

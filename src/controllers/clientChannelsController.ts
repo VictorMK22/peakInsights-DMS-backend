@@ -26,7 +26,7 @@ export const getClientNotes = async (req: AuthRequest, res: Response) => {
     .populate("authorId", "name role profilePicture")
     .sort({ createdAt: -1 })
     .lean();
-  res.json({ success: true, data: { notes } });
+  return res.json({ success: true, data: { notes } });
 };
 
 export const createClientNote = async (req: AuthRequest, res: Response) => {
@@ -43,7 +43,7 @@ export const createClientNote = async (req: AuthRequest, res: Response) => {
     body: body.trim(),
   });
   const populated = await note.populate("authorId", "name role profilePicture");
-  res.status(201).json({ success: true, data: { note: populated } });
+  return res.status(201).json({ success: true, data: { note: populated } });
 };
 
 export const deleteClientNote = async (req: AuthRequest, res: Response) => {
@@ -53,7 +53,7 @@ export const deleteClientNote = async (req: AuthRequest, res: Response) => {
     _id: req.params.noteId,
     clientId: req.params.id,
   });
-  res.json({ success: true });
+  return res.json({ success: true });
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -67,7 +67,7 @@ export const getClientMeetings = async (req: AuthRequest, res: Response) => {
     .populate("authorId", "name role profilePicture")
     .sort({ scheduledAt: -1 })
     .lean();
-  res.json({ success: true, data: { meetings } });
+  return res.json({ success: true, data: { meetings } });
 };
 
 export const createClientMeeting = async (req: AuthRequest, res: Response) => {
@@ -107,7 +107,7 @@ export const createClientMeeting = async (req: AuthRequest, res: Response) => {
     "authorId",
     "name role profilePicture",
   );
-  res.status(201).json({ success: true, data: { meeting: populated } });
+  return res.status(201).json({ success: true, data: { meeting: populated } });
 };
 
 export const updateClientMeeting = async (req: AuthRequest, res: Response) => {
@@ -119,7 +119,7 @@ export const updateClientMeeting = async (req: AuthRequest, res: Response) => {
     { new: true, runValidators: true },
   ).populate("authorId", "name role profilePicture");
   if (!meeting) return res.status(404).json({ success: false });
-  res.json({ success: true, data: { meeting } });
+  return res.json({ success: true, data: { meeting } });
 };
 
 export const deleteClientMeeting = async (req: AuthRequest, res: Response) => {
@@ -129,7 +129,7 @@ export const deleteClientMeeting = async (req: AuthRequest, res: Response) => {
     _id: req.params.meetingId,
     clientId: req.params.id,
   });
-  res.json({ success: true });
+  return res.json({ success: true });
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -143,7 +143,7 @@ export const getClientCalls = async (req: AuthRequest, res: Response) => {
     .populate("authorId", "name role profilePicture")
     .sort({ calledAt: -1 })
     .lean();
-  res.json({ success: true, data: { calls } });
+  return res.json({ success: true, data: { calls } });
 };
 
 export const createClientCall = async (req: AuthRequest, res: Response) => {
@@ -169,7 +169,7 @@ export const createClientCall = async (req: AuthRequest, res: Response) => {
     summary: summary.trim(),
   });
   const populated = await call.populate("authorId", "name role profilePicture");
-  res.status(201).json({ success: true, data: { call: populated } });
+  return res.status(201).json({ success: true, data: { call: populated } });
 };
 
 export const deleteClientCall = async (req: AuthRequest, res: Response) => {
@@ -179,7 +179,7 @@ export const deleteClientCall = async (req: AuthRequest, res: Response) => {
     _id: req.params.callId,
     clientId: req.params.id,
   });
-  res.json({ success: true });
+  return res.json({ success: true });
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -202,7 +202,7 @@ export const getClientInvoices = async (req: AuthRequest, res: Response) => {
     .populate("authorId", "name role")
     .sort({ issuedAt: -1 })
     .lean();
-  res.json({
+  return res.json({
     success: true,
     data: { invoices: invoices.map(withInvoiceFileUrl) },
   });
@@ -249,7 +249,7 @@ export const createClientInvoice = async (req: AuthRequest, res: Response) => {
       : undefined,
   });
   const populated = await invoice.populate("authorId", "name role");
-  res.status(201).json({
+  return res.status(201).json({
     success: true,
     data: { invoice: withInvoiceFileUrl(populated.toObject()) },
   });
@@ -279,7 +279,10 @@ export const updateClientInvoice = async (req: AuthRequest, res: Response) => {
     .populate("authorId", "name role")
     .lean();
   if (!invoice) return res.status(404).json({ success: false });
-  res.json({ success: true, data: { invoice: withInvoiceFileUrl(invoice) } });
+  return res.json({
+    success: true,
+    data: { invoice: withInvoiceFileUrl(invoice) },
+  });
 };
 
 export const deleteClientInvoice = async (req: AuthRequest, res: Response) => {
@@ -289,7 +292,7 @@ export const deleteClientInvoice = async (req: AuthRequest, res: Response) => {
     _id: req.params.invoiceId,
     clientId: req.params.id,
   });
-  res.json({ success: true });
+  return res.json({ success: true });
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -308,5 +311,5 @@ export const getClientTasks = async (req: AuthRequest, res: Response) => {
     .populate("assignedTo", "name role")
     .sort({ createdAt: -1 })
     .lean();
-  res.json({ success: true, data: { tasks } });
+  return res.json({ success: true, data: { tasks } });
 };

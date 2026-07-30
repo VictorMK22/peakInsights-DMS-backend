@@ -28,7 +28,7 @@ export const getClientWhatsappMessages = async (
     .populate("authorId", "name role profilePicture")
     .sort({ timestamp: 1 })
     .lean();
-  res.json({
+  return res.json({
     success: true,
     data: { messages, configured: whatsappIsConfigured() },
   });
@@ -82,7 +82,7 @@ export const sendClientWhatsappMessage = async (
       warning: result.error,
     });
   }
-  res.status(201).json({ success: true, data: { message: populated } });
+  return res.status(201).json({ success: true, data: { message: populated } });
 };
 
 // ═══════════════════════════════════════════════════════════════

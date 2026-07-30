@@ -1,4 +1,19 @@
 export type UserRole = "ceo" | "supervisor" | "user" | "sales_person";
+
+// Shape of the decoded JWT payload — used by middleware/auth.ts and
+// authController.ts wherever the auth token is signed/verified.
+// userId is the only field actually read off the decoded token today
+// (auth.ts re-fetches the full user by id rather than trusting
+// role/email straight from the token); role/email are kept optional
+// since not every sign site necessarily includes them.
+export interface JwtPayload {
+  userId: string;
+  role?: UserRole;
+  email?: string;
+  iat?: number;
+  exp?: number;
+}
+
 export type DocumentStatus =
   | "draft"
   | "in_progress"
