@@ -1,7 +1,7 @@
 {
-  "name": "peakinsights-dms-backend",
+  "name": "peakinsights-hub-backend",
   "version": "1.0.0",
-  "description": "PeakInsights Document Management System - Backend API",
+  "description": "PeakInsights Hub - Backend API",
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",

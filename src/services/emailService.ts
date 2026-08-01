@@ -1,7 +1,7 @@
 /**
  * services/emailService.ts
  *
- * Transactional emails for PeakInsights DMS.
+ * Transactional emails for PeakInsights Hub.
  *
  * Account creation is CEO-only — there is no self-registration or
  * approval workflow. Accounts are created directly by the CEO and
@@ -81,7 +81,7 @@ async function send(
   const t = getTransporter();
   if (!t) return null;
 
-  const from = `"PeakInsights" <${process.env.SMTP_USER}>`;
+  const from = `"PeakInsights Hub" <${process.env.SMTP_USER}>`;
 
   try {
     const info = await t.sendMail({
@@ -126,8 +126,8 @@ function wrap(title: string, body: string): string {
              style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08);">
         <tr>
           <td style="background:linear-gradient(135deg,#0ea5e9,#7c3aed);padding:28px 32px;">
-            <p style="margin:0;font-size:22px;font-weight:700;color:#fff;letter-spacing:-.5px;">⚡ PeakInsights</p>
-            <p style="margin:4px 0 0;font-size:13px;color:rgba(255,255,255,.75);">Document Management System</p>
+            <p style="margin:0;font-size:22px;font-weight:700;color:#fff;letter-spacing:-.5px;">⚡ PeakInsights Hub</p>
+            <p style="margin:4px 0 0;font-size:13px;color:rgba(255,255,255,.75);">Business Operations Hub</p>
           </td>
         </tr>
         <tr>
@@ -136,7 +136,7 @@ function wrap(title: string, body: string): string {
         <tr>
           <td style="padding:20px 32px;border-top:1px solid #f1f5f9;background:#f8fafc;">
             <p style="margin:0;font-size:12px;color:#94a3b8;line-height:1.6;">
-              This email was sent by PeakInsights DMS. If you didn't expect this, you can safely ignore it.<br />
+              This email was sent by PeakInsights Hub. If you didn't expect this, you can safely ignore it.<br />
               © ${new Date().getFullYear()} PeakInsights. All rights reserved.
             </p>
           </td>
@@ -178,11 +178,11 @@ export async function sendAccountCreatedByCEOEmail(
 ): Promise<void> {
   await send(
     to,
-    "Your PeakInsights account is ready",
+    "Your PeakInsights Hub account is ready",
     wrap(
       "Account Created",
       `
-      ${h1("Welcome to PeakInsights, " + name + "!")}
+      ${h1("Welcome to PeakInsights Hub, " + name + "!")}
       ${p("The CEO has created a <strong>" + (role === "sales_person" ? "Sales Person / Business Development Officer" : role) + "</strong> account for you. Your account is active immediately.")}
       ${info("Email", to)}
       ${highlight(
@@ -211,12 +211,12 @@ export async function sendPasswordResetEmail(
   const resetUrl = `${APP_URL}/reset-password?token=${resetToken}&email=${encodeURIComponent(to)}`;
   await send(
     to,
-    "Reset your PeakInsights password",
+    "Reset your PeakInsights Hub password",
     wrap(
       "Password Reset",
       `
       ${h1("Password Reset Request")}
-      ${p("Hi " + name + ", we received a request to reset your PeakInsights password.")}
+      ${p("Hi " + name + ", we received a request to reset your PeakInsights Hub password.")}
       ${btn("Reset My Password", resetUrl)}
       ${highlight("This link expires in <strong>1 hour</strong>. If you didn't request this, you can safely ignore this email.")}
     `,
@@ -233,7 +233,7 @@ export async function sendPasswordChangedEmail(
 ): Promise<void> {
   await send(
     to,
-    "Your PeakInsights password was changed",
+    "Your PeakInsights Hub password was changed",
     wrap(
       "Password Changed",
       `
@@ -371,7 +371,7 @@ export async function sendNewMessageEmail(
       "New Message",
       `
       ${h1("New message from " + senderName)}
-      ${p("Hi " + recipientName + ", you have a new message in PeakInsights.")}
+      ${p("Hi " + recipientName + ", you have a new message in PeakInsights Hub.")}
       ${subject ? info("Subject", subject) : ""}
       ${
         bodyPreview
