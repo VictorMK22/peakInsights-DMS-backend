@@ -13,6 +13,7 @@ export interface IUser extends Document {
   phone?: string;
   profilePicture?: string;
   isActive: boolean;
+  mfaEnabled: boolean;
   supervisorId?: mongoose.Types.ObjectId;
   accountStatus: "pending" | "active" | "rejected" | "disabled";
   rejectionReason?: string;
@@ -40,7 +41,7 @@ const UserSchema = new Schema<IUser>(
     password: { type: String, required: true, minlength: 8, select: false },
     role: {
       type: String,
-      enum: ["ceo", "supervisor", "user", "sales_person"],
+      enum: ["ceo", "supervisor", "user", "sales_person", "accountant", "tech"],
       required: true,
     },
     department: { type: String, trim: true },
@@ -59,6 +60,11 @@ const UserSchema = new Schema<IUser>(
       type: String,
     },
     isActive: { type: Boolean, default: false }, // false until CEO approves
+    // Surfaced on the ICT Security Center as real MFA coverage. There is
+    // no MFA *enforcement* wired up yet (no second factor is actually
+    // checked at login) — this flag is a record of enrollment status,
+    // settable via the profile/security settings, not a gate on login.
+    mfaEnabled: { type: Boolean, default: false },
     supervisorId: {
       type: Schema.Types.ObjectId,
       ref: "User",

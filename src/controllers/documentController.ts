@@ -112,7 +112,7 @@ const canAccess = async (
   userId: string,
   role: string,
 ): Promise<boolean> => {
-  if (role === "ceo") return true;
+  if (role === "ceo" || role === "tech") return true;
 
   const ownerId = idOf(doc.ownerId);
   if (ownerId === userId) return true;
@@ -163,7 +163,7 @@ const canModify = (
   userId: string,
   role: string,
 ): boolean => {
-  if (role === "ceo") return true;
+  if (role === "ceo" || role === "tech") return true;
   if (idOf(doc.ownerId) === userId) return true;
   if (role === "supervisor" && doc.documentType === "learning") return true;
   return false;
@@ -393,7 +393,11 @@ export const createDocument = async (
     //                      They may explicitly choose 'storage' for reference files.
     const uploaderRole = req.user!.role;
     let documentType: string;
-    if (uploaderRole === "ceo" || uploaderRole === "supervisor") {
+    if (
+      uploaderRole === "ceo" ||
+      uploaderRole === "tech" ||
+      uploaderRole === "supervisor"
+    ) {
       documentType = rawDocumentType === "storage" ? "storage" : "learning";
     } else {
       documentType = rawDocumentType === "storage" ? "storage" : "working";
@@ -552,7 +556,7 @@ export const getDocumentTypeCounts = async (
 
     // Same visibility rule getDocuments uses for documents.
     const docFilter: Record<string, unknown> = { isDeleted: { $ne: true } };
-    if (role === "user") {
+    if (role === "user" || role === "accountant") {
       const activeTasks = await TaskModel.find({
         status: "in_progress",
         documentId: { $exists: true },
@@ -588,7 +592,7 @@ export const getDocumentTypeCounts = async (
       }).select("subordinateId");
       const subIds = maps.map((m) => m.subordinateId);
       folderOwnerFilter = { ownerId: { $in: [uid, ...subIds] } };
-    } else if (role === "user") {
+    } else if (role === "user" || role === "accountant") {
       folderOwnerFilter = { ownerId: uid };
     }
     // ceo: no filter
@@ -701,7 +705,7 @@ export const getDocuments = async (
         readStatus === "read" ? { $in: readIds } : { $nin: readIds };
     }
 
-    if (req.user!.role === "user") {
+    if (req.user!.role === "user" || req.user!.role === "accountant") {
       // Own docs + docs linked to active tasks where user is collaborator
       const activeTasks = await TaskModel.find({
         status: "in_progress",
@@ -727,7 +731,7 @@ export const getDocuments = async (
         { supervisorId: uid },
         { documentType: "learning" },
       ];
-    } else if (req.user!.role === "ceo") {
+    } else if (req.user!.role === "ceo" || req.user!.role === "tech") {
       if (ownerF) filter["ownerId"] = new mongoose.Types.ObjectId(ownerF);
       if (supF) filter["supervisorId"] = new mongoose.Types.ObjectId(supF);
     }
@@ -1699,7 +1703,7 @@ export const deleteComment = async (
 
     const isAuthor = comment.user.toString() === req.user!.userId;
     const isDocOwner = doc.ownerId.toString() === req.user!.userId;
-    const isCEO = req.user!.role === "ceo";
+    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
 
     if (!isAuthor && !isDocOwner && !isCEO) {
       res.status(403).json({

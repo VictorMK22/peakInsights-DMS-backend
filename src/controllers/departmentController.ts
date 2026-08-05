@@ -15,13 +15,11 @@ export const createDepartment = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo") {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message: "Only the CEO can create departments",
-        });
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
+      res.status(403).json({
+        success: false,
+        message: "Only the CEO can create departments",
+      });
       return;
     }
 
@@ -40,12 +38,10 @@ export const createDepartment = async (
       name: name.trim(),
     }).collation({ locale: "en", strength: 2 });
     if (existing) {
-      res
-        .status(409)
-        .json({
-          success: false,
-          message: "A department with this name already exists",
-        });
+      res.status(409).json({
+        success: false,
+        message: "A department with this name already exists",
+      });
       return;
     }
 
@@ -117,7 +113,7 @@ export const updateDepartment = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo") {
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
       res
         .status(403)
         .json({ success: false, message: "Only the CEO can edit departments" });
@@ -145,12 +141,10 @@ export const updateDepartment = async (
         name: name.trim(),
       }).collation({ locale: "en", strength: 2 });
       if (clash) {
-        res
-          .status(409)
-          .json({
-            success: false,
-            message: "A department with this name already exists",
-          });
+        res.status(409).json({
+          success: false,
+          message: "A department with this name already exists",
+        });
         return;
       }
       department.name = name.trim();
@@ -189,13 +183,11 @@ export const deleteDepartment = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo") {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message: "Only the CEO can delete departments",
-        });
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
+      res.status(403).json({
+        success: false,
+        message: "Only the CEO can delete departments",
+      });
       return;
     }
 

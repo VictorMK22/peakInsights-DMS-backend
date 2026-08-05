@@ -4,6 +4,8 @@ import { AuthRequest } from "../types/auth";
 import { canAccess } from "./clientController";
 import { ClientNoteModel } from "../models/ClientNote";
 import { ClientMeetingModel } from "../models/ClientMeeting";
+import { MeetingModel } from "../models/Meeting";
+import { getClientMeetingActivity } from "../services/meetingActivityService";
 import { ClientCallModel } from "../models/ClientCall";
 import {
   ClientInvoiceModel,
@@ -58,6 +60,17 @@ export const deleteClientNote = async (req: AuthRequest, res: Response) => {
 
 // ═══════════════════════════════════════════════════════════════
 // MEETINGS
+//
+// Two sources, on purpose:
+//   - ClientMeetingModel: a manual log, for meetings that happened
+//     off-system (a hallway chat, a meeting booked elsewhere) that
+//     someone wants a record of after the fact.
+//   - MeetingModel (below, getClientScheduledMeetings): every meeting
+//     actually scheduled through the Meeting & Calendar module with
+//     this client attached — populated automatically, live status/
+//     RSVPs, zero manual entry. This is the primary path; the manual
+//     log is the fallback for things that never went through the
+//     calendar at all.
 // ═══════════════════════════════════════════════════════════════
 
 export const getClientMeetings = async (req: AuthRequest, res: Response) => {
@@ -68,6 +81,41 @@ export const getClientMeetings = async (req: AuthRequest, res: Response) => {
     .sort({ scheduledAt: -1 })
     .lean();
   return res.json({ success: true, data: { meetings } });
+};
+
+/**
+ * Meetings auto-synced from the Meeting & Calendar module for this
+ * client — no manual entry involved. This is what a client's
+ * "activity timeline" for meetings should actually show.
+ */
+export const getClientScheduledMeetings = async (
+  req: AuthRequest,
+  res: Response,
+) => {
+  if (!(await authorized(req)))
+    return res.status(403).json({ success: false, message: "Access denied" });
+  const meetings = await MeetingModel.find({ clientId: req.params.id })
+    .populate("organizer", "name email role")
+    .populate("attendees.userId", "name email role")
+    .sort({ startTime: -1 })
+    .lean();
+  return res.json({ success: true, data: { meetings } });
+};
+
+/**
+ * The automatic activity trail (created / invited / accepted /
+ * declined / rescheduled / cancelled / completed) for every meeting
+ * tied to this client — this is what makes the timeline "automatic"
+ * rather than something someone has to write up.
+ */
+export const getClientMeetingActivityFeed = async (
+  req: AuthRequest,
+  res: Response,
+) => {
+  if (!(await authorized(req)))
+    return res.status(403).json({ success: false, message: "Access denied" });
+  const activity = await getClientMeetingActivity(req.params.id);
+  return res.json({ success: true, data: { activity } });
 };
 
 export const createClientMeeting = async (req: AuthRequest, res: Response) => {

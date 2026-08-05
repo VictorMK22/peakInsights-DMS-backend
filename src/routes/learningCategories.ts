@@ -15,8 +15,20 @@ router.use(authenticate);
 router.get("/", getLearningCategories);
 
 // CEO / supervisor manage the taxonomy.
-router.post("/", requireRole("ceo", "supervisor"), createLearningCategory);
-router.put("/:id", requireRole("ceo", "supervisor"), updateLearningCategory);
-router.delete("/:id", requireRole("ceo", "supervisor"), deleteLearningCategory);
+router.post(
+  "/",
+  requireRole("ceo", "tech", "supervisor"),
+  createLearningCategory,
+);
+router.put(
+  "/:id",
+  requireRole("ceo", "tech", "supervisor"),
+  updateLearningCategory,
+);
+router.delete(
+  "/:id",
+  requireRole("ceo", "tech", "supervisor"),
+  deleteLearningCategory,
+);
 
 export default router;

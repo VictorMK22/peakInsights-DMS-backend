@@ -1,0 +1,3001 @@
+[33mcommit 284af255da65237f3b8ce3c5b427b380e7e1897a[m
+Author: VictorMK22 <meli.victorkip17@gmail.com>
+Date:   Sun Apr 19 13:09:16 2026 +0300
+
+    Refined Document viewing logic
+
+[1mdiff --git a/.env.example b/.env.example[m
+[1mindex 6c88b7d..95bb22f 100644[m
+[1m--- a/.env.example[m
+[1m+++ b/.env.example[m
+[36m@@ -1,7 +1,7 @@[m
+ NODE_ENV=development[m
+ PORT=5000[m
+[31m-MONGODB_URI=mongodb://localhost:27017/peakinsights_dms[m
+[31m-JWT_SECRET=your-super-secret-jwt-key-change-in-production[m
+[32m+[m[32mMONGODB_URI=mongodb+srv://meli_db_user:ompe688xLw1t2KUR@cluster0.iv29ju2.mongodb.net/peakinsights_dms?authSource=admin&retryWrites=true&w=majority[m
+[32m+[m[32mJWT_SECRET=8f9a1d0c7e4b2f6a9d3c8e1f4b7a2c7e[m
+ JWT_EXPIRES_IN=7d[m
+ UPLOAD_DIR=./uploads[m
+ MAX_FILE_SIZE=52428800[m
+[36m@@ -13,3 +13,4 @@[m [mCEO_NAME=PeakInsights CEO[m
+ CEO_EMAIL=ceo@peakinsights.com[m
+ CEO_PASSWORD=PeakInsights@2025[m
+ CEO_DEPARTMENT=Executive[m
+[41m+[m
+[1mdiff --git a/src/controllers/analyticsController.ts b/src/controllers/analyticsController.ts[m
+[1mindex 53a2b0f..a77c565 100644[m
+[1m--- a/src/controllers/analyticsController.ts[m
+[1m+++ b/src/controllers/analyticsController.ts[m
+[36m@@ -7,6 +7,7 @@[m [mimport { AuditLog } from '../models/AuditLog';[m
+ import { SupervisorMapping } from '../models/SupervisorMapping';[m
+ import { Collaboration } from '../models/Collaboration';[m
+ import mongoose from 'mongoose';[m
+[32m+[m[32mimport { EmailLog } from '../models/EmailLog';[m
+ [m
+ // ─── Design note ─────────────────────────────────────────────────[m
+ //[m
+[36m@@ -135,7 +136,7 @@[m [mexport const getDashboardStats = async (req: AuthRequest, res: Response, next: N[m
+ [m
+     const [[m
+       totalDocs, completedDocs, inProgressDocs,[m
+[31m-      totalTasks, completedTasks, pendingTasks,[m
+[32m+[m[32m      totalTasks, completedTasks, pendingTasks, submittedTasks, inProgressTasks,[m
+       totalUsers, recentAudit, collaborationStats,[m
+     ] = await Promise.all([[m
+       DocumentModel.countDocuments(docFilter),[m
+[36m@@ -144,6 +145,8 @@[m [mexport const getDashboardStats = async (req: AuthRequest, res: Response, next: N[m
+       TaskModel.countDocuments(taskFilter),[m
+       TaskModel.countDocuments({ ...taskFilter, status: 'completed' }),[m
+       TaskModel.countDocuments({ ...taskFilter, status: 'pending' }),[m
+[32m+[m[32m      TaskModel.countDocuments({ ...taskFilter, status: 'submitted' }),[m
+[32m+[m[32m      TaskModel.countDocuments({ ...taskFilter, status: 'in_progress' }),[m
+       role === 'ceo' ? User.countDocuments({ isActive: true }) : 0,[m
+       AuditLog.find(userId && role === 'user' ? { actorId: new mongoose.Types.ObjectId(userId) } : {})[m
+         .populate('actorId', 'name email').populate('documentId', 'title')[m
+[36m@@ -176,7 +179,7 @@[m [mexport const getDashboardStats = async (req: AuthRequest, res: Response, next: N[m
+           totalDocs, completedDocs, inProgressDocs,[m
+           docCompletionRate: totalDocs > 0 ? ((completedDocs / totalDocs) * 100).toFixed(1) : '0',[m
+           // Task performance stats (the appraisal dimension)[m
+[31m-          totalTasks, completedTasks, pendingTasks,[m
+[32m+[m[32m          totalTasks, completedTasks, pendingTasks, submittedTasks, inProgressTasks,[m
+           taskCompletionRate: totalTasks > 0 ? ((completedTasks / totalTasks) * 100).toFixed(1) : '0',[m
+           avgTaskEfficiency: taskEfficiency[0]?.avgEfficiency?.toFixed(3) ?? 'N/A',[m
+           avgTaskTatMinutes: Math.round(taskEfficiency[0]?.avgTat ?? 0),[m
+[36m@@ -218,6 +221,7 @@[m [mexport const getAuditTrail = async (req: AuthRequest, res: Response, next: NextF[m
+     const [logs, total] = await Promise.all([[m
+       AuditLog.find(filter)[m
+         .populate('actorId', 'name email role')[m
+[32m+[m[32m        .populate('targetUserId', 'name email')[m
+         .populate('documentId', 'title')[m
+         .populate('supervisorIdAtTime', 'name email')[m
+         .sort({ timestamp: -1 }).skip(skip).limit(Number(limit)),[m
+[36m@@ -256,4 +260,87 @@[m [mexport const getCollaborationFrequency = async (req: AuthRequest, res: Response,[m
+ [m
+     res.json({ success: true, message: 'Collaboration frequency retrieved', data: { stats: stats[0] } });[m
+   } catch (err) { next(err); }[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m
+[32m+[m[32m// ─────────────────────────────────────────────────────────────────[m
+[32m+[m[32m// EMAIL ANALYTICS[m
+[32m+[m[32m// ─────────────────────────────────────────────────────────────────[m
+[32m+[m[32mexport const getEmailAnalytics = async (req: AuthRequest, res: Response, next: NextFunction) => {[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const match = req.user?.role === 'ceo'[m
+[32m+[m[32m      ? {}[m
+[32m+[m[32m      : { senderId: req.user!.userId };[m
+[32m+[m
+[32m+[m[32m    const stats = await EmailLog.aggregate([[m
+[32m+[m[32m      { $match: match },[m
+[32m+[m
+[32m+[m[32m      {[m
+[32m+[m[32m        $facet: {[m
+[32m+[m[32m          statusBreakdown: [[m
+[32m+[m[32m            { $group: { _id: '$status', count: { $sum: 1 } } }[m
+[32m+[m[32m          ],[m
+[32m+[m
+[32m+[m[32m          volumeOverTime: [[m
+[32m+[m[32m            {[m
+[32m+[m[32m              $group: {[m
+[32m+[m[32m                _id: {[m
+[32m+[m[32m                  $dateToString: { format: "%Y-%m", date: "$createdAt" }[m
+[32m+[m[32m                },[m
+[32m+[m[32m                sent: { $sum: { $cond: [{ $eq: ["$status", "sent"] }, 1, 0] } },[m
+[32m+[m[32m                failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } },[m
+[32m+[m[32m              }[m
+[32m+[m[32m            },[m
+[32m+[m[32m            { $sort: { _id: 1 } }[m
+[32m+[m[32m          ],[m
+[32m+[m
+[32m+[m[32m          topSenders: [[m
+[32m+[m[32m            {[m
+[32m+[m[32m              $group: {[m
+[32m+[m[32m                _id: "$senderId",[m
+[32m+[m[32m                total: { $sum: 1 },[m
+[32m+[m[32m                failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } }[m
+[32m+[m[32m              }[m
+[32m+[m[32m            },[m
+[32m+[m[32m            { $sort: { total: -1 } },[m
+[32m+[m[32m            { $limit: 10 },[m
+[32m+[m[32m            {[m
+[32m+[m[32m              $lookup: {[m
+[32m+[m[32m                from: "users",[m
+[32m+[m[32m                localField: "_id",[m
+[32m+[m[32m                foreignField: "_id",[m
+[32m+[m[32m                as: "user"[m
+[32m+[m[32m              }[m
+[32m+[m[32m            },[m
+[32m+[m[32m            { $unwind: "$user" }[m
+[32m+[m[32m          ],[m
+[32m+[m
+[32m+[m[32m          failureRate: [[m
+[32m+[m[32m            {[m
+[32m+[m[32m              $group: {[m
+[32m+[m[32m                _id: null,[m
+[32m+[m[32m                total: { $sum: 1 },[m
+[32m+[m[32m                failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } }[m
+[32m+[m[32m              }[m
+[32m+[m[32m            },[m
+[32m+[m[32m            {[m
+[32m+[m[32m              $project: {[m
+[32m+[m[32m                failureRate: {[m
+[32m+[m[32m                  $divide: ["$failed", "$total"][m
+[32m+[m[32m                }[m
+[32m+[m[32m              }[m
+[32m+[m[32m            }[m
+[32m+[m[32m          ][m
+[32m+[m[32m        }[m
+[32m+[m[32m      }[m
+[32m+[m[32m    ]);[m
+[32m+[m
+[32m+[m[32m    res.json({[m
+[32m+[m[32m      success: true,[m
+[32m+[m[32m      data: stats[0][m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m  } catch (err) {[m
+[32m+[m[32m    next(err);[m
+[32m+[m[32m  }[m
+ };[m
+\ No newline at end of file[m
+[1mdiff --git a/src/controllers/documentController.ts b/src/controllers/documentController.ts[m
+[1mindex dd41b15..614683a 100644[m
+[1m--- a/src/controllers/documentController.ts[m
+[1m+++ b/src/controllers/documentController.ts[m
+[36m@@ -132,13 +132,44 @@[m [mexport const createDocument = async ([m
+       return res.status(400).json({ success: false, message: 'No files uploaded' });[m
+     }[m
+ [m
+[31m-    const { description, priority, tags, department, documentType } = req.body;[m
+[32m+[m[32m    // Working documents only carry: title (filename), description, date.[m
+[32m+[m[32m    // Priority is a storage/learning-only field — working docs have no priority[m
+[32m+[m[32m    // because they are task-driven and task priority governs urgency.[m
+[32m+[m[32m    const { description, tags, department, documentType: rawDocumentType, priority: rawPriority } = req.body;[m
+[32m+[m
+[32m+[m[32m    // Document type rules:[m
+[32m+[m[32m    //   CEO / Supervisor → 'learning' by default (they upload training materials).[m
+[32m+[m[32m    //                      They may explicitly choose 'storage' to override.[m
+[32m+[m[32m    //   User             → 'working' always (task documents; cannot set learning).[m
+[32m+[m[32m    //                      They may explicitly choose 'storage' for reference files.[m
+[32m+[m[32m    const uploaderRole = req.user!.role;[m
+[32m+[m[32m    let documentType: string;[m
+[32m+[m[32m    if (uploaderRole === 'ceo' || uploaderRole === 'supervisor') {[m
+[32m+[m[32m      documentType = rawDocumentType === 'storage' ? 'storage' : 'learning';[m
+[32m+[m[32m    } else {[m
+[32m+[m[32m      documentType = rawDocumentType === 'storage' ? 'storage' : 'working';[m
+[32m+[m[32m    }[m
+ [m
+     let relativePaths: string[] = [];[m
+[31m-    try {[m
+[31m-      relativePaths = req.body.webkitRelativePaths[m
+[31m-        ? JSON.parse(req.body.webkitRelativePaths) : [];[m
+[31m-    } catch { relativePaths = []; }[m
+[32m+[m[32m    const raw = req.body.webkitRelativePaths;[m
+[32m+[m[32m    if (raw) {[m
+[32m+[m[32m      try {[m
+[32m+[m[32m        const parsed = JSON.parse(raw);[m
+[32m+[m[32m        if (!Array.isArray(parsed)) {[m
+[32m+[m[32m          return res.status(400).json({ success: false, message: 'webkitRelativePaths must be an array' });[m
+[32m+[m[32m        }[m
+[32m+[m[32m        relativePaths = parsed;[m
+[32m+[m[32m      } catch (e) {[m
+[32m+[m[32m        return res.status(400).json({ success: false, message: 'Invalid webkitRelativePaths: ' + (e as Error).message });[m
+[32m+[m[32m      }[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    if (relativePaths.length > 0 && relativePaths.length !== files.length) {[m
+[32m+[m[32m      return res.status(400).json({[m
+[32m+[m[32m        success: false,[m
+[32m+[m[32m        message: `Path count (${relativePaths.length}) does not match file count (${files.length})`[m
+[32m+[m[32m      });[m
+[32m+[m[32m    }[m
+ [m
+     const mapping = await SupervisorMapping.findOne({[m
+       subordinateId: req.user!.userId, status: 'active',[m
+[36m@@ -149,25 +180,33 @@[m [mexport const createDocument = async ([m
+       const parts        = relativePath.split('/');[m
+       const fileName     = parts.pop() ?? file.originalname;[m
+ [m
+[31m-      // Rebuild folder hierarchy[m
+[32m+[m[32m      // Rebuild folder hierarchy using upsert to avoid race conditions.[m
+[32m+[m[32m      // When multiple files in a folder upload run concurrently (Promise.all),[m
+[32m+[m[32m      // two files may both try to create the same parent folder at the same time.[m
+[32m+[m[32m      // findOneAndUpdate with upsert:true is atomic — whichever wins creates the[m
+[32m+[m[32m      // folder; the loser gets back the existing one instead of a duplicate key error.[m
+       let parentFolderId = null;[m
+       let currentPath    = '';[m
+       for (const segment of parts) {[m
+         currentPath += `/${segment}`;[m
+[31m-        let folder = await FolderModel.findOne({[m
+[31m-          path: currentPath, ownerId: req.user!.userId,[m
+[31m-        });[m
+[32m+[m[32m        const folder = await FolderModel.findOneAndUpdate([m
+[32m+[m[32m          { path: currentPath, ownerId: req.user!.userId },[m
+[32m+[m[32m          {[m
+[32m+[m[32m            $setOnInsert: {[m
+[32m+[m[32m              name: segment,[m
+[32m+[m[32m              path: currentPath,[m
+[32m+[m[32m              parentFolderId,[m
+[32m+[m[32m              ownerId: req.user!.userId,[m
+[32m+[m[32m            },[m
+[32m+[m[32m          },[m
+[32m+[m[32m          { upsert: true, new: true, setDefaultsOnInsert: true }[m
+[32m+[m[32m        ) as any;[m
+         if (!folder) {[m
+[31m-          folder = await FolderModel.create({[m
+[31m-            name: segment, path: currentPath,[m
+[31m-            parentFolderId, ownerId: req.user!.userId,[m
+[31m-          });[m
+[32m+[m[32m          throw new Error('Folder creation failed unexpectedly');[m
+         }[m
+         parentFolderId = folder._id;[m
+       }[m
+ [m
+[31m-      const filePath = file.path;[m
+[31m-[m
+       const fileUrl = getLocalFileUrl(file.filename);[m
+ [m
+       const doc = await DocumentModel.create({[m
+[36m@@ -175,14 +214,14 @@[m [mexport const createDocument = async ([m
+         description,[m
+         folderId:     parentFolderId,[m
+         fileType:     file.mimetype,[m
+[31m-        priority:     priority ?? 'medium',[m
+[32m+[m[32m        // Priority only applies to storage/learning docs (not working docs — tasks drive urgency)[m
+[32m+[m[32m        priority:     documentType !== 'working' ? (rawPriority ?? 'medium') : undefined,[m
+         ownerId:      req.user!.userId,[m
+         supervisorId: mapping?.supervisorId,[m
+         departmentId: department ?? mapping?.departmentName,[m
+         tags:         tags ? (Array.isArray(tags) ? tags : [tags]) : [],[m
+         documentType: documentType ?? 'working',[m
+         status:       'draft',       // always draft — no TAT timer[m
+[31m-        filePath,[m
+         currentVersion: 1,[m
+         versionHistory: [{[m
+           versionNumber: 1,[m
+[36m@@ -197,20 +236,11 @@[m [mexport const createDocument = async ([m
+         }],[m
+       });[m
+ [m
+[31m-      const queued = await enqueueDocumentProcessing({[m
+[32m+[m[32m      await enqueueDocumentProcessing({[m
+         documentId: doc._id.toString(),[m
+         fileKey:    file.filename,[m
+         fileType:   file.mimetype,[m
+       });[m
+[31m-[m
+[31m-      if (!queued) {[m
+[31m-        const { processDocumentDirectly } = await import("../services/documentProcessor");[m
+[31m-        await processDocumentDirectly({[m
+[31m-          documentId: doc._id.toString(),[m
+[31m-          fileKey:    file.filename,[m
+[31m-          fileType:   file.mimetype,[m
+[31m-        });[m
+[31m-      }[m
+       await invalidateCache(req.user!.userId);[m
+       await createAuditLog({[m
+         documentId: doc._id.toString(),[m
+[36m@@ -330,7 +360,8 @@[m [mexport const getDocument = async ([m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+ // UPDATE METADATA[m
+[31m-// Owner or CEO: title, description, tags, priority[m
+[32m+[m[32m// Working docs: title, description only.[m
+[32m+[m[32m// Storage/learning: title, description, priority, tags.[m
+ // ─────────────────────────────────────────────────────────────────[m
+ export const updateDocument = async ([m
+   req: AuthRequest,[m
+[36m@@ -353,8 +384,11 @@[m [mexport const updateDocument = async ([m
+ [m
+     if (title)       doc.title       = title;[m
+     if (description !== undefined) doc.description = description;[m
+[31m-    if (priority)    doc.priority    = priority;[m
+[31m-    if (tags)        doc.tags        = tags;[m
+[32m+[m[32m    // Priority and tags only apply to non-working documents[m
+[32m+[m[32m    if (doc.documentType !== 'working') {[m
+[32m+[m[32m      if (priority) doc.priority = priority;[m
+[32m+[m[32m      if (tags)     doc.tags     = tags;[m
+[32m+[m[32m    }[m
+ [m
+     await doc.save();[m
+     await createAuditLog({ documentId: req.params.id, actorId: req.user!.userId, action: 'edited' });[m
+[36m@@ -737,49 +771,34 @@[m [mexport const previewDocument = async ([m
+   next: NextFunction[m
+ ): Promise<void> => {[m
+   try {[m
+[31m-    const document = await DocumentModel.findById(req.params.id);[m
+[31m-[m
+[31m-    if (!document) {[m
+[31m-      res.status(404).json({ success: false });[m
+[31m-      return;[m
+[31m-    }[m
+[31m-[m
+[31m-    const latest = document.versionHistory.at(-1);[m
+[31m-[m
+[31m-    if (!latest) {[m
+[31m-      res.status(404).json({ success: false });[m
+[31m-      return;[m
+[31m-    }[m
+[31m-[m
+[31m-    const filePath = path.resolve([m
+[31m-      process.env.UPLOAD_DIR ?? './uploads',[m
+[31m-      latest.fileKey[m
+[31m-    );[m
+[32m+[m[32m    const doc = await DocumentModel.findById(req.params.id);[m
+[32m+[m[32m    if (!doc) { res.status(404).json({ success: false }); return; }[m
+ [m
+[31m-    const fileUrl = `http://localhost:5000/uploads/${latest.fileKey}`;[m
+[31m-    const fileType = document.fileType;[m
+[32m+[m[32m    const access = await canAccess(doc as Parameters<typeof canAccess>[0], req.user!.userId, req.user!.role);[m
+[32m+[m[32m    if (!access) { res.status(403).json({ success: false, message: 'Access denied' }); return; }[m
+ [m
+[31m-    if (fileType.includes('word') || fileType.includes('docx')) {[m
+[31m-      const mammoth = await import('mammoth');[m
+[31m-      const result = await mammoth.convertToHtml({ path: filePath });[m
+[32m+[m[32m    const latest   = doc.versionHistory[doc.versionHistory.length - 1];[m
+[32m+[m[32m    if (!latest) { res.status(404).json({ success: false, message: 'No file found' }); return; }[m
+ [m
+[31m-      res.json({[m
+[31m-        success: true,[m
+[31m-        type: 'html',[m
+[31m-        html: result.value,[m
+[31m-      });[m
+[31m-      return;[m
+[32m+[m[32m    const filePath = path.join(process.env.UPLOAD_DIR ?? './uploads', latest.fileKey);[m
+[32m+[m[32m    const mimeType = latest.fileType;[m
+[32m+[m
+[32m+[m[32m    // DOCX → HTML via mammoth (no LibreOffice)[m
+[32m+[m[32m    const isDocx = mimeType.includes('wordprocessingml') || mimeType.includes('msword');[m
+[32m+[m[32m    if (isDocx && fs.existsSync(filePath)) {[m
+[32m+[m[32m      try {[m
+[32m+[m[32m        const mammoth = await import('mammoth');[m
+[32m+[m[32m        const result  = await mammoth.convertToHtml({ path: filePath });[m
+[32m+[m[32m        res.json({ success: true, type: 'html', html: result.value, url: latest.fileUrl });[m
+[32m+[m[32m        return;[m
+[32m+[m[32m      } catch (e) {[m
+[32m+[m[32m        console.error('mammoth failed, falling back:', e);[m
+[32m+[m[32m      }[m
+     }[m
+ [m
+[31m-    res.json({[m
+[31m-      success: true,[m
+[31m-      type: fileType,[m
+[31m-      url: fileUrl,[m
+[31m-    });[m
+[31m-  } catch (error) {[m
+[31m-    console.error(error);[m
+[31m-    next(error);[m
+[31m-  }[m
+[32m+[m[32m    // PDF / images / everything else → return URL for browser rendering[m
+[32m+[m[32m    res.json({ success: true, type: mimeType, url: latest.fileUrl });[m
+[32m+[m[32m  } catch (err) { next(err); }[m
+ };[m
+ [m
+ export const downloadDocument = async ([m
+[1mdiff --git a/src/controllers/emailController.ts b/src/controllers/emailController.ts[m
+[1mnew file mode 100644[m
+[1mindex 0000000..867aace[m
+[1m--- /dev/null[m
+[1m+++ b/src/controllers/emailController.ts[m
+[36m@@ -0,0 +1,213 @@[m
+[32m+[m
+[32m+[m[32mimport { Response, NextFunction } from 'express';[m
+[32m+[m[32mimport { AuthRequest } from '../types/auth';[m
+[32m+[m
+[32m+[m[32mimport { sendTrackedEmail } from '../services/emailWorkflowService';[m
+[32m+[m[32mimport { canSendTo } from './messageController';[m
+[32m+[m[32mimport { User } from '../models/User';[m
+[32m+[m[32mimport { EmailLog } from '../models/EmailLog';[m
+[32m+[m[32mimport { sendDirectUserEmail } from '../services/emailService';[m
+[32m+[m
+[32m+[m[32m// =====================================================[m
+[32m+[m[32m// 📧 SEND DIRECT EMAIL[m
+[32m+[m[32m// Allows users to compose and send a real email to any[m
+[32m+[m[32m// contact's registered email address, directly from the[m
+[32m+[m[32m// PeakInsights interface. Uses the same SMTP transport[m
+[32m+[m[32m// as the notification emails but the sender controls the[m
+[32m+[m[32m// subject and body.[m
+[32m+[m[32m//[m
+[32m+[m[32m// RBAC: follows the same rules as sendMessage — a user[m
+[32m+[m[32m// can only email their supervisor; a supervisor can email[m
+[32m+[m[32m// their team + CEO; CEO can email anyone.[m
+[32m+[m[32m// =====================================================[m
+[32m+[m
+[32m+[m[32mexport const sendEmailDirect = async (req: AuthRequest, res: Response, next: NextFunction) => {[m
+[32m+[m[32m  try {[m
+[32m+[m
+[32m+[m[32m    const senderId = req.user!.userId;[m
+[32m+[m[32m    const senderRole = req.user!.role;[m
+[32m+[m
+[32m+[m[32m    const { receiverId, subject, body } = req.body;[m
+[32m+[m
+[32m+[m[32m    if (!receiverId || !body?.trim()) {[m
+[32m+[m[32m      return res.status(400).json({ success: false, message: 'receiverId and body required' });[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    const { allowed, message } = await canSendTo(senderId, senderRole, receiverId);[m
+[32m+[m[32m    if (!allowed) return res.status(403).json({ success: false, message });[m
+[32m+[m
+[32m+[m[32m    const [sender, receiver] = await Promise.all([[m
+[32m+[m[32m      User.findById(senderId).select('name email supervisorId').lean(),[m
+[32m+[m[32m      User.findById(receiverId).select('name email').lean(),[m
+[32m+[m[32m    ]);[m
+[32m+[m
+[32m+[m[32m    if (!receiver?.email) {[m
+[32m+[m[32m      return res.status(404).json({ success: false, message: 'Recipient not found' });[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    const result = await sendTrackedEmail({[m
+[32m+[m[32m      senderId,[m
+[32m+[m[32m      receiverId,[m
+[32m+[m[32m      receiverEmail: receiver.email,[m
+[32m+[m[32m      receiverName: receiver.name,[m
+[32m+[m[32m      senderName: sender?.name,[m
+[32m+[m[32m      senderEmail: sender?.email,[m
+[32m+[m[32m      subject: subject?.trim() || '(No subject)',[m
+[32m+[m[32m      body: body.trim(),[m
+[32m+[m[32m      ipAddress: req.ip,[m
+[32m+[m[32m      userAgent: req.headers['user-agent'],[m
+[32m+[m[32m      supervisorId: sender?.supervisorId,[m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m    if (!result?.messageId) {[m
+[32m+[m[32m      return res.status(500).json({[m
+[32m+[m[32m        success: false,[m
+[32m+[m[32m        message: 'Email failed to send',[m
+[32m+[m[32m      });[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    return res.json({[m
+[32m+[m[32m      success: true,[m
+[32m+[m[32m      message: `Email sent to ${receiver.name}`,[m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m  } catch (err) {[m
+[32m+[m[32m    next(err);[m
+[32m+[m[32m  }[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m[32mexport const getSentEmails = async (req: AuthRequest, res: Response, next: NextFunction) => {[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const userId = req.user!.userId;[m
+[32m+[m
+[32m+[m[32m    const emails = await EmailLog.find({ senderId: userId })[m
+[32m+[m[32m      .populate('receiverId', 'name email role')[m
+[32m+[m[32m      .sort({ createdAt: -1 })[m
+[32m+[m[32m      .limit(100);[m
+[32m+[m
+[32m+[m[32m    res.json({[m
+[32m+[m[32m      success: true,[m
+[32m+[m[32m      data: { emails },[m
+[32m+[m[32m    });[m
+[32m+[m[32m  } catch (err) {[m
+[32m+[m[32m    next(err);[m
+[32m+[m[32m  }[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m[32mexport const retryEmail = async (req: AuthRequest, res: Response, next: NextFunction) => {[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const { id } = req.params;[m
+[32m+[m
+[32m+[m[32m    const email = await EmailLog.findById(id)[m
+[32m+[m[32m      .populate('senderId receiverId');[m
+[32m+[m
+[32m+[m[32m    if (!email) {[m
+[32m+[m[32m      return res.status(404).json({ success: false, message: 'Email not found' });[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    if (email.status !== 'failed') {[m
+[32m+[m[32m      return res.status(400).json({ success: false, message: 'Only failed emails can be retried' });[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    const result = await sendDirectUserEmail({[m
+[32m+[m[32m      toEmail: email.toEmail,[m
+[32m+[m[32m      toName: (email.receiverId as any).name,[m
+[32m+[m[32m      fromName: 'Retry System',[m
+[32m+[m[32m      fromEmail: (email.senderId as any).email,[m
+[32m+[m[32m      subject: email.subject,[m
+[32m+[m[32m      body: email.body,[m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m    await EmailLog.findByIdAndUpdate(id, {[m
+[32m+[m[32m      status: 'sent',[m
+[32m+[m[32m      error: null,[m
+[32m+[m[32m      sentAt: new Date(),[m
+[32m+[m[32m      messageId: result?.messageId,[m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m    res.json({ success: true, message: 'Email retried successfully' });[m
+[32m+[m
+[32m+[m[32m  } catch (err) {[m
+[32m+[m[32m    next(err);[m
+[32m+[m[32m  }[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m
+[32m+[m[32mexport const getEmailAnalytics = async (req: AuthRequest, res: Response, next: NextFunction) => {[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const match = req.user?.role === 'ceo'[m
+[32m+[m[32m      ? {}[m
+[32m+[m[32m      : { senderId: req.user!.userId };[m
+[32m+[m
+[32m+[m[32m    const stats = await EmailLog.aggregate([[m
+[32m+[m[32m      { $match: match },[m
+[32m+[m
+[32m+[m[32m      {[m
+[32m+[m[32m        $facet: {[m
+[32m+[m[32m          statusBreakdown: [[m
+[32m+[m[32m            { $group: { _id: '$status', count: { $sum: 1 } } }[m
+[32m+[m[32m          ],[m
+[32m+[m
+[32m+[m[32m          volumeOverTime: [[m
+[32m+[m[32m            {[m
+[32m+[m[32m              $group: {[m
+[32m+[m[32m                _id: {[m
+[32m+[m[32m                  $dateToString: { format: "%Y-%m", date: "$createdAt" }[m
+[32m+[m[32m                },[m
+[32m+[m[32m                sent: { $sum: { $cond: [{ $eq: ["$status", "sent"] }, 1, 0] } },[m
+[32m+[m[32m                failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } },[m
+[32m+[m[32m              }[m
+[32m+[m[32m            },[m
+[32m+[m[32m            { $sort: { _id: 1 } }[m
+[32m+[m[32m          ],[m
+[32m+[m
+[32m+[m[32m          topSenders: [[m
+[32m+[m[32m            {[m
+[32m+[m[32m              $group: {[m
+[32m+[m[32m                _id: "$senderId",[m
+[32m+[m[32m                total: { $sum: 1 },[m
+[32m+[m[32m                failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } }[m
+[32m+[m[32m              }[m
+[32m+[m[32m            },[m
+[32m+[m[32m            { $sort: { total: -1 } },[m
+[32m+[m[32m            { $limit: 10 },[m
+[32m+[m[32m            {[m
+[32m+[m[32m              $lookup: {[m
+[32m+[m[32m                from: "users",[m
+[32m+[m[32m                localField: "_id",[m
+[32m+[m[32m                foreignField: "_id",[m
+[32m+[m[32m                as: "user"[m
+[32m+[m[32m              }[m
+[32m+[m[32m            },[m
+[32m+[m[32m            { $unwind: "$user" }[m
+[32m+[m[32m          ],[m
+[32m+[m
+[32m+[m[32m          failureRate: [[m
+[32m+[m[32m            {[m
+[32m+[m[32m              $group: {[m
+[32m+[m[32m                _id: null,[m
+[32m+[m[32m                total: { $sum: 1 },[m
+[32m+[m[32m                failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } }[m
+[32m+[m[32m              }[m
+[32m+[m[32m            },[m
+[32m+[m[32m            {[m
+[32m+[m[32m              $project: {[m
+[32m+[m[32m                failureRate: {[m
+[32m+[m[32m                  $divide: ["$failed", "$total"][m
+[32m+[m[32m                }[m
+[32m+[m[32m              }[m
+[32m+[m[32m            }[m
+[32m+[m[32m          ][m
+[32m+[m[32m        }[m
+[32m+[m[32m      }[m
+[32m+[m[32m    ]);[m
+[32m+[m
+[32m+[m[32m    res.json({[m
+[32m+[m[32m      success: true,[m
+[32m+[m[32m      data: stats[0][m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m  } catch (err) {[m
+[32m+[m[32m    next(err);[m
+[32m+[m[32m  }[m
+[32m+[m[32m};[m
+\ No newline at end of file[m
+[1mdiff --git a/src/controllers/folderController.ts b/src/controllers/folderController.ts[m
+[1mindex 855e3cc..12ffac2 100644[m
+[1m--- a/src/controllers/folderController.ts[m
+[1m+++ b/src/controllers/folderController.ts[m
+[36m@@ -5,6 +5,8 @@[m [mimport { FolderModel } from "../models/Folder"[m
+ import { DocumentModel } from "../models/Document"[m
+ import { AuditLog } from "../models/AuditLog";[m
+ [m
+[32m+[m[32mconst escapeRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');[m
+[32m+[m
+ export const createFolder = async (req: AuthRequest, res: Response) => {[m
+ [m
+   const { name, parentFolderId } = req.body[m
+[36m@@ -125,7 +127,7 @@[m [mexport const moveFolder = async (req: AuthRequest, res: Response) => {[m
+ [m
+     // 🔥 Update all subfolders[m
+     const subfolders = await FolderModel.find({[m
+[31m-      path: { $regex: `^${oldPath}` }[m
+[32m+[m[32m      path: { $regex: `^${escapeRegex(oldPath)}(/|$)` }[m
+     });[m
+ [m
+     for (const sub of subfolders) {[m
+[36m@@ -161,7 +163,7 @@[m [mexport const deleteFolderRecursive = async (req: AuthRequest, res: Response) =>[m
+ [m
+     // 🔥 Find all nested folders[m
+     const foldersToDelete = await FolderModel.find({[m
+[31m-      path: { $regex: `^${folder.path}` }[m
+[32m+[m[32m      path: { $regex: `^${escapeRegex(folder.path)}(/|$)` }[m
+     });[m
+ [m
+     const folderIds = foldersToDelete.map(f => f._id);[m
+[1mdiff --git a/src/controllers/messageController.ts b/src/controllers/messageController.ts[m
+[1mindex 316b055..37feea0 100644[m
+[1m--- a/src/controllers/messageController.ts[m
+[1m+++ b/src/controllers/messageController.ts[m
+[36m@@ -3,13 +3,14 @@[m [mimport { AuthRequest } from '../types/auth';[m
+ import { MessageModel } from '../models/Message';[m
+ import { User } from '../models/User';[m
+ import { SupervisorMapping } from '../models/SupervisorMapping';[m
+[32m+[m[32mimport { createNotification } from '../services/notificationService';[m
+ import { getIO } from '../socket/socketServer';[m
+[31m-import mongoose from 'mongoose';[m
+[32m+[m
+ [m
+ /**[m
+  * 🔒 RBAC Messaging Rules[m
+  */[m
+[31m-const canSendTo = async ([m
+[32m+[m[32mexport const canSendTo = async ([m
+   senderId: string,[m
+   senderRole: string,[m
+   receiverId: string[m
+[36m@@ -124,6 +125,19 @@[m [mexport const sendMessage = async ([m
+       io.to(`user:${receiverId}`).emit('new-message', populated);[m
+     } catch {}[m
+ [m
+[32m+[m[32m    // 🔔 NOTIFICATION + EMAIL[m
+[32m+[m[32m    const sender = await User.findById(senderId).select('name');[m
+[32m+[m[32m    await createNotification([m
+[32m+[m[32m      receiverId,[m
+[32m+[m[32m      `New message from ${sender?.name ?? 'Someone'}: ${subject ?? body.slice(0, 60)}`,[m
+[32m+[m[32m      'new_message',[m
+[32m+[m[32m      {[m
+[32m+[m[32m        senderName:     sender?.name ?? 'Someone',[m
+[32m+[m[32m        messageSubject: subject,[m
+[32m+[m[32m        messageBody:    body,[m
+[32m+[m[32m      }[m
+[32m+[m[32m    );[m
+[32m+[m
+     res.status(201).json({[m
+       success: true,[m
+       data: { message: populated },[m
+[36m@@ -246,6 +260,16 @@[m [mexport const markRead = async (req: AuthRequest, res: Response) => {[m
+     msg.readAt = new Date();[m
+     await msg.save();[m
+ [m
+[32m+[m[32m    // Notify the sender in real-time that their message was read.[m
+[32m+[m[32m    // The sender's UI can then show a "read" indicator immediately.[m
+[32m+[m[32m    try {[m
+[32m+[m[32m      const io = getIO();[m
+[32m+[m[32m      io.to(`user:${msg.senderId.toString()}`).emit('chat:read', {[m
+[32m+[m[32m        messageId: id,[m
+[32m+[m[32m        readAt:    msg.readAt,[m
+[32m+[m[32m      });[m
+[32m+[m[32m    } catch { /* socket not initialised in tests */ }[m
+[32m+[m
+     res.json({ success: true });[m
+   } catch (err) {[m
+     console.error('❌ markRead:', err);[m
+[36m@@ -264,9 +288,11 @@[m [mexport const getUnreadCount = async (req: AuthRequest, res: Response) => {[m
+       isRead: false,[m
+     });[m
+ [m
+[32m+[m[32m    // NOTE: response key is `unreadCount` (not `count`) to match[m
+[32m+[m[32m    // AppLayout.tsx which reads r.data.data.unreadCount[m
+     res.json({[m
+       success: true,[m
+[31m-      data: { count },[m
+[32m+[m[32m      data: { unreadCount: count },[m
+     });[m
+   } catch (err) {[m
+     console.error('❌ unreadCount:', err);[m
+[36m@@ -276,7 +302,7 @@[m [mexport const getUnreadCount = async (req: AuthRequest, res: Response) => {[m
+ [m
+ [m
+ // =====================================================[m
+[31m-// 👥 CONTACTS (FIXED FOR UI)[m
+[32m+[m[32m// 👥 CONTACTS[m
+ // =====================================================[m
+ export const getContacts = async (req: AuthRequest, res: Response) => {[m
+   try {[m
+[36m@@ -324,4 +350,6 @@[m [mexport const getContacts = async (req: AuthRequest, res: Response) => {[m
+     console.error('❌ getContacts:', err);[m
+     res.status(500).json({ success: false });[m
+   }[m
+[31m-};[m
+\ No newline at end of file[m
+[32m+[m[32m};[m
+[41m+[m
+[41m+[m
+[1mdiff --git a/src/controllers/taskC1.ts b/src/controllers/taskC1.ts[m
+[1mnew file mode 100644[m
+[1mindex 0000000..e69de29[m
+[1mdiff --git a/src/controllers/taskController.ts b/src/controllers/taskController.ts[m
+[1mindex 56847aa..05d312b 100644[m
+[1m--- a/src/controllers/taskController.ts[m
+[1m+++ b/src/controllers/taskController.ts[m
+[36m@@ -1,9 +1,11 @@[m
+ import { Response, NextFunction } from 'express';[m
+ import { AuthRequest } from '../types/auth';[m
+[31m-import { TaskModel, ITask } from '../models/Task';[m
+[32m+[m[32mimport { TaskModel, TaskStatus, ITask } from '../models/Task';[m
+ import { SupervisorMapping } from '../models/SupervisorMapping';[m
+ import { User } from '../models/User';[m
+[32m+[m[32mimport { DocumentModel } from '../models/Document';[m
+ import { createNotification } from '../services/notificationService';[m
+[32m+[m[32mimport { getLocalFileUrl } from '../middleware/upload';[m
+ import mongoose from 'mongoose';[m
+ [m
+ // ─── Helpers ─────────────────────────────────────────────────────[m
+[36m@@ -21,13 +23,11 @@[m [mconst canViewTask = (task: ITask, userId: string, role: string): boolean =>[m
+   task.collaborators.some((c) => c.userId.toString() === userId && c.status === 'active');[m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-// CREATE — CEO assigns to anyone; Supervisor to their team only[m
+[32m+[m[32m// CREATE TASK[m
+[32m+[m[32m// CEO/Supervisor can upload files when creating the task.[m
+[32m+[m[32m// These files serve as context/brief/requirements for the assignee.[m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-export const createTask = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response,[m
+[31m-  next: NextFunction[m
+[31m-): Promise<void> => {[m
+[32m+[m[32mexport const createTask = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+     const role    = req.user!.role;[m
+     const actorId = req.user!.userId;[m
+[36m@@ -63,41 +63,63 @@[m [mexport const createTask = async ([m
+       }[m
+     }[m
+ [m
+[32m+[m[32m    // Build taskFiles from any uploaded files[m
+[32m+[m[32m    const uploadedFiles = (req.files as Express.Multer.File[]) ?? [];[m
+[32m+[m[32m    const taskFiles = uploadedFiles.map((file) => ({[m
+[32m+[m[32m      fileName:   file.originalname,[m
+[32m+[m[32m      fileKey:    file.filename,[m
+[32m+[m[32m      fileUrl:    getLocalFileUrl(file.filename),[m
+[32m+[m[32m      fileSize:   file.size,[m
+[32m+[m[32m      fileType:   file.mimetype,[m
+[32m+[m[32m      uploadedBy: new mongoose.Types.ObjectId(actorId),[m
+[32m+[m[32m      uploadedAt: new Date(),[m
+[32m+[m[32m    }));[m
+[32m+[m
+     const task = await TaskModel.create({[m
+       title, description,[m
+       assignedBy:   new mongoose.Types.ObjectId(actorId),[m
+       assignedTo:   new mongoose.Types.ObjectId(assignedTo),[m
+       documentId:   documentId ? new mongoose.Types.ObjectId(documentId) : undefined,[m
+[32m+[m[32m      taskFiles,[m
+[32m+[m[32m      submissionDocuments: [],[m
+       priority:     priority ?? 'medium',[m
+       dueDate:      dueDate ? new Date(dueDate) : undefined,[m
+       status:       'pending',[m
+       collaborators: [],[m
+[32m+[m[32m      approvalHistory: [],[m
+     });[m
+ [m
+[32m+[m[32m    const assigner = await User.findById(actorId).select('name').lean();[m
+[32m+[m
+     await createNotification([m
+       assignedTo,[m
+       `You have been assigned a new task: "${title}"`,[m
+[31m-      'task_assigned'[m
+[32m+[m[32m      'task_assigned',[m
+[32m+[m[32m      {[m
+[32m+[m[32m        taskTitle:       title,[m
+[32m+[m[32m        taskDescription: description,[m
+[32m+[m[32m        taskPriority:    priority ?? 'medium',[m
+[32m+[m[32m        taskDueDate:     dueDate,[m
+[32m+[m[32m        taskId:          task._id.toString(),[m
+[32m+[m[32m        assignerName:    assigner?.name ?? 'Your manager',[m
+[32m+[m[32m      }[m
+     );[m
+ [m
+     const populated = await TaskModel.findById(task._id)[m
+       .populate('assignedBy', 'name email role')[m
+       .populate('assignedTo', 'name email role')[m
+       .populate('collaborators.userId', 'name email')[m
+[31m-      .populate('documentId', 'title');[m
+[32m+[m[32m      .populate('documentId', 'title fileType')[m
+[32m+[m[32m      .populate('submissionDocuments', 'title fileType createdAt');[m
+ [m
+     res.status(201).json({ success: true, message: 'Task created', data: { task: populated } });[m
+   } catch (err) { next(err); }[m
+ };[m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-// READ ALL[m
+[32m+[m[32m// READ ALL — role-scoped, paginated[m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-export const getTasks = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response,[m
+[31m-  next: NextFunction[m
+[31m-): Promise<void> => {[m
+[32m+[m[32mexport const getTasks = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+     const role   = req.user!.role;[m
+     const userId = new mongoose.Types.ObjectId(req.user!.userId);[m
+[36m@@ -108,7 +130,6 @@[m [mexport const getTasks = async ([m
+     if (priority) filter['priority'] = priority;[m
+ [m
+     if (role === 'user') {[m
+[31m-      // User sees tasks assigned to them + tasks where they are an active collaborator[m
+       filter['$or'] = [[m
+         { assignedTo: userId },[m
+         { 'collaborators': { $elemMatch: { userId, status: 'active' } } },[m
+[36m@@ -116,7 +137,6 @@[m [mexport const getTasks = async ([m
+     } else if (role === 'supervisor') {[m
+       filter['$or'] = [{ assignedTo: userId }, { assignedBy: userId }];[m
+     }[m
+[31m-    // CEO: no filter[m
+ [m
+     const skip = (Number(page) - 1) * Number(limit);[m
+     const [tasks, total] = await Promise.all([[m
+[36m@@ -124,7 +144,8 @@[m [mexport const getTasks = async ([m
+         .populate('assignedBy', 'name email role')[m
+         .populate('assignedTo', 'name email role')[m
+         .populate('collaborators.userId', 'name email')[m
+[31m-        .populate('documentId', 'title')[m
+[32m+[m[32m        .populate('documentId', 'title fileType')[m
+[32m+[m[32m        .populate('submissionDocuments', 'title fileType createdAt')[m
+         .sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),[m
+       TaskModel.countDocuments(filter),[m
+     ]);[m
+[36m@@ -138,19 +159,17 @@[m [mexport const getTasks = async ([m
+ };[m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-// READ ONE[m
+[32m+[m[32m// READ ONE — includes all linked documents for review[m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-export const getTask = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response,[m
+[31m-  next: NextFunction[m
+[31m-): Promise<void> => {[m
+[32m+[m[32mexport const getTask = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+     const task = await TaskModel.findById(req.params.id)[m
+       .populate('assignedBy', 'name email role')[m
+       .populate('assignedTo', 'name email role')[m
+       .populate('collaborators.userId', 'name email')[m
+[31m-      .populate('documentId', 'title');[m
+[32m+[m[32m      .populate('documentId', 'title fileType versionHistory')[m
+[32m+[m[32m      .populate('submissionDocuments', 'title fileType versionHistory createdAt')[m
+[32m+[m[32m      .populate('approvalHistory.by', 'name role');[m
+ [m
+     if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }[m
+     if (!canViewTask(task, req.user!.userId, req.user!.role)) {[m
+[36m@@ -161,13 +180,9 @@[m [mexport const getTask = async ([m
+ };[m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-// UPDATE METADATA — assigner edits meta; assignee sets target/notes[m
+[32m+[m[32m// UPDATE METADATA[m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-export const updateTask = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response,[m
+[31m-  next: NextFunction[m
+[31m-): Promise<void> => {[m
+[32m+[m[32mexport const updateTask = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+     const task = await TaskModel.findById(req.params.id);[m
+     if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }[m
+[36m@@ -209,211 +224,191 @@[m [mexport const updateTask = async ([m
+ };[m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-// UPDATE STATUS — drives TAT measurement[m
+[32m+[m[32m// UPDATE STATUS — TAT lifecycle[m
+ //[m
+[31m-//  pending     → in_progress : assignee commits targetMinutes; startedAt recorded[m
+[31m-//  in_progress → completed   : tatMinutes + efficiencyRatio calculated;[m
+[31m-//                              ALL collaborator access immediately revoked[m
+[31m-//  any         → cancelled   : assigner or CEO only; collaborators revoked[m
+[32m+[m[32m//  pending     → in_progress : assignee commits targetMinutes[m
+[32m+[m[32m//  in_progress → submitted   : assignee attaches supporting documents[m
+[32m+[m[32m//  submitted   → completed   : approver (supervisor/CEO) reviews docs + approves[m
+[32m+[m[32m//  submitted   → rejected    : approver rejects with reason (goes back to in_progress)[m
+[32m+[m[32m//  any         → cancelled   : assigner or CEO only[m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-export const updateTaskStatus = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response[m
+[31m-): Promise<void> => {[m
+[32m+[m[32mexport const updateTaskStatus = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+[31m-    const { taskId } = req.params;[m
+[31m-    const { status, submissionComment } = req.body;[m
+[31m-    const userId = req.user?.userId;[m
+[31m-[m
+[31m-    const task = await TaskModel.findById(taskId);[m
+[31m-[m
+[31m-    if (!task) {[m
+[31m-      res.status(404).json({ success: false, message: "Task not found" });[m
+[31m-      return;[m
+[31m-    }[m
+[31m-[m
+[31m-    if (task.assignedTo.toString() !== userId) {[m
+[31m-      res.status(403).json({ success: false, message: "Unauthorized" });[m
+[31m-      return;[m
+[31m-    }[m
+[31m-[m
+[31m-    if (status === "in_progress" && task.status === "pending") {[m
+[31m-      task.status = "in_progress";[m
+[31m-      task.startedAt = new Date();[m
+[31m-    } else if (status === "submitted" && task.status === "in_progress") {[m
+[31m-      if (!task.proofFiles?.length && !submissionComment) {[m
+[31m-        res.status(400).json({[m
+[31m-          success: false,[m
+[31m-          message: "Attach proof of work or add a submission comment",[m
+[31m-        });[m
+[31m-        return;[m
+[31m-      }[m
+[31m-    [m
+[31m-      const now = new Date();[m
+[31m-    [m
+[31m-      task.status = "submitted";[m
+[31m-      task.submittedAt = now;[m
+[31m-      task.completedAt = now; // ✅ IMPORTANT[m
+[31m-      task.submissionComment = submissionComment;[m
+[31m-    [m
+[31m-      // ✅ CALCULATE WORK METRICS HERE[m
+[31m-      if (task.startedAt) {[m
+[31m-        task.tatMinutes = calcTAT(task.startedAt, now);[m
+[31m-      }[m
+[31m-    [m
+[31m-      if (task.targetMinutes && task.tatMinutes) {[m
+[31m-        task.efficiencyRatio = calcEfficiency([m
+[31m-          task.targetMinutes,[m
+[31m-          task.tatMinutes[m
+[31m-        );[m
+[31m-      }[m
+[31m-    [m
+[31m-      await createNotification([m
+[31m-        task.assignedBy.toString(),[m
+[31m-        `Task "${task.title}" submitted for approval`,[m
+[31m-        "task_submitted"[m
+[31m-      );[m
+[31m-    } else {[m
+[31m-      res.status(400).json({[m
+[31m-        success: false,[m
+[31m-        message: "Invalid status transition",[m
+[31m-      });[m
+[31m-      return;[m
+[31m-    }[m
+[31m-[m
+[31m-    await task.save();[m
+[31m-[m
+[31m-    res.json({ success: true, data: task });[m
+[31m-  } catch (error) {[m
+[31m-    console.error(error);[m
+[31m-    res.status(500).json({ success: false, message: "Server error" });[m
+[31m-  }[m
+[31m-};[m
+[32m+[m[32m    const task = await TaskModel.findById(req.params.id);[m
+[32m+[m[32m    if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }[m
+ [m
+[31m-// ─────────────────────────────────────────────────────────────────[m
+[31m-// UPDATE TASK[m
+[31m-// ─────────────────────────────────────────────────────────────────[m
+[31m-export const approveTask = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response[m
+[31m-): Promise<void> => {[m
+[31m-  try {[m
+[31m-    const { taskId } = req.params;[m
+[31m-    const { action, rejectionReason } = req.body as {[m
+[31m-      action: "approve" | "reject";[m
+[32m+[m[32m    const userId     = req.user!.userId;[m
+[32m+[m[32m    const isAssignee = task.assignedTo.toString() === userId;[m
+[32m+[m[32m    const isAssigner = task.assignedBy.toString() === userId;[m
+[32m+[m[32m    const isCEO      = req.user!.role === 'ceo';[m
+[32m+[m[32m    const isSupervisor = req.user!.role === 'supervisor';[m
+[32m+[m
+[32m+[m[32m    const {[m
+[32m+[m[32m      status,[m
+[32m+[m[32m      targetMinutes,[m
+[32m+[m[32m      notes,[m
+[32m+[m[32m      submissionComment,[m
+[32m+[m[32m      submissionDocumentIds, // array of existing document IDs to attach[m
+[32m+[m[32m      rejectionReason,[m
+[32m+[m[32m    } = req.body as {[m
+[32m+[m[32m      status: TaskStatus;[m
+[32m+[m[32m      targetMinutes?: number;[m
+[32m+[m[32m      notes?: string;[m
+[32m+[m[32m      submissionComment?: string;[m
+[32m+[m[32m      submissionDocumentIds?: string[];[m
+       rejectionReason?: string;[m
+     };[m
+ [m
+[31m-    const userId = req.user?.userId;[m
+[31m-[m
+[31m-    const task = await TaskModel.findById(taskId);[m
+[32m+[m[32m    const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'submitted', 'completed', 'rejected', 'cancelled'];[m
+[32m+[m[32m    if (!validStatuses.includes(status)) {[m
+[32m+[m[32m      res.status(400).json({ success: false, message: 'Invalid status' }); return;[m
+[32m+[m[32m    }[m
+ [m
+[31m-    // ❌ Task not found[m
+[31m-    if (!task) {[m
+[31m-      res.status(404).json({ success: false, message: "Task not found" });[m
+[31m-      return;[m
+[32m+[m[32m    if (status === 'cancelled' && !isAssigner && !isCEO) {[m
+[32m+[m[32m      res.status(403).json({ success: false, message: 'Only the task creator or CEO can cancel tasks' }); return;[m
+     }[m
+ [m
+[31m-    // ❌ Only assigner can approve/reject[m
+[31m-    if (task.assignedBy.toString() !== userId) {[m
+[31m-      res.status(403).json({ success: false, message: "Unauthorized" });[m
+[31m-      return;[m
+[32m+[m[32m    if (['in_progress', 'submitted'].includes(status) && !isAssignee && !isCEO) {[m
+[32m+[m[32m      res.status(403).json({ success: false, message: 'Only the task assignee can start or submit tasks' }); return;[m
+     }[m
+ [m
+[31m-    // ❌ Must be submitted first[m
+[31m-    if (task.status !== "submitted") {[m
+[31m-      res.status(400).json({[m
+[31m-        success: false,[m
+[31m-        message: "Task must be submitted before approval",[m
+[31m-      });[m
+[31m-      return;[m
+[32m+[m[32m    if (['completed', 'rejected'].includes(status) && !isAssigner && !isCEO && !isSupervisor) {[m
+[32m+[m[32m      res.status(403).json({ success: false, message: 'Only the task creator, supervisor, or CEO can approve/reject tasks' }); return;[m
+     }[m
+ [m
+     const now = new Date();[m
+ [m
+[31m-    if (!task.approvalHistory) {[m
+[31m-      task.approvalHistory = [];[m
+[32m+[m[32m    // ── pending → in_progress ────────────────────────────────────[m
+[32m+[m[32m    if (status === 'in_progress' && task.status === 'pending') {[m
+[32m+[m[32m      const target = targetMinutes ?? task.targetMinutes;[m
+[32m+[m[32m      if (!target || target < 1) {[m
+[32m+[m[32m        res.status(400).json({[m
+[32m+[m[32m          success: false,[m
+[32m+[m[32m          message: 'You must set targetMinutes before starting. This is your personal commitment.',[m
+[32m+[m[32m        }); return;[m
+[32m+[m[32m      }[m
+[32m+[m[32m      task.targetMinutes = target;[m
+[32m+[m[32m      task.startedAt     = now;[m
+[32m+[m[32m      task.status        = 'in_progress';[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    // ── in_progress → submitted ───────────────────────────────────[m
+[32m+[m[32m    // Assignee submits for approval and can link supporting documents[m
+[32m+[m[32m    else if (status === 'submitted' && task.status === 'in_progress') {[m
+[32m+[m[32m      task.status           = 'submitted';[m
+[32m+[m[32m      task.submittedAt      = now;[m
+[32m+[m[32m      if (submissionComment) task.submissionComment = submissionComment;[m
+[32m+[m
+[32m+[m[32m      // Attach documents the assignee is submitting as proof of work[m
+[32m+[m[32m      if (submissionDocumentIds?.length) {[m
+[32m+[m[32m        const validIds = submissionDocumentIds.map(id => new mongoose.Types.ObjectId(id));[m
+[32m+[m[32m        task.submissionDocuments = validIds;[m
+[32m+[m[32m      }[m
+[32m+[m
+[32m+[m[32m      await createNotification([m
+[32m+[m[32m        task.assignedBy.toString(),[m
+[32m+[m[32m        `Task "${task.title}" has been submitted for your review`,[m
+[32m+[m[32m        'task_submitted'[m
+[32m+[m[32m      );[m
+     }[m
+ [m
+[31m-    // ✅ APPROVE[m
+[31m-    if (action === "approve") {[m
+[31m-      task.status = "completed";[m
+[31m-      task.approvedAt = now;[m
+[32m+[m[32m    // ── submitted → completed (APPROVAL) ─────────────────────────[m
+[32m+[m[32m    else if (status === 'completed' && task.status === 'submitted') {[m
+[32m+[m[32m      task.completedAt = now;[m
+[32m+[m[32m      task.status      = 'completed';[m
+ [m
+[31m-      // ✅ approval duration[m
+[31m-      if (task.submittedAt) {[m
+[31m-        task.approvalDurationMinutes = calcTAT(task.submittedAt, now);[m
+[32m+[m[32m      if (task.startedAt) {[m
+[32m+[m[32m        task.tatMinutes = calcTAT(task.startedAt, now);[m
+[32m+[m[32m        if (task.targetMinutes) {[m
+[32m+[m[32m          task.efficiencyRatio = calcEfficiency(task.targetMinutes, task.tatMinutes);[m
+[32m+[m[32m        }[m
+       }[m
+ [m
+[31m-      // ✅ history[m
+[32m+[m[32m      // Revoke all collaborators[m
+[32m+[m[32m      const revokedAt = now;[m
+[32m+[m[32m      task.collaborators = task.collaborators.map((c) => ({[m
+[32m+[m[32m        ...c, status: 'revoked' as const, revokedAt,[m
+[32m+[m[32m      }));[m
+[32m+[m
+       task.approvalHistory.push({[m
+[31m-        action: "approved",[m
+[31m-        by: new mongoose.Types.ObjectId(userId),[m
+[31m-        at: now,[m
+[32m+[m[32m        action: 'approved',[m
+[32m+[m[32m        by:     new mongoose.Types.ObjectId(userId),[m
+[32m+[m[32m        at:     now,[m
+       });[m
+ [m
+[32m+[m[32m      const assigneeUser = await User.findById(task.assignedTo).select('name').lean();[m
+       await createNotification([m
+         task.assignedTo.toString(),[m
+[31m-        `Task "${task.title}" has been approved and completed`,[m
+[31m-        "task_completed"[m
+[32m+[m[32m        `Task "${task.title}" has been approved and marked complete`,[m
+[32m+[m[32m        'task_completed',[m
+[32m+[m[32m        {[m
+[32m+[m[32m          taskTitle:       task.title,[m
+[32m+[m[32m          assigneeName:    assigneeUser?.name ?? 'The assignee',[m
+[32m+[m[32m          efficiencyRatio: task.efficiencyRatio,[m
+[32m+[m[32m        }[m
+       );[m
+     }[m
+ [m
+[31m-    // ❌ REJECT[m
+[31m-    else if (action === "reject") {[m
+[32m+[m[32m    // ── submitted → rejected ──────────────────────────────────────[m
+[32m+[m[32m    else if (status === 'rejected' && task.status === 'submitted') {[m
+       if (!rejectionReason) {[m
+[31m-        res.status(400).json({[m
+[31m-          success: false,[m
+[31m-          message: "Rejection reason is required",[m
+[31m-        });[m
+[31m-        return;[m
+[32m+[m[32m        res.status(400).json({ success: false, message: 'A rejection reason is required' }); return;[m
+       }[m
+[31m-[m
+[31m-      task.status = "in_progress";[m
+[32m+[m[32m      task.status          = 'in_progress'; // returns to in_progress so assignee can rework[m
+       task.rejectionReason = rejectionReason;[m
+ [m
+[31m-      // ✅ history[m
+       task.approvalHistory.push({[m
+[31m-        action: "rejected",[m
+[31m-        by: new mongoose.Types.ObjectId(userId),[m
+[31m-        at: now,[m
+[32m+[m[32m        action: 'rejected',[m
+[32m+[m[32m        by:     new mongoose.Types.ObjectId(userId),[m
+[32m+[m[32m        at:     now,[m
+         reason: rejectionReason,[m
+       });[m
+ [m
+       await createNotification([m
+         task.assignedTo.toString(),[m
+         `Task "${task.title}" was rejected: ${rejectionReason}`,[m
+[31m-        "task_rejected"[m
+[32m+[m[32m        'task_rejected'[m
+       );[m
+     }[m
+ [m
+[31m-    // ❌ Invalid action[m
+[31m-    else {[m
+[32m+[m[32m    // ── cancellation ─────────────────────────────────────────────[m
+[32m+[m[32m    else if (status === 'cancelled') {[m
+[32m+[m[32m      task.status = 'cancelled';[m
+[32m+[m[32m      const revokedAt = now;[m
+[32m+[m[32m      task.collaborators = task.collaborators.map((c) => ({[m
+[32m+[m[32m        ...c, status: 'revoked' as const, revokedAt,[m
+[32m+[m[32m      }));[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    else if (task.status === status) {[m
+[32m+[m[32m      res.status(400).json({ success: false, message: `Task is already ${status}` }); return;[m
+[32m+[m[32m    } else {[m
+       res.status(400).json({[m
+         success: false,[m
+[31m-        message: "Invalid action",[m
+[31m-      });[m
+[31m-      return;[m
+[32m+[m[32m        message: `Cannot transition from "${task.status}" to "${status}"`,[m
+[32m+[m[32m      }); return;[m
+     }[m
+ [m
+[32m+[m[32m    if (notes !== undefined) task.notes = notes;[m
+     await task.save();[m
+ [m
+[31m-    res.json({ success: true, data: task });[m
+[32m+[m[32m    // Return fully populated task so the reviewer can see all linked docs[m
+[32m+[m[32m    const populated = await TaskModel.findById(task._id)[m
+[32m+[m[32m      .populate('assignedBy', 'name email role')[m
+[32m+[m[32m      .populate('assignedTo', 'name email role')[m
+[32m+[m[32m      .populate('collaborators.userId', 'name email')[m
+[32m+[m[32m      .populate('documentId', 'title fileType versionHistory')[m
+[32m+[m[32m      .populate('submissionDocuments', 'title fileType versionHistory createdAt')[m
+[32m+[m[32m      .populate('approvalHistory.by', 'name role');[m
+ [m
+[31m-  } catch (error) {[m
+[31m-    console.error(error);[m
+[31m-    res.status(500).json({ success: false, message: "Server error" });[m
+[31m-  }[m
+[32m+[m[32m    res.json({ success: true, message: 'Task updated', data: { task: populated } });[m
+[32m+[m[32m  } catch (err) { next(err); }[m
+ };[m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+ // DELETE[m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-export const deleteTask = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response,[m
+[31m-  next: NextFunction[m
+[31m-): Promise<void> => {[m
+[32m+[m[32mexport const deleteTask = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+     const task = await TaskModel.findById(req.params.id);[m
+     if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }[m
+[36m@@ -432,22 +427,8 @@[m [mexport const deleteTask = async ([m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+ // INVITE COLLABORATOR[m
+[31m-//[m
+[31m-// The task assignee (or CEO) can invite another user to help.[m
+[31m-// Rules:[m
+[31m-//   - Task must be in_progress[m
+[31m-//   - Invitee must be in the same team (supervisor mapping) OR CEO inviting anyone[m
+[31m-//   - Cannot invite someone already an active collaborator[m
+[31m-//   - Cannot invite the assignee themselves[m
+[31m-//[m
+[31m-// When the task is completed or cancelled, access is auto-revoked[m
+[31m-// in updateTaskStatus — no manual revocation needed.[m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-export const inviteTaskCollaborator = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response,[m
+[31m-  next: NextFunction[m
+[31m-): Promise<void> => {[m
+[32m+[m[32mexport const inviteTaskCollaborator = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+     const { id } = req.params as { id: string };[m
+     const { inviteeId } = req.body as { inviteeId: string };[m
+[36m@@ -459,75 +440,57 @@[m [mexport const inviteTaskCollaborator = async ([m
+     const isCEO      = req.user!.role === 'ceo';[m
+ [m
+     if (!isAssignee && !isCEO) {[m
+[31m-      res.status(403).json({ success: false, message: 'Only the task assignee or CEO can invite collaborators' });[m
+[31m-      return;[m
+[32m+[m[32m      res.status(403).json({ success: false, message: 'Only the task assignee or CEO can invite collaborators' }); return;[m
+     }[m
+ [m
+     if (task.status !== 'in_progress') {[m
+[31m-      res.status(400).json({ success: false, message: 'Collaborators can only be invited to tasks that are in progress' });[m
+[31m-      return;[m
+[32m+[m[32m      res.status(400).json({ success: false, message: 'Collaborators can only be invited to in-progress tasks' }); return;[m
+     }[m
+ [m
+     if (inviteeId === req.user!.userId) {[m
+[31m-      res.status(400).json({ success: false, message: 'You cannot invite yourself as a collaborator' });[m
+[31m-      return;[m
+[31m-    }[m
+[31m-[m
+[31m-    if (inviteeId === task.assignedTo.toString()) {[m
+[31m-      res.status(400).json({ success: false, message: 'The assignee is already the task owner' });[m
+[31m-      return;[m
+[32m+[m[32m      res.status(400).json({ success: false, message: 'You cannot invite yourself' }); return;[m
+     }[m
+ [m
+[31m-    // Check invitee is already an active collaborator[m
+[31m-    const alreadyCollaborating = task.collaborators.some([m
+[32m+[m[32m    const alreadyActive = task.collaborators.some([m
+       (c) => c.userId.toString() === inviteeId && c.status === 'active'[m
+     );[m
+[31m-    if (alreadyCollaborating) {[m
+[31m-      res.status(400).json({ success: false, message: 'This user is already an active collaborator' });[m
+[31m-      return;[m
+[32m+[m[32m    if (alreadyActive) {[m
+[32m+[m[32m      res.status(400).json({ success: false, message: 'This user is already an active collaborator' }); return;[m
+     }[m
+ [m
+[31m-    // Verify the invitee exists and is active[m
+     const invitee = await User.findById(inviteeId).select('name isActive');[m
+     if (!invitee?.isActive) {[m
+[31m-      res.status(404).json({ success: false, message: 'Invitee not found or inactive' });[m
+[31m-      return;[m
+[32m+[m[32m      res.status(404).json({ success: false, message: 'Invitee not found or inactive' }); return;[m
+     }[m
+ [m
+[31m-    // Supervisors can only invite from their own team[m
+     if (req.user!.role === 'supervisor') {[m
+       const mapping = await SupervisorMapping.findOne({[m
+[31m-        supervisorId: req.user!.userId,[m
+[31m-        subordinateId: inviteeId,[m
+[31m-        status: 'active',[m
+[32m+[m[32m        supervisorId: req.user!.userId, subordinateId: inviteeId, status: 'active',[m
+       });[m
+       if (!mapping) {[m
+[31m-        res.status(403).json({ success: false, message: 'You can only invite members of your own team' });[m
+[31m-        return;[m
+[32m+[m[32m        res.status(403).json({ success: false, message: 'You can only invite members of your own team' }); return;[m
+       }[m
+     }[m
+ [m
+[31m-    // Add collaborator (re-add if previously revoked, otherwise push new)[m
+     const existingIdx = task.collaborators.findIndex((c) => c.userId.toString() === inviteeId);[m
+     if (existingIdx >= 0) {[m
+[31m-      // Re-invite a previously revoked collaborator[m
+       task.collaborators[existingIdx].status    = 'active';[m
+       task.collaborators[existingIdx].invitedAt = new Date();[m
+       task.collaborators[existingIdx].revokedAt = undefined;[m
+     } else {[m
+       task.collaborators.push({[m
+[31m-        userId:    new mongoose.Types.ObjectId(inviteeId),[m
+[31m-        invitedAt: new Date(),[m
+[31m-        status:    'active',[m
+[32m+[m[32m        userId: new mongoose.Types.ObjectId(inviteeId), invitedAt: new Date(), status: 'active',[m
+       });[m
+     }[m
+ [m
+     await task.save();[m
+ [m
+[32m+[m[32m    const inviter = await User.findById(req.user!.userId).select('name').lean();[m
+     await createNotification([m
+       inviteeId,[m
+       `You have been invited to collaborate on task: "${task.title}"`,[m
+[31m-      'task_collaboration_invite'[m
+[32m+[m[32m      'task_collaboration_invite',[m
+[32m+[m[32m      { taskTitle: task.title, inviterName: inviter?.name ?? 'A colleague' }[m
+     );[m
+ [m
+     res.json({ success: true, message: `${invitee.name} invited as a collaborator` });[m
+[36m@@ -535,17 +498,11 @@[m [mexport const inviteTaskCollaborator = async ([m
+ };[m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-// REVOKE COLLABORATOR — manual early revocation[m
+[31m-// Assignee or CEO can revoke before task completion.[m
+[32m+[m[32m// REVOKE COLLABORATOR[m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-export const revokeTaskCollaborator = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response,[m
+[31m-  next: NextFunction[m
+[31m-): Promise<void> => {[m
+[32m+[m[32mexport const revokeTaskCollaborator = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+     const { id, collaboratorId } = req.params as { id: string; collaboratorId: string };[m
+[31m-[m
+     const task = await TaskModel.findById(id);[m
+     if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }[m
+ [m
+[36m@@ -553,16 +510,14 @@[m [mexport const revokeTaskCollaborator = async ([m
+     const isCEO      = req.user!.role === 'ceo';[m
+ [m
+     if (!isAssignee && !isCEO) {[m
+[31m-      res.status(403).json({ success: false, message: 'Only the task assignee or CEO can revoke collaborator access' });[m
+[31m-      return;[m
+[32m+[m[32m      res.status(403).json({ success: false, message: 'Only the task assignee or CEO can revoke collaborator access' }); return;[m
+     }[m
+ [m
+     const collaborator = task.collaborators.find([m
+       (c) => c.userId.toString() === collaboratorId && c.status === 'active'[m
+     );[m
+     if (!collaborator) {[m
+[31m-      res.status(404).json({ success: false, message: 'Active collaborator not found' });[m
+[31m-      return;[m
+[32m+[m[32m      res.status(404).json({ success: false, message: 'Active collaborator not found' }); return;[m
+     }[m
+ [m
+     collaborator.status    = 'revoked';[m
+[36m@@ -574,18 +529,13 @@[m [mexport const revokeTaskCollaborator = async ([m
+ };[m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-// TASK LEADERBOARD[m
+[32m+[m[32m// LEADERBOARD[m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-export const getTaskLeaderboard = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response,[m
+[31m-  next: NextFunction[m
+[31m-): Promise<void> => {[m
+[32m+[m[32mexport const getTaskLeaderboard = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+     const { limit = '10' } = req.query as Record<string, string>;[m
+     const matchStage: Record<string, unknown> = {[m
+[31m-      status: 'completed',[m
+[31m-      efficiencyRatio: { $exists: true },[m
+[32m+[m[32m      status: 'completed', efficiencyRatio: { $exists: true },[m
+     };[m
+ [m
+     if (req.user!.role === 'supervisor') {[m
+[36m@@ -615,13 +565,9 @@[m [mexport const getTaskLeaderboard = async ([m
+ };[m
+ [m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-// INDIVIDUAL APPRAISAL REPORT[m
+[32m+[m[32m// INDIVIDUAL APPRAISAL[m
+ // ─────────────────────────────────────────────────────────────────[m
+[31m-export const getUserAppraisal = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response,[m
+[31m-  next: NextFunction[m
+[31m-): Promise<void> => {[m
+[32m+[m[32mexport const getUserAppraisal = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+     const { userId } = req.params as { userId: string };[m
+ [m
+[36m@@ -648,12 +594,9 @@[m [mexport const getUserAppraisal = async ([m
+           avgEfficiency:    { $avg: '$efficiencyRatio' },[m
+           avgTatMinutes:    { $avg: '$tatMinutes' },[m
+           avgTargetMinutes: { $avg: '$targetMinutes' },[m
+[31m-          onTimeTasks: { $sum: {[m
+[31m-            $cond: [{ $and: [[m
+[31m-              { $gte: ['$efficiencyRatio', 1] },[m
+[31m-              { $eq:  ['$status', 'completed'] },[m
+[31m-            ]}, 1, 0],[m
+[31m-          }},[m
+[32m+[m[32m          onTimeTasks: { $sum: { $cond: [{ $and: [[m
+[32m+[m[32m            { $gte: ['$efficiencyRatio', 1] }, { $eq: ['$status', 'completed'] },[m
+[32m+[m[32m          ]}, 1, 0] }},[m
+         }},[m
+       ]),[m
+       TaskModel.find({ assignedTo: targetId, status: 'completed' })[m
+[36m@@ -672,10 +615,10 @@[m [mexport const getUserAppraisal = async ([m
+       data: {[m
+         appraisal: {[m
+           ...stats,[m
+[31m-          completionRate:  stats.totalTasks > 0 ? `${((stats.completedTasks / stats.totalTasks) * 100).toFixed(1)}%` : '0%',[m
+[31m-          onTimeRate:      stats.completedTasks > 0 ? `${((stats.onTimeTasks / stats.completedTasks) * 100).toFixed(1)}%` : '0%',[m
+[31m-          avgEfficiency:   stats.avgEfficiency ? Number(stats.avgEfficiency.toFixed(3)) : null,[m
+[31m-          avgTatMinutes:   stats.avgTatMinutes ? Math.round(stats.avgTatMinutes) : null,[m
+[32m+[m[32m          completionRate: stats.totalTasks > 0 ? `${((stats.completedTasks / stats.totalTasks) * 100).toFixed(1)}%` : '0%',[m
+[32m+[m[32m          onTimeRate:     stats.completedTasks > 0 ? `${((stats.onTimeTasks / stats.completedTasks) * 100).toFixed(1)}%` : '0%',[m
+[32m+[m[32m          avgEfficiency:  stats.avgEfficiency ? Number(stats.avgEfficiency.toFixed(3)) : null,[m
+[32m+[m[32m          avgTatMinutes:  stats.avgTatMinutes ? Math.round(stats.avgTatMinutes) : null,[m
+         },[m
+         recentTasks,[m
+       },[m
+[36m@@ -683,31 +626,75 @@[m [mexport const getUserAppraisal = async ([m
+   } catch (err) { next(err); }[m
+ };[m
+ [m
+[31m-[m
+[31m-export const supervisorApproveTask = async ([m
+[31m-  req: AuthRequest,[m
+[31m-  res: Response,[m
+[31m-  next: NextFunction[m
+[31m-): Promise<void> => {[m
+[32m+[m[32m// ─────────────────────────────────────────────────────────────────[m
+[32m+[m[32m// APPROVE TASK  (PATCH /:id/approve)[m
+[32m+[m[32m// Convenience endpoint: CEO or Supervisor can approve a submitted[m
+[32m+[m[32m// task without going through the full updateTaskStatus flow.[m
+[32m+[m[32m// Equivalent to PATCH /:id/status with { status: 'completed' }.[m
+[32m+[m[32m// ─────────────────────────────────────────────────────────────────[m
+[32m+[m[32mexport const approveTask = async (req: AuthRequest, res: Response, next: NextFunction): Promise<void> => {[m
+   try {[m
+     const task = await TaskModel.findById(req.params.id);[m
+[32m+[m[32m    if (!task) { res.status(404).json({ success: false, message: 'Task not found' }); return; }[m
+ [m
+[31m-    if (!task) {[m
+[31m-      res.status(404).json({ message: "Task not found" });[m
+[31m-      return;[m
+[32m+[m[32m    const userId = req.user!.userId;[m
+[32m+[m[32m    const role   = req.user!.role;[m
+[32m+[m
+[32m+[m[32m    if (role !== 'ceo' && role !== 'supervisor') {[m
+[32m+[m[32m      res.status(403).json({ success: false, message: 'Only CEO or Supervisor can approve tasks' }); return;[m
+     }[m
+ [m
+[31m-    task.status = "completed"; // ⚠️ see issue #3 below[m
+[31m-    task.set("approvedBy", req.user!.userId);[m
+[31m-    task.set("approvedAt", new Date());[m
+[32m+[m[32m    if (task.status !== 'submitted') {[m
+[32m+[m[32m      res.status(400).json({[m
+[32m+[m[32m        success: false,[m
+[32m+[m[32m        message: `Cannot approve a task that is "${task.status}" — task must be submitted first`,[m
+[32m+[m[32m      }); return;[m
+[32m+[m[32m    }[m
+ [m
+[31m-    await task.save();[m
+[32m+[m[32m    const now = new Date();[m
+[32m+[m[32m    task.status      = 'completed';[m
+[32m+[m[32m    task.completedAt = now;[m
+ [m
+[31m-    res.json({[m
+[31m-      message: "Task approved successfully",[m
+[31m-      task,[m
+[32m+[m[32m    if (task.startedAt) {[m
+[32m+[m[32m      task.tatMinutes = calcTAT(task.startedAt, now);[m
+[32m+[m[32m      if (task.targetMinutes) {[m
+[32m+[m[32m        task.efficiencyRatio = calcEfficiency(task.targetMinutes, task.tatMinutes);[m
+[32m+[m[32m      }[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    // Auto-revoke all active collaborators on completion[m
+[32m+[m[32m    task.collaborators = task.collaborators.map((c) => ({[m
+[32m+[m[32m      ...c, status: 'revoked' as const, revokedAt: now,[m
+[32m+[m[32m    }));[m
+[32m+[m
+[32m+[m[32m    task.approvalHistory.push({[m
+[32m+[m[32m      action: 'approved',[m
+[32m+[m[32m      by:     new mongoose.Types.ObjectId(userId),[m
+[32m+[m[32m      at:     now,[m
+     });[m
+[31m-  } catch (error) {[m
+[31m-    next(error);[m
+[31m-  }[m
+[32m+[m
+[32m+[m[32m    await task.save();[m
+[32m+[m
+[32m+[m[32m    const assigneeUser = await User.findById(task.assignedTo).select('name').lean();[m
+[32m+[m[32m    await createNotification([m
+[32m+[m[32m      task.assignedTo.toString(),[m
+[32m+[m[32m      `Task "${task.title}" has been approved and marked complete`,[m
+[32m+[m[32m      'task_completed',[m
+[32m+[m[32m      {[m
+[32m+[m[32m        taskTitle:       task.title,[m
+[32m+[m[32m        assigneeName:    assigneeUser?.name ?? 'The assignee',[m
+[32m+[m[32m        efficiencyRatio: task.efficiencyRatio,[m
+[32m+[m[32m      }[m
+[32m+[m[32m    );[m
+[32m+[m
+[32m+[m[32m    const populated = await TaskModel.findById(task._id)[m
+[32m+[m[32m      .populate('assignedBy', 'name email role')[m
+[32m+[m[32m      .populate('assignedTo', 'name email role')[m
+[32m+[m[32m      .populate('collaborators.userId', 'name email')[m
+[32m+[m[32m      .populate('documentId', 'title fileType versionHistory')[m
+[32m+[m[32m      .populate('submissionDocuments', 'title fileType versionHistory createdAt')[m
+[32m+[m[32m      .populate('approvalHistory.by', 'name role');[m
+[32m+[m
+[32m+[m[32m    res.json({ success: true, message: 'Task approved and completed', data: { task: populated } });[m
+[32m+[m[32m  } catch (err) { next(err); }[m
+ };[m
+\ No newline at end of file[m
+[1mdiff --git a/src/index.ts b/src/index.ts[m
+[1mindex 1c31a03..90534ba 100644[m
+[1m--- a/src/index.ts[m
+[1m+++ b/src/index.ts[m
+[36m@@ -20,6 +20,7 @@[m [mimport analyticsRoutes from './routes/analytics';[m
+ import folderRoutes    from './routes/folders';[m
+ import taskRoutes      from './routes/tasks';[m
+ import messageRoutes   from './routes/messages';[m
+[32m+[m[32mimport emailRoutes   from './routes/emails';[m
+ [m
+ dotenv.config();[m
+ [m
+[36m@@ -27,7 +28,11 @@[m [mconst app = express();[m
+ [m
+ const PORT         = process.env.PORT         ?? 5000;[m
+ const FRONTEND_URL = process.env.FRONTEND_URL ?? 'http://localhost:5173';[m
+[31m-const UPLOAD_DIR   = process.env.UPLOAD_DIR   ?? './uploads';[m
+[32m+[m[32mconst UPLOAD_DIR = process.env.UPLOAD_DIR[m
+[32m+[m[32m  ? path.resolve(process.env.UPLOAD_DIR)[m
+[32m+[m[32m  : path.join(__dirname, '../uploads');[m
+[32m+[m
+[32m+[m[32mconst allowedOrigins = [FRONTEND_URL];[m
+ [m
+ // ── Ensure uploads directory exists ──────────────────────────────[m
+ if (!fs.existsSync(UPLOAD_DIR)) {[m
+[36m@@ -40,15 +45,21 @@[m [mif (!fs.existsSync(UPLOAD_DIR)) {[m
+ // IMPORTANT: This must come before helmet() to avoid CSP blocking.[m
+ app.use([m
+   '/uploads',[m
+[31m-  express.static(path.resolve(UPLOAD_DIR), {[m
+[31m-    // Allow cross-origin embedding for iframes (PDF preview)[m
+[32m+[m[32m  express.static(UPLOAD_DIR, {[m
+     setHeaders: (res) => {[m
+       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');[m
+[31m-      res.setHeader('Access-Control-Allow-Origin', FRONTEND_URL);[m
+[32m+[m
+[32m+[m[32m      const origin = res.req?.headers?.origin;[m
+[32m+[m
+[32m+[m[32m      if (origin && allowedOrigins.includes(origin)) {[m
+[32m+[m[32m        res.setHeader('Access-Control-Allow-Origin', origin);[m
+[32m+[m[32m      }[m
+     },[m
+   })[m
+ );[m
+ [m
+[32m+[m[32mconsole.log('Uploads path:', path.resolve(UPLOAD_DIR));[m
+[32m+[m
+ // ── Security ──────────────────────────────────────────────────────[m
+ app.use([m
+   helmet({[m
+[36m@@ -90,8 +101,9 @@[m [mapp.use('/api/users',     userRoutes);[m
+ app.use('/api/documents', documentRoutes);[m
+ app.use('/api/folders',   folderRoutes);[m
+ app.use('/api/analytics', analyticsRoutes);[m
+[31m-app.use('/api/tasks',     taskRoutes);       // ← new[m
+[31m-app.use('/api/messages',  messageRoutes);    // ← new[m
+[32m+[m[32mapp.use('/api/tasks',     taskRoutes);[m[41m      [m
+[32m+[m[32mapp.use('/api/messages',  messageRoutes);[m[41m    [m
+[32m+[m[32mapp.use("/api/emails", emailRoutes);[m
+ [m
+ // ── Health check ──────────────────────────────────────────────────[m
+ app.get('/api/health', (_req, res) => {[m
+[1mdiff --git a/src/middleware/upload.ts b/src/middleware/upload.ts[m
+[1mindex 06830d6..604001b 100644[m
+[1m--- a/src/middleware/upload.ts[m
+[1m+++ b/src/middleware/upload.ts[m
+[36m@@ -4,7 +4,7 @@[m [mimport fs from 'fs';[m
+ import { v4 as uuid } from 'uuid';[m
+ import { Request } from 'express';[m
+ [m
+[31m-const UPLOAD_DIR = process.env.UPLOAD_DIR ?? './uploads';[m
+[32m+[m[32mconst UPLOAD_DIR = path.resolve(__dirname, '../../uploads');[m
+ [m
+ // Ensure the uploads directory exists at startup[m
+ if (!fs.existsSync(UPLOAD_DIR)) {[m
+[36m@@ -65,97 +65,5 @@[m [mexport const uploadToLocal = multer({[m
+ // In production swap BACKEND_URL for your actual domain.[m
+ export const getLocalFileUrl = (filename: string): string => {[m
+   const base = process.env.BACKEND_URL ?? 'http://localhost:5000';[m
+[31m-  return `${base}/uploads/${filename}`;[m
+[32m+[m[32m  return `${base}/uploads/${encodeURIComponent(filename)}`;[m
+ };[m
+[31m-[m
+[31m-[m
+[31m-[m
+[31m-// import multer from "multer";[m
+[31m-// import multerS3 from "multer-s3";[m
+[31m-// import { v4 as uuid } from "uuid";[m
+[31m-// import { Request } from "express";[m
+[31m-// import { s3, BUCKET } from "../services/s3Storage";[m
+[31m-[m
+[31m-// /**[m
+[31m-//  * ✅ 1. S3 Upload Middleware (production storage)[m
+[31m-//  */[m
+[31m-[m
+[31m-// export const uploadToS3 = multer({[m
+[31m-[m
+[31m-//   storage: multerS3({[m
+[31m-[m
+[31m-//     s3,[m
+[31m-//     bucket: BUCKET,[m
+[31m-[m
+[31m-//     metadata: ([m
+[31m-//       _req: Request,[m
+[31m-//       file: Express.Multer.File,[m
+[31m-//       cb: (error: any, metadata?: any) => void[m
+[31m-//     ) => {[m
+[31m-//       cb(null, { fieldName: file.fieldname });[m
+[31m-//     },[m
+[31m-[m
+[31m-//     key: ([m
+[31m-//       _req: Request,[m
+[31m-//       file: Express.Multer.File,[m
+[31m-//       cb: (error: any, key?: string) => void[m
+[31m-//     ) => {[m
+[31m-[m
+[31m-//       const key = `documents/${uuid()}-${file.originalname}`;[m
+[31m-[m
+[31m-//       cb(null, key);[m
+[31m-//     }[m
+[31m-[m
+[31m-//   }),[m
+[31m-[m
+[31m-//   limits: {[m
+[31m-//     fileSize: 100 * 1024 * 1024[m
+[31m-//   }[m
+[31m-[m
+[31m-// });[m
+[31m-[m
+[31m-// /**[m
+[31m-//  * ✅ 2. Memory Upload Middleware (for text extraction)[m
+[31m-//  */[m
+[31m-// export const uploadToMemory = multer({[m
+[31m-//   storage: multer.memoryStorage(),[m
+[31m-//   limits: {[m
+[31m-//     fileSize: 20 * 1024 * 1024 // smaller for RAM safety[m
+[31m-//   }[m
+[31m-// });[m
+[31m-[m
+[31m-[m
+[31m-// import multer from "multer";[m
+[31m-// import path from "path";[m
+[31m-// import { v4 as uuid } from "uuid";[m
+[31m-[m
+[31m-// /**[m
+[31m-//  * ✅ LOCAL DISK STORAGE (NO AWS REQUIRED)[m
+[31m-//  */[m
+[31m-[m
+[31m-// const storage = multer.diskStorage({[m
+[31m-//   destination: (req, file, cb) => {[m
+[31m-//     cb(null, "uploads/"); // make sure folder exists[m
+[31m-//   },[m
+[31m-//   filename: (req, file, cb) => {[m
+[31m-//     const uniqueName = `${uuid()}-${file.originalname}`;[m
+[31m-//     cb(null, uniqueName);[m
+[31m-//   },[m
+[31m-// });[m
+[31m-[m
+[31m-// export const uploadToLocal = multer({[m
+[31m-//   storage,[m
+[31m-//   limits: {[m
+[31m-//     fileSize: 100 * 1024 * 1024,[m
+[31m-//   },[m
+[31m-// });[m
+[31m-[m
+[31m-// /**[m
+[31m-//  * ✅ Memory (keep this)[m
+[31m-//  */[m
+[31m-// export const uploadToMemory = multer({[m
+[31m-//   storage: multer.memoryStorage(),[m
+[31m-//   limits: {[m
+[31m-//     fileSize: 20 * 1024 * 1024,[m
+[31m-//   },[m
+[31m-// });[m
+\ No newline at end of file[m
+[1mdiff --git a/src/models/AuditLog.ts b/src/models/AuditLog.ts[m
+[1mindex 70abc0e..7fb0ed5 100644[m
+[1m--- a/src/models/AuditLog.ts[m
+[1m+++ b/src/models/AuditLog.ts[m
+[36m@@ -16,7 +16,7 @@[m [mexport interface IAuditLog extends Document {[m
+ const AuditLogSchema = new Schema<IAuditLog>({[m
+   documentId: { type: Schema.Types.ObjectId, ref: 'Document' },[m
+   actorId: { type: Schema.Types.ObjectId, ref: 'User', required: true },[m
+[31m-  action: { type: String, enum: ['created','viewed','edited','submitted','completed','invited','access_revoked','deleted','downloaded'], required: true },[m
+[32m+[m[32m  action: { type: String, enum: ['created','viewed','edited','submitted','completed','invited','access_revoked','deleted','downloaded', 'email_sent'], required: true },[m
+   targetUserId: { type: Schema.Types.ObjectId, ref: 'User' },[m
+   supervisorIdAtTime: { type: Schema.Types.ObjectId, ref: 'User' },[m
+   details: { type: Schema.Types.Mixed },[m
+[36m@@ -30,5 +30,7 @@[m [mAuditLogSchema.pre('findOneAndUpdate', function() { throw new Error('Audit logs[m
+ AuditLogSchema.index({ actorId: 1, timestamp: -1 });[m
+ AuditLogSchema.index({ documentId: 1, timestamp: -1 });[m
+ AuditLogSchema.index({ supervisorIdAtTime: 1, timestamp: -1 });[m
+[32m+[m[32mAuditLogSchema.index({ action: 1, timestamp: -1 });[m
+[32m+[m[32mAuditLogSchema.index({ targetUserId: 1, action: 1 });[m
+ [m
+ export const AuditLog = mongoose.model<IAuditLog>('AuditLog', AuditLogSchema);[m
+[1mdiff --git a/src/models/EmailLog.ts b/src/models/EmailLog.ts[m
+[1mnew file mode 100644[m
+[1mindex 0000000..66f4a93[m
+[1m--- /dev/null[m
+[1m+++ b/src/models/EmailLog.ts[m
+[36m@@ -0,0 +1,98 @@[m
+[32m+[m[32mimport mongoose, { Document, Schema } from 'mongoose';[m
+[32m+[m
+[32m+[m[32mexport type EmailStatus =[m
+[32m+[m[32m  | 'pending'[m
+[32m+[m[32m  | 'sent'[m
+[32m+[m[32m  | 'failed';[m
+[32m+[m
+[32m+[m[32mexport interface IEmailLog extends Document {[m
+[32m+[m[32m  _id: mongoose.Types.ObjectId;[m
+[32m+[m
+[32m+[m[32m  senderId: mongoose.Types.ObjectId;[m
+[32m+[m[32m  receiverId: mongoose.Types.ObjectId;[m
+[32m+[m
+[32m+[m[32m  toEmail: string;[m
+[32m+[m
+[32m+[m[32m  subject: string;[m
+[32m+[m[32m  body: string;[m
+[32m+[m[32m  bodyPreview: string;[m
+[32m+[m
+[32m+[m[32m  status: EmailStatus;[m
+[32m+[m[32m  error?: string;[m
+[32m+[m
+[32m+[m[32m  sentAt?: Date;[m
+[32m+[m
+[32m+[m[32m  // Optional tracking (future-ready)[m
+[32m+[m[32m  messageId?: string; // SMTP / provider ID[m
+[32m+[m
+[32m+[m[32m  createdAt: Date;[m
+[32m+[m[32m  updatedAt: Date;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mconst EmailLogSchema = new Schema<IEmailLog>([m
+[32m+[m[32m  {[m
+[32m+[m[32m    senderId: {[m
+[32m+[m[32m      type: Schema.Types.ObjectId,[m
+[32m+[m[32m      ref: 'User',[m
+[32m+[m[32m      required: true,[m
+[32m+[m[32m      index: true,[m
+[32m+[m[32m    },[m
+[32m+[m
+[32m+[m[32m    receiverId: {[m
+[32m+[m[32m      type: Schema.Types.ObjectId,[m
+[32m+[m[32m      ref: 'User',[m
+[32m+[m[32m      required: true,[m
+[32m+[m[32m      index: true,[m
+[32m+[m[32m    },[m
+[32m+[m
+[32m+[m[32m    toEmail: {[m
+[32m+[m[32m      type: String,[m
+[32m+[m[32m      required: true,[m
+[32m+[m[32m      lowercase: true,[m
+[32m+[m[32m      trim: true,[m
+[32m+[m[32m    },[m
+[32m+[m
+[32m+[m[32m    subject: {[m
+[32m+[m[32m      type: String,[m
+[32m+[m[32m      required: true,[m
+[32m+[m[32m      trim: true,[m
+[32m+[m[32m      default: '(No subject)',[m
+[32m+[m[32m    },[m
+[32m+[m
+[32m+[m[32m    body: {[m
+[32m+[m[32m      type: String,[m
+[32m+[m[32m      required: true,[m
+[32m+[m[32m    },[m
+[32m+[m
+[32m+[m[32m    bodyPreview: {[m
+[32m+[m[32m      type: String,[m
+[32m+[m[32m      required: true,[m
+[32m+[m[32m    },[m
+[32m+[m
+[32m+[m[32m    status: {[m
+[32m+[m[32m      type: String,[m
+[32m+[m[32m      enum: ['pending', 'sent', 'failed'],[m
+[32m+[m[32m      default: 'pending',[m
+[32m+[m[32m      index: true,[m
+[32m+[m[32m    },[m
+[32m+[m
+[32m+[m[32m    error: {[m
+[32m+[m[32m      type: String,[m
+[32m+[m[32m    },[m
+[32m+[m
+[32m+[m[32m    sentAt: {[m
+[32m+[m[32m      type: Date,[m
+[32m+[m[32m    },[m
+[32m+[m
+[32m+[m[32m    messageId: {[m
+[32m+[m[32m      type: String,[m
+[32m+[m[32m    },[m
+[32m+[m[32m  },[m
+[32m+[m[32m  { timestamps: true }[m
+[32m+[m[32m);[m
+[32m+[m
+[32m+[m[32mEmailLogSchema.index({ senderId: 1, createdAt: -1 });[m
+[32m+[m[32mEmailLogSchema.index({ receiverId: 1, createdAt: -1 });[m
+[32m+[m[32mEmailLogSchema.index({ status: 1, createdAt: -1 });[m
+[32m+[m
+[32m+[m[32mexport const EmailLog = mongoose.model<IEmailLog>('EmailLog', EmailLogSchema);[m
+\ No newline at end of file[m
+[1mdiff --git a/src/models/Notification.ts b/src/models/Notification.ts[m
+[1mindex 69f68d0..3ea56a8 100644[m
+[1m--- a/src/models/Notification.ts[m
+[1m+++ b/src/models/Notification.ts[m
+[36m@@ -1,24 +1,51 @@[m
+[31m-import mongoose from "mongoose";[m
+[32m+[m[32mimport mongoose, { Document, Types } from "mongoose";[m
+ [m
+[31m-const NotificationSchema = new mongoose.Schema({[m
+[32m+[m[32mexport interface INotification extends Document {[m
+[32m+[m[32m  userId: Types.ObjectId;[m
+[32m+[m[32m  message: string;[m
+[32m+[m[32m  type: string;[m
+[32m+[m[32m  read: boolean;[m
+[32m+[m[32m  meta?: Record<string, any>;[m
+[32m+[m[32m  createdAt: Date;[m
+[32m+[m[32m  updatedAt: Date;[m
+[32m+[m[32m}[m
+ [m
+[31m-  userId: {[m
+[31m-    type: mongoose.Schema.Types.ObjectId,[m
+[31m-    ref: "User"[m
+[31m-  },[m
+[32m+[m[32mconst NotificationSchema = new mongoose.Schema<INotification>([m
+[32m+[m[32m  {[m
+[32m+[m[32m    userId: {[m
+[32m+[m[32m      type: mongoose.Schema.Types.ObjectId,[m
+[32m+[m[32m      ref: "User",[m
+[32m+[m[32m      required: true,[m
+[32m+[m[32m      index: true,[m
+[32m+[m[32m    },[m
+[32m+[m
+[32m+[m[32m    message: {[m
+[32m+[m[32m      type: String,[m
+[32m+[m[32m      required: true,[m
+[32m+[m[32m    },[m
+ [m
+[31m-  message: String,[m
+[32m+[m[32m    type: {[m
+[32m+[m[32m      type: String,[m
+[32m+[m[32m      required: true,[m
+[32m+[m[32m    },[m
+ [m
+[31m-  type: String,[m
+[32m+[m[32m    read: {[m
+[32m+[m[32m      type: Boolean,[m
+[32m+[m[32m      default: false,[m
+[32m+[m[32m      index: true,[m
+[32m+[m[32m    },[m
+ [m
+[31m-  read: {[m
+[31m-    type: Boolean,[m
+[31m-    default: false[m
+[31m-  }[m
+[32m+[m[32m    meta: {[m
+[32m+[m[32m      type: mongoose.Schema.Types.Mixed,[m
+[32m+[m[32m    },[m
+[32m+[m[32m  },[m
+[32m+[m[32m  { timestamps: true }[m
+[32m+[m[32m);[m
+ [m
+[31m-}, { timestamps: true });[m
+[32m+[m[32m// Index for fast user notifications[m
+[32m+[m[32mNotificationSchema.index({ userId: 1, createdAt: -1 });[m
+ [m
+[31m-export default mongoose.model([m
+[32m+[m[32mexport default mongoose.model<INotification>([m
+   "Notification",[m
+   NotificationSchema[m
+ );[m
+\ No newline at end of file[m
+[1mdiff --git a/src/models/Task.ts b/src/models/Task.ts[m
+[1mindex 26cdaa6..473ef2f 100644[m
+[1m--- a/src/models/Task.ts[m
+[1m+++ b/src/models/Task.ts[m
+[36m@@ -1,39 +1,28 @@[m
+ import mongoose, { Document, Schema } from 'mongoose';[m
+ [m
+[31m-export type TaskStatus   = 'pending' | 'in_progress' | 'submitted' | 'completed' | 'cancelled';[m
+[32m+[m[32mexport type TaskStatus   = 'pending' | 'in_progress' | 'submitted' | 'completed' | 'rejected' | 'cancelled';[m
+ export type TaskPriority = 'low' | 'medium' | 'high' | 'critical';[m
+ [m
+[31m-// ─── System design ────────────────────────────────────────────────[m
+[31m-//[m
+[31m-// ALL measurement and collaboration lives on Tasks, not Documents.[m
+[31m-//[m
+[31m-// Documents are purely for file storage and reference — they have[m
+[31m-// no status workflow, no TAT, no efficiency, no completion approval,[m
+[31m-// and no collaborators.[m
+[31m-//[m
+[31m-// Tasks drive everything performance-related:[m
+[31m-//[m
+[31m-//   TAT lifecycle:[m
+[31m-//     1. CEO/Supervisor assigns task            → status = pending[m
+[31m-//     2. Assignee sets targetMinutes + starts   → status = in_progress[m
+[31m-//                                                  startedAt recorded[m
+[31m-//     3. Assignee marks complete                → status = completed[m
+[31m-//                                                  completedAt, tatMinutes,[m
+[31m-//                                                  efficiencyRatio calculated[m
+[31m-//[m
+[31m-//   efficiencyRatio = targetMinutes / tatMinutes[m
+[31m-//     > 1.0  finished faster than committed  (excellent)[m
+[31m-//     = 1.0  exactly on target[m
+[31m-//     < 1.0  overran target                  (needs attention)[m
+[31m-//[m
+[31m-//   Task collaboration:[m
+[31m-//     - Assignee can invite other users to help with the task[m
+[31m-//     - Invited users appear in collaborators[] and gain read access[m
+[31m-//       to any linked document[m
+[31m-//     - When the task moves to completed or cancelled, ALL collaborator[m
+[31m-//       access is immediately and automatically revoked[m
+[31m-//[m
+[31m-// ─────────────────────────────────────────────────────────────────[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Design:[m
+[32m+[m[32m *[m
+[32m+[m[32m * TAT lifecycle:[m
+[32m+[m[32m *   1. CEO/Supervisor creates task (optionally uploads supporting files)[m
+[32m+[m[32m *   2. Assignee sets targetMinutes + starts        → in_progress, startedAt recorded[m
+[32m+[m[32m *   3. Assignee submits with supporting documents  → submitted[m
+[32m+[m[32m *   4. Supervisor/CEO reviews linked documents     → completed OR rejected[m
+[32m+[m[32m *[m
+[32m+[m[32m * efficiencyRatio = targetMinutes / tatMinutes[m
+[32m+[m[32m *   > 1.0  finished faster than committed (excellent)[m
+[32m+[m[32m *   = 1.0  exactly on target[m
+[32m+[m[32m *   < 1.0  overran target (needs attention)[m
+[32m+[m[32m *[m
+[32m+[m[32m * Task-to-Document linking:[m
+[32m+[m[32m *   - documentId: primary document this task is about[m
+[32m+[m[32m *   - submissionDocuments: documents the assignee attaches when submitting[m
+[32m+[m[32m *   - taskFiles: files uploaded by CEO/Supervisor when creating the task[m
+[32m+[m[32m *     (context/brief/requirements for the assignee)[m
+[32m+[m[32m */[m
+ [m
+ export interface ITaskCollaborator {[m
+   userId:    mongoose.Types.ObjectId;[m
+[36m@@ -43,56 +32,79 @@[m [mexport interface ITaskCollaborator {[m
+ }[m
+ [m
+ export interface IApprovalHistory {[m
+[31m-  action: 'approved' | 'rejected';[m
+[31m-  by: mongoose.Types.ObjectId;[m
+[31m-  at: Date;[m
+[31m-  reason?: string;[m
+[32m+[m[32m  action:   'approved' | 'rejected';[m
+[32m+[m[32m  by:       mongoose.Types.ObjectId;[m
+[32m+[m[32m  at:       Date;[m
+[32m+[m[32m  reason?:  string;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport interface ITaskFile {[m
+[32m+[m[32m  fileName:  string;[m
+[32m+[m[32m  fileKey:   string;[m
+[32m+[m[32m  fileUrl:   string;[m
+[32m+[m[32m  fileSize:  number;[m
+[32m+[m[32m  fileType:  string;[m
+[32m+[m[32m  uploadedBy: mongoose.Types.ObjectId;[m
+[32m+[m[32m  uploadedAt: Date;[m
+ }[m
+ [m
+ export interface ITask extends Document {[m
+[31m-  _id: mongoose.Types.ObjectId;[m
+[31m-  title: string;[m
+[32m+[m[32m  _id:         mongoose.Types.ObjectId;[m
+[32m+[m[32m  title:       string;[m
+   description?: string;[m
+[31m-  assignedBy: mongoose.Types.ObjectId;[m
+[31m-  assignedTo: mongoose.Types.ObjectId;[m
+[32m+[m[32m  assignedBy:  mongoose.Types.ObjectId;[m
+[32m+[m[32m  assignedTo:  mongoose.Types.ObjectId;[m
+[32m+[m
+[32m+[m[32m  // Primary linked document (e.g. a working doc the task is about)[m
+   documentId?: mongoose.Types.ObjectId;[m
+ [m
+[31m-  status: TaskStatus;[m
+[32m+[m[32m  // Files uploaded by CEO/Supervisor when creating the task[m
+[32m+[m[32m  // (context files, briefs, requirements for the assignee)[m
+[32m+[m[32m  taskFiles:   ITaskFile[];[m
+[32m+[m
+[32m+[m[32m  // Documents attached by the assignee when submitting for approval[m
+[32m+[m[32m  // The reviewer can open these to approve/reject the task[m
+[32m+[m[32m  submissionDocuments: mongoose.Types.ObjectId[];[m
+[32m+[m
+[32m+[m[32m  status:   TaskStatus;[m
+   priority: TaskPriority;[m
+   dueDate?: Date;[m
+ [m
+[31m-  targetMinutes?: number;[m
+[31m-  startedAt?: Date;[m
+[31m-  completedAt?: Date;[m
+[31m-  tatMinutes?: number;[m
+[32m+[m[32m  // TAT[m
+[32m+[m[32m  targetMinutes?:  number;[m
+[32m+[m[32m  startedAt?:      Date;[m
+[32m+[m[32m  submittedAt?:    Date;[m
+[32m+[m[32m  completedAt?:    Date;[m
+[32m+[m[32m  tatMinutes?:     number;[m
+   efficiencyRatio?: number;[m
+ [m
+[31m-  // ✅ APPROVAL FLOW FIELDS[m
+[31m-  submittedAt?: Date;[m
+[31m-[m
+[31m-  approvedBy?: mongoose.Types.ObjectId;[m
+[31m-  approvedAt?: Date;[m
+[31m-  approvalHistory?: IApprovalHistory[];[m
+[31m-[m
+[31m-  // SLA tracking[m
+[31m-  approvalDurationMinutes?: number;[m
+[31m-[m
+[31m-  // Proof of work[m
+[31m-  proofFiles?: string[];[m
+[31m-[m
+[32m+[m[32m  // Submission[m
+   submissionComment?: string;[m
+[32m+[m[32m  rejectionReason?:   string;[m
+ [m
+[31m-  rejectedBy?: mongoose.Types.ObjectId;[m
+[31m-  rejectedAt?: Date;[m
+[31m-  rejectionReason?: string;[m
+[32m+[m[32m  // Approval history (full trail)[m
+[32m+[m[32m  approvalHistory: IApprovalHistory[];[m
+ [m
+[32m+[m[32m  // Collaboration[m
+   collaborators: ITaskCollaborator[];[m
+ [m
+   notes?: string;[m
+   createdAt: Date;[m
+   updatedAt: Date;[m
+[32m+[m[32m  approvedAt?: Date;[m
+[32m+[m[32m  approvalDurationMinutes?: number;[m
+ }[m
+ [m
+[32m+[m[32mconst TaskFileSchema = new Schema<ITaskFile>({[m
+[32m+[m[32m  fileName:   { type: String, required: true },[m
+[32m+[m[32m  fileKey:    { type: String, required: true },[m
+[32m+[m[32m  fileUrl:    { type: String, required: true },[m
+[32m+[m[32m  fileSize:   { type: Number, required: true },[m
+[32m+[m[32m  fileType:   { type: String, required: true },[m
+[32m+[m[32m  uploadedBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },[m
+[32m+[m[32m  uploadedAt: { type: Date, default: Date.now },[m
+[32m+[m[32m}, { _id: false });[m
+[32m+[m
+ const TaskCollaboratorSchema = new Schema<ITaskCollaborator>({[m
+   userId:    { type: Schema.Types.ObjectId, ref: 'User', required: true },[m
+   invitedAt: { type: Date, default: Date.now },[m
+[36m@@ -100,76 +112,43 @@[m [mconst TaskCollaboratorSchema = new Schema<ITaskCollaborator>({[m
+   status:    { type: String, enum: ['active', 'revoked'], default: 'active' },[m
+ }, { _id: false });[m
+ [m
+[32m+[m[32mconst ApprovalHistorySchema = new Schema<IApprovalHistory>({[m
+[32m+[m[32m  action: { type: String, enum: ['approved', 'rejected'], required: true },[m
+[32m+[m[32m  by:     { type: Schema.Types.ObjectId, ref: 'User', required: true },[m
+[32m+[m[32m  at:     { type: Date, default: Date.now },[m
+[32m+[m[32m  reason: { type: String },[m
+[32m+[m[32m}, { _id: false });[m
+[32m+[m
+ const TaskSchema = new Schema<ITask>({[m
+[31m-  title: { type: String, required: true, trim: true },[m
+[32m+[m[32m  title:       { type: String, required: true, trim: true },[m
+   description: { type: String },[m
+[32m+[m[32m  assignedBy:  { type: Schema.Types.ObjectId, ref: 'User', required: true },[m
+[32m+[m[32m  assignedTo:  { type: Schema.Types.ObjectId, ref: 'User', required: true },[m
+ [m
+[31m-  assignedBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },[m
+[31m-  assignedTo: { type: Schema.Types.ObjectId, ref: 'User', required: true },[m
+[31m-  documentId: { type: Schema.Types.ObjectId, ref: 'Document' },[m
+[31m-[m
+[31m-  status: {[m
+[31m-    type: String,[m
+[31m-    enum: ['pending', 'in_progress', 'submitted', 'completed', 'cancelled'],[m
+[31m-    default: 'pending'[m
+[31m-  },[m
+[32m+[m[32m  documentId:           { type: Schema.Types.ObjectId, ref: 'Document' },[m
+[32m+[m[32m  taskFiles:            { type: [TaskFileSchema], default: [] },[m
+[32m+[m[32m  submissionDocuments:  [{ type: Schema.Types.ObjectId, ref: 'Document' }],[m
+ [m
+[31m-  priority: {[m
+[31m-    type: String,[m
+[31m-    enum: ['low', 'medium', 'high', 'critical'],[m
+[31m-    default: 'medium'[m
+[31m-  },[m
+[31m-[m
+[31m-  dueDate: { type: Date },[m
+[32m+[m[32m  status:   { type: String, enum: ['pending', 'in_progress', 'submitted', 'completed', 'rejected', 'cancelled'], default: 'pending' },[m
+[32m+[m[32m  priority: { type: String, enum: ['low', 'medium', 'high', 'critical'], default: 'medium' },[m
+[32m+[m[32m  dueDate:  { type: Date },[m
+ [m
+   // TAT[m
+[31m-  targetMinutes: { type: Number, min: 1 },[m
+[31m-  startedAt: { type: Date },[m
+[31m-  completedAt: { type: Date },[m
+[31m-  tatMinutes: { type: Number },[m
+[32m+[m[32m  targetMinutes:   { type: Number, min: 1 },[m
+[32m+[m[32m  startedAt:       { type: Date },[m
+[32m+[m[32m  submittedAt:     { type: Date },[m
+[32m+[m[32m  completedAt:     { type: Date },[m
+[32m+[m[32m  tatMinutes:      { type: Number },[m
+   efficiencyRatio: { type: Number },[m
+[31m-[m
+[31m-  // ✅ Approval workflow[m
+[31m-  submittedAt: { type: Date },[m
+[31m-[m
+[31m-  approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },[m
+   approvedAt: { type: Date },[m
+[31m-[m
+[31m-  rejectedBy: { type: Schema.Types.ObjectId, ref: 'User' },[m
+[31m-  rejectedAt: { type: Date },[m
+[31m-  rejectionReason: { type: String },[m
+[31m-[m
+[31m-  approvalHistory: [[m
+[31m-    {[m
+[31m-      action: {[m
+[31m-        type: String,[m
+[31m-        enum: ['approved', 'rejected'],[m
+[31m-        required: true,[m
+[31m-      },[m
+[31m-      by: {[m
+[31m-        type: Schema.Types.ObjectId,[m
+[31m-        ref: 'User',[m
+[31m-        required: true,[m
+[31m-      },[m
+[31m-      at: {[m
+[31m-        type: Date,[m
+[31m-        default: Date.now,[m
+[31m-      },[m
+[31m-      reason: {[m
+[31m-        type: String,[m
+[31m-      },[m
+[31m-    }[m
+[31m-  ],[m
+[31m-[m
+   approvalDurationMinutes: { type: Number },[m
+ [m
+[31m-  proofFiles: [[m
+[31m-    {[m
+[31m-      url: String,[m
+[31m-      uploadedAt: Date,[m
+[31m-    }[m
+[31m-  ],[m
+[32m+[m[32m  // Submission[m
+   submissionComment: { type: String },[m
+[32m+[m[32m  rejectionReason:   { type: String },[m
+[32m+[m
+[32m+[m[32m  // Approval trail[m
+[32m+[m[32m  approvalHistory: { type: [ApprovalHistorySchema], default: [] },[m
+ [m
+   // Collaboration[m
+   collaborators: { type: [TaskCollaboratorSchema], default: [] },[m
+[36m@@ -180,6 +159,7 @@[m [mconst TaskSchema = new Schema<ITask>({[m
+ TaskSchema.index({ assignedTo: 1, status: 1 });[m
+ TaskSchema.index({ assignedBy: 1, createdAt: -1 });[m
+ TaskSchema.index({ documentId: 1 });[m
+[32m+[m[32mTaskSchema.index({ submissionDocuments: 1 });[m
+ TaskSchema.index({ assignedTo: 1, efficiencyRatio: -1 });[m
+ TaskSchema.index({ 'collaborators.userId': 1 });[m
+ [m
+[1mdiff --git a/src/models/User.ts b/src/models/User.ts[m
+[1mindex 49b908b..0e9de38 100644[m
+[1m--- a/src/models/User.ts[m
+[1m+++ b/src/models/User.ts[m
+[36m@@ -13,6 +13,7 @@[m [mexport interface IUser extends Document {[m
+   phone?: string;[m
+   profilePicture?: string[m
+   isActive: boolean;[m
+[32m+[m[32m  supervisorId?: mongoose.Types.ObjectId;[m
+   accountStatus: 'pending' | 'active' | 'rejected' | 'disabled' ;[m
+   rejectionReason?: string;[m
+   approvedBy?: mongoose.Types.ObjectId;[m
+[36m@@ -47,6 +48,10 @@[m [mconst UserSchema = new Schema<IUser>({[m
+     type: String[m
+   },[m
+   isActive: { type: Boolean, default: false }, // false until CEO approves[m
+[32m+[m[32m  supervisorId: {[m
+[32m+[m[32m    type: Schema.Types.ObjectId,[m
+[32m+[m[32m    ref: 'User',[m
+[32m+[m[32m  },[m
+   accountStatus: { type: String, enum: ['pending', 'active', 'rejected', 'disabled'], default: 'pending' },[m
+   rejectionReason: { type: String },[m
+   approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },[m
+[36m@@ -70,4 +75,13 @@[m [mUserSchema.set('toJSON', {[m
+   transform: (_doc, ret) => { delete (ret as any).password; return ret; }[m
+ });[m
+ [m
+[32m+[m[32mUserSchema.index({ supervisorId: 1 });[m
+[32m+[m
+[32m+[m[32mUserSchema.pre('save', function (next) {[m
+[32m+[m[32m  if (this.role === 'ceo' && this.supervisorId) {[m
+[32m+[m[32m    return next(new Error('CEO cannot have a supervisor'));[m
+[32m+[m[32m  }[m
+[32m+[m[32m  next();[m
+[32m+[m[32m});[m
+[32m+[m
+ export const User = mongoose.model<IUser>('User', UserSchema);[m
+[1mdiff --git a/src/routes/analytics.ts b/src/routes/analytics.ts[m
+[1mindex 2282b63..fdfb473 100644[m
+[1m--- a/src/routes/analytics.ts[m
+[1m+++ b/src/routes/analytics.ts[m
+[36m@@ -1,6 +1,7 @@[m
+ import { Router } from 'express';[m
+ import { authenticate, authorize } from '../middleware/auth';[m
+[31m-import { getLeaderboard, getBottleneckAnalysis, getTrendAnalysis, getDashboardStats, getAuditTrail, getCollaborationFrequency } from '../controllers/analyticsController';[m
+[32m+[m[32mimport { getLeaderboard, getBottleneckAnalysis, getTrendAnalysis, getDashboardStats, getAuditTrail, getCollaborationFrequency, getEmailAnalytics } from '../controllers/analyticsController';[m
+[32m+[m
+ [m
+ const router = Router();[m
+ router.use(authenticate);[m
+[36m@@ -10,4 +11,6 @@[m [mrouter.get('/bottlenecks', authorize('ceo', 'supervisor'), getBottleneckAnalysis[m
+ router.get('/trends', authorize('ceo', 'supervisor'), getTrendAnalysis);[m
+ router.get('/audit-trail', getAuditTrail);[m
+ router.get('/collaboration-frequency', authorize('ceo', 'supervisor'), getCollaborationFrequency);[m
+[32m+[m[32mrouter.get('/email-stats', getEmailAnalytics);[m[41m [m
+[32m+[m
+ export default router;[m
+[1mdiff --git a/src/routes/emails.ts b/src/routes/emails.ts[m
+[1mnew file mode 100644[m
+[1mindex 0000000..dd7452d[m
+[1m--- /dev/null[m
+[1m+++ b/src/routes/emails.ts[m
+[36m@@ -0,0 +1,12 @@[m
+[32m+[m[32mimport { Router } from 'express';[m
+[32m+[m[32mimport { authenticate } from '../middleware/auth';[m
+[32m+[m[32mimport { getSentEmails, retryEmail, sendEmailDirect } from '../controllers/emailController';[m
+[32m+[m
+[32m+[m[32mconst router = Router();[m
+[32m+[m[32mrouter.use(authenticate);[m
+[32m+[m
+[32m+[m[32mrouter.post('/', sendEmailDirect);[m
+[32m+[m[32mrouter.get("/sent", getSentEmails);[m
+[32m+[m[32mrouter.get("/:id/retry", retryEmail);[m
+[32m+[m
+[32m+[m[32mexport default router;[m
+\ No newline at end of file[m
+[1mdiff --git a/src/routes/tasks.ts b/src/routes/tasks.ts[m
+[1mindex 5f09623..f611276 100644[m
+[1m--- a/src/routes/tasks.ts[m
+[1m+++ b/src/routes/tasks.ts[m
+[36m@@ -1,11 +1,13 @@[m
+ import { Router } from 'express';[m
+ import { authenticate, authorize } from '../middleware/auth';[m
+[32m+[m[32mimport { uploadToLocal } from '../middleware/upload';[m
+ import {[m
+   createTask,[m
+   getTasks,[m
+   getTask,[m
+   updateTask,[m
+   updateTaskStatus,[m
+[32m+[m[32m  approveTask,[m
+   deleteTask,[m
+   inviteTaskCollaborator,[m
+   revokeTaskCollaborator,[m
+[36m@@ -13,26 +15,19 @@[m [mimport {[m
+   getUserAppraisal,[m
+ } from '../controllers/taskController';[m
+ [m
+[31m-// ─── Tasks own TAT, efficiency, and collaboration ─────────────────[m
+[31m-//[m
+[31m-//  CRUD:[m
+[31m-//    GET    /                  list tasks (role-scoped)[m
+[31m-//    POST   /                  create / assign (CEO or Supervisor)[m
+[31m-//    GET    /:id               get one[m
+[31m-//    PUT    /:id               update metadata / set target[m
+[31m-//    PATCH  /:id/status        advance status (pending→in_progress→completed)[m
+[31m-//    DELETE /:id               delete (assigner or CEO)[m
+[31m-//[m
+[31m-//  Collaboration:[m
+[31m-//    POST   /:id/invite                        invite a collaborator[m
+[31m-//    DELETE /:id/collaborators/:collaboratorId  manually revoke access early[m
+[31m-//    (Access is auto-revoked when task is completed or cancelled)[m
+[31m-//[m
+[31m-//  Appraisal:[m
+[31m-//    GET    /analytics/leaderboard             ranked efficiency (CEO/Supervisor)[m
+[31m-//    GET    /analytics/appraisal/:userId       individual report[m
+[31m-//[m
+[31m-// ─────────────────────────────────────────────────────────────────[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Tasks — own TAT, efficiency, collaboration, file uploads, document linking.[m
+[32m+[m[32m *[m
+[32m+[m[32m * Lifecycle:[m
+[32m+[m[32m *   POST   /              CEO/Supervisor creates task (can upload briefing files)[m
+[32m+[m[32m *   PATCH  /:id/status    Drives TAT state machine:[m
+[32m+[m[32m *                           pending → in_progress (assignee sets targetMinutes)[m
+[32m+[m[32m *                           in_progress → submitted (assignee attaches docs)[m
+[32m+[m[32m *                           submitted → completed   (approver approves)[m
+[32m+[m[32m *                           submitted → rejected    (approver rejects, back to in_progress)[m
+[32m+[m[32m *                           any → cancelled[m
+[32m+[m[32m *   PATCH  /:id/approve   Convenience shortcut: directly approve a submitted task[m
+[32m+[m[32m */[m
+ [m
+ const router = Router();[m
+ router.use(authenticate);[m
+[36m@@ -42,15 +37,19 @@[m [mrouter.get('/analytics/leaderboard',       authorize('ceo', 'supervisor'), getTa[m
+ router.get('/analytics/appraisal/:userId', getUserAppraisal);[m
+ [m
+ // ── CRUD ──────────────────────────────────────────────────────────[m
+[31m-router.get('/',              getTasks);[m
+[31m-router.post('/',             createTask);[m
+[31m-router.get('/:id',           getTask);[m
+[31m-router.put('/:id',           updateTask);[m
+[31m-router.patch('/:id/status',  updateTaskStatus);[m
+[31m-router.delete('/:id',        deleteTask);[m
+[32m+[m[32mrouter.get('/',    getTasks);[m
+[32m+[m[32m// CEO/Supervisor can upload briefing files when creating a task.[m
+[32m+[m[32m// uploadToLocal.any() accepts any field name and any number of files.[m
+[32m+[m[32mrouter.post('/',   uploadToLocal.any(), createTask);[m
+[32m+[m
+[32m+[m[32mrouter.get('/:id',            getTask);[m
+[32m+[m[32mrouter.put('/:id',            updateTask);[m
+[32m+[m[32mrouter.patch('/:id/status',   updateTaskStatus);[m
+[32m+[m[32mrouter.patch('/:id/approve',  approveTask);[m
+[32m+[m[32mrouter.delete('/:id',         deleteTask);[m
+ [m
+ // ── Collaboration ─────────────────────────────────────────────────[m
+[31m-router.post('/:id/invite',                            inviteTaskCollaborator);[m
+[31m-router.delete('/:id/collaborators/:collaboratorId',   revokeTaskCollaborator);[m
+[32m+[m[32mrouter.post('/:id/invite',                           inviteTaskCollaborator);[m
+[32m+[m[32mrouter.delete('/:id/collaborators/:collaboratorId',  revokeTaskCollaborator);[m
+ [m
+ export default router;[m
+\ No newline at end of file[m
+[1mdiff --git a/src/services/emailService.ts b/src/services/emailService.ts[m
+[1mnew file mode 100644[m
+[1mindex 0000000..d09d944[m
+[1m--- /dev/null[m
+[1m+++ b/src/services/emailService.ts[m
+[36m@@ -0,0 +1,396 @@[m
+[32m+[m[32m/**[m
+[32m+[m[32m * services/emailService.ts[m
+[32m+[m[32m *[m
+[32m+[m[32m * Transactional emails for PeakInsights DMS.[m
+[32m+[m[32m *[m
+[32m+[m[32m * Account creation is CEO-only — there is no self-registration or[m
+[32m+[m[32m * approval workflow. Accounts are created directly by the CEO and[m
+[32m+[m[32m * are immediately active. There are therefore no pending / approved /[m
+[32m+[m[32m * rejected account emails.[m
+[32m+[m[32m *[m
+[32m+[m[32m * Events covered:[m
+[32m+[m[32m *   - Account created by CEO (user or supervisor, includes temp password)[m
+[32m+[m[32m *   - Password reset request[m
+[32m+[m[32m *   - Password changed notification[m
+[32m+[m[32m *   - Task assigned[m
+[32m+[m[32m *   - Task completed[m
+[32m+[m[32m *   - Task collaboration invitation[m
+[32m+[m[32m *   - New message notification[m
+[32m+[m[32m */[m
+[32m+[m
+[32m+[m[32mimport nodemailer, { SentMessageInfo, Transporter } from 'nodemailer';[m
+[32m+[m
+[32m+[m[32minterface DirectEmailOptions {[m
+[32m+[m[32m  toEmail: string;[m
+[32m+[m[32m  toName?: string;[m
+[32m+[m[32m  fromName?: string;[m
+[32m+[m[32m  fromEmail?: string;[m
+[32m+[m[32m  subject: string;[m
+[32m+[m[32m  body: string;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ─── Transport ────────────────────────────────────────────────────[m
+[32m+[m
+[32m+[m[32mlet transporter: Transporter | null = null;[m
+[32m+[m
+[32m+[m[32mfunction getTransporter(): Transporter | null {[m
+[32m+[m[32m  if (transporter) return transporter;[m
+[32m+[m
+[32m+[m[32m  const host = process.env.SMTP_HOST;[m
+[32m+[m[32m  const port = process.env.SMTP_PORT;[m
+[32m+[m[32m  const user = process.env.SMTP_USER;[m
+[32m+[m[32m  const pass = process.env.SMTP_PASS;[m
+[32m+[m
+[32m+[m[32m  if (!host || !port || !user || !pass) {[m
+[32m+[m[32m    console.warn('⚠️  SMTP not configured — emails will be skipped');[m
+[32m+[m[32m    return null;[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  transporter = nodemailer.createTransport({[m
+[32m+[m[32m    host,[m
+[32m+[m[32m    port: Number(port),[m
+[32m+[m[32m    secure: Number(port) === 465,   // true for 465, false for 587/25[m
+[32m+[m[32m    auth: { user, pass },[m
+[32m+[m[32m  });[m
+[32m+[m
+[32m+[m[32m  return transporter;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ─── Helpers ──────────────────────────────────────────────────────[m
+[32m+[m
+[32m+[m[32mconst FROM    = `"PeakInsights" <${process.env.SMTP_USER ?? 'noreply@peakinsights.com'}>`;[m
+[32m+[m[32mconst APP_URL = process.env.FRONTEND_URL ?? 'http://localhost:5173';[m
+[32m+[m
+[32m+[m[32m/** Send a single email. Never throws — logs on failure. */[m
+[32m+[m[32masync function send([m
+[32m+[m[32m  to: string,[m
+[32m+[m[32m  subject: string,[m
+[32m+[m[32m  html: string,[m
+[32m+[m[32m  replyTo?: string[m
+[32m+[m[32m): Promise<SentMessageInfo | null> {[m
+[32m+[m[32m  const t = getTransporter();[m
+[32m+[m[32m  if (!t) return null;[m
+[32m+[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    const info = await t.sendMail({ from: FROM, to, subject, html, replyTo });[m
+[32m+[m
+[32m+[m[32m    console.log(`📧 Email sent → ${to}: ${subject}`);[m
+[32m+[m[32m    return info; // ✅ IMPORTANT[m
+[32m+[m[32m  } catch (err) {[m
+[32m+[m[32m    console.error(`❌ Email failed → ${to}: ${subject}`, err);[m
+[32m+[m[32m    return null;[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ─── HTML wrapper ─────────────────────────────────────────────────[m
+[32m+[m
+[32m+[m[32mfunction wrap(title: string, body: string): string {[m
+[32m+[m[32m  return `<!DOCTYPE html>[m
+[32m+[m[32m<html lang="en">[m
+[32m+[m[32m<head>[m
+[32m+[m[32m<meta charset="UTF-8" />[m
+[32m+[m[32m<meta name="viewport" content="width=device-width, initial-scale=1.0" />[m
+[32m+[m[32m<title>${title}</title>[m
+[32m+[m[32m</head>[m
+[32m+[m[32m<body style="margin:0;padding:0;background:#f1f5f9;font-family:'Segoe UI',Arial,sans-serif;">[m
+[32m+[m[32m  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:40px 16px;">[m
+[32m+[m[32m    <tr><td align="center">[m
+[32m+[m[32m      <table width="600" cellpadding="0" cellspacing="0"[m
+[32m+[m[32m             style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08);">[m
+[32m+[m[32m        <tr>[m
+[32m+[m[32m          <td style="background:linear-gradient(135deg,#0ea5e9,#7c3aed);padding:28px 32px;">[m
+[32m+[m[32m            <p style="margin:0;font-size:22px;font-weight:700;color:#fff;letter-spacing:-.5px;">⚡ PeakInsights</p>[m
+[32m+[m[32m            <p style="margin:4px 0 0;font-size:13px;color:rgba(255,255,255,.75);">Document Management System</p>[m
+[32m+[m[32m          </td>[m
+[32m+[m[32m        </tr>[m
+[32m+[m[32m        <tr>[m
+[32m+[m[32m          <td style="padding:32px;">${body}</td>[m
+[32m+[m[32m        </tr>[m
+[32m+[m[32m        <tr>[m
+[32m+[m[32m          <td style="padding:20px 32px;border-top:1px solid #f1f5f9;background:#f8fafc;">[m
+[32m+[m[32m            <p style="margin:0;font-size:12px;color:#94a3b8;line-height:1.6;">[m
+[32m+[m[32m              This email was sent by PeakInsights DMS. If you didn't expect this, you can safely ignore it.<br />[m
+[32m+[m[32m              © ${new Date().getFullYear()} PeakInsights. All rights reserved.[m
+[32m+[m[32m            </p>[m
+[32m+[m[32m          </td>[m
+[32m+[m[32m        </tr>[m
+[32m+[m[32m      </table>[m
+[32m+[m[32m    </td></tr>[m
+[32m+[m[32m  </table>[m
+[32m+[m[32m</body>[m
+[32m+[m[32m</html>`;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mconst h1  = (t: string) => `<h1 style="margin:0 0 8px;font-size:22px;font-weight:700;color:#0f172a;">${t}</h1>`;[m
+[32m+[m[32mconst p   = (t: string) => `<p style="margin:0 0 16px;font-size:15px;color:#334155;line-height:1.7;">${t}</p>`;[m
+[32m+[m[32mconst btn = (text: string, href: string, color = '#0ea5e9') =>[m
+[32m+[m[32m  `<a href="${href}" style="display:inline-block;margin:8px 0 20px;padding:12px 28px;background:${color};color:#fff;font-size:14px;font-weight:600;border-radius:8px;text-decoration:none;">${text}</a>`;[m
+[32m+[m[32mconst info = (label: string, value: string) =>[m
+[32m+[m[32m  `<p style="margin:4px 0;font-size:14px;color:#475569;"><strong style="color:#0f172a;">${label}:</strong> ${value}</p>`;[m
+[32m+[m[32mconst highlight = (text: string) =>[m
+[32m+[m[32m  `<div style="background:#f0f9ff;border-left:4px solid #0ea5e9;border-radius:4px;padding:12px 16px;margin:16px 0;font-size:14px;color:#0369a1;">${text}</div>`;[m
+[32m+[m
+[32m+[m[32m// ═════════════════════════════════════════════════════════════════[m
+[32m+[m[32m// ACCOUNT — CEO creation only[m
+[32m+[m[32m// There is no self-registration, pending approval, or rejection flow.[m
+[32m+[m[32m// The CEO creates accounts directly; they are immediately active.[m
+[32m+[m[32m// ═════════════════════════════════════════════════════════════════[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Sent when the CEO creates a user or supervisor account directly.[m
+[32m+[m[32m * Includes the temporary password so the recipient can log in immediately.[m
+[32m+[m[32m */[m
+[32m+[m[32mexport async function sendAccountCreatedByCEOEmail([m
+[32m+[m[32m  to: string,[m
+[32m+[m[32m  name: string,[m
+[32m+[m[32m  temporaryPassword: string,[m
+[32m+[m[32m  role: 'user' | 'supervisor',[m
+[32m+[m[32m  fromEmail?: string[m
+[32m+[m[32m): Promise<void> {[m
+[32m+[m[32m  await send([m
+[32m+[m[32m    to,[m
+[32m+[m[32m    'Your PeakInsights account is ready',[m
+[32m+[m[32m    wrap('Account Created', `[m
+[32m+[m[32m      ${h1('Welcome to PeakInsights, ' + name + '!')}[m
+[32m+[m[32m      ${p('The CEO has created a <strong>' + role + '</strong> account for you. Your account is active immediately.')}[m
+[32m+[m[32m      ${info('Email', to)}[m
+[32m+[m[32m      ${highlight([m
+[32m+[m[32m        '<strong>Temporary password:</strong> ' +[m
+[32m+[m[32m        `<code style="font-size:16px;letter-spacing:2px;">${temporaryPassword}</code>` +[m
+[32m+[m[32m        '<br/><br/>Please change your password after your first login.'[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      ${btn('Log in Now', `${APP_URL}/login`, '#7c3aed')}[m
+[32m+[m[32m    `),[m
+[32m+[m[32m    fromEmail[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ═════════════════════════════════════════════════════════════════[m
+[32m+[m[32m// PASSWORD[m
+[32m+[m[32m// ═════════════════════════════════════════════════════════════════[m
+[32m+[m
+[32m+[m[32m/** Sent when a user requests a password reset link. */[m
+[32m+[m[32mexport async function sendPasswordResetEmail([m
+[32m+[m[32m  to: string,[m
+[32m+[m[32m  name: string,[m
+[32m+[m[32m  resetToken: string,[m
+[32m+[m[32m  fromEmail?: string[m
+[32m+[m[32m): Promise<void> {[m
+[32m+[m[32m  const resetUrl = `${APP_URL}/reset-password?token=${resetToken}&email=${encodeURIComponent(to)}`;[m
+[32m+[m[32m  await send([m
+[32m+[m[32m    to,[m
+[32m+[m[32m    'Reset your PeakInsights password',[m
+[32m+[m[32m    wrap('Password Reset', `[m
+[32m+[m[32m      ${h1('Password Reset Request')}[m
+[32m+[m[32m      ${p('Hi ' + name + ', we received a request to reset your PeakInsights password.')}[m
+[32m+[m[32m      ${btn('Reset My Password', resetUrl)}[m
+[32m+[m[32m      ${highlight('This link expires in <strong>1 hour</strong>. If you didn\'t request this, you can safely ignore this email.')}[m
+[32m+[m[32m    `),[m
+[32m+[m[32m    fromEmail[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/** Sent after a successful password change (via change-password endpoint). */[m
+[32m+[m[32mexport async function sendPasswordChangedEmail([m
+[32m+[m[32m  to: string,[m
+[32m+[m[32m  name: string,[m
+[32m+[m[32m  fromEmail?: string[m
+[32m+[m[32m): Promise<void> {[m
+[32m+[m[32m  await send([m
+[32m+[m[32m    to,[m
+[32m+[m[32m    'Your PeakInsights password was changed',[m
+[32m+[m[32m    wrap('Password Changed', `[m
+[32m+[m[32m      ${h1('Password Changed')}[m
+[32m+[m[32m      ${p('Hi ' + name + ', your password was successfully updated.')}[m
+[32m+[m[32m      ${highlight('If you didn\'t make this change, please contact your administrator immediately.')}[m
+[32m+[m[32m      ${btn('Log in', `${APP_URL}/login`)}[m
+[32m+[m[32m    `),[m
+[32m+[m[32m    fromEmail[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ═════════════════════════════════════════════════════════════════[m
+[32m+[m[32m// TASKS[m
+[32m+[m[32m// ═════════════════════════════════════════════════════════════════[m
+[32m+[m
+[32m+[m[32minterface TaskEmailData {[m
+[32m+[m[32m  assigneeName:    string;[m
+[32m+[m[32m  assigneeTo:      string;[m
+[32m+[m[32m  assignerName:    string;[m
+[32m+[m[32m  taskTitle:       string;[m
+[32m+[m[32m  taskDescription?: string;[m
+[32m+[m[32m  priority:        string;[m
+[32m+[m[32m  dueDate?:        string;[m
+[32m+[m[32m  taskId:          string;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/** Sent to the assignee when a task is created and assigned to them. */[m
+[32m+[m[32mexport async function sendTaskAssignedEmail(data: TaskEmailData, fromEmail?: string): Promise<void> {[m
+[32m+[m[32m  const priorityColor: Record<string, string> = {[m
+[32m+[m[32m    low: '#64748b', medium: '#0ea5e9', high: '#f59e0b', critical: '#ef4444',[m
+[32m+[m[32m  };[m
+[32m+[m[32m  await send([m
+[32m+[m[32m    data.assigneeTo,[m
+[32m+[m[32m    `📋 New task assigned: "${data.taskTitle}"`,[m
+[32m+[m[32m    wrap('Task Assigned', `[m
+[32m+[m[32m      ${h1('You have a new task')}[m
+[32m+[m[32m      ${p('Hi ' + data.assigneeName + ', ' + data.assignerName + ' has assigned you a new task.')}[m
+[32m+[m[32m      ${info('Task', data.taskTitle)}[m
+[32m+[m[32m      ${data.taskDescription ? info('Description', data.taskDescription) : ''}[m
+[32m+[m[32m      ${info('Priority',[m
+[32m+[m[32m        `<span style="color:${priorityColor[data.priority] ?? '#0f172a'};font-weight:600;text-transform:uppercase;">${data.priority}</span>`[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      ${data.dueDate ? info('Due date', data.dueDate) : ''}[m
+[32m+[m[32m      ${highlight('When you\'re ready to start, open the task and set your <strong>target completion time</strong>. This becomes your personal commitment for appraisal.')}[m
+[32m+[m[32m      ${btn('View Task', `${APP_URL}/workspace/tasks`)}[m
+[32m+[m[32m    `),[m
+[32m+[m[32m    fromEmail[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/** Sent to the assigner when the task is completed by the assignee. */[m
+[32m+[m[32mexport async function sendTaskCompletedEmail([m
+[32m+[m[32m  to: string,[m
+[32m+[m[32m  assignerName: string,[m
+[32m+[m[32m  taskTitle: string,[m
+[32m+[m[32m  assigneeName: string,[m
+[32m+[m[32m  efficiencyRatio?: number,[m
+[32m+[m[32m  fromEmail?: string[m
+[32m+[m[32m): Promise<void> {[m
+[32m+[m[32m  const effStr = efficiencyRatio != null[m
+[32m+[m[32m    ? `<br/>Efficiency ratio: <strong>${efficiencyRatio.toFixed(3)}×</strong> (${efficiencyRatio >= 1 ? '✅ on or ahead of target' : '⚠️ over target'})`[m
+[32m+[m[32m    : '';[m
+[32m+[m[32m  await send([m
+[32m+[m[32m    to,[m
+[32m+[m[32m    `✅ Task completed: "${taskTitle}"`,[m
+[32m+[m[32m    wrap('Task Completed', `[m
+[32m+[m[32m      ${h1('Task Completed')}[m
+[32m+[m[32m      ${p('Hi ' + assignerName + ', ' + assigneeName + ' has completed the task.')}[m
+[32m+[m[32m      ${info('Task', taskTitle)}[m
+[32m+[m[32m      ${highlight(assigneeName + ' finished the task.' + effStr)}[m
+[32m+[m[32m      ${btn('View Task Details', `${APP_URL}/tasks`)}[m
+[32m+[m[32m    `),[m
+[32m+[m[32m    fromEmail[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m/** Sent to the invitee when they are added as a task collaborator. */[m
+[32m+[m[32mexport async function sendTaskCollaborationInviteEmail([m
+[32m+[m[32m  to: string,[m
+[32m+[m[32m  inviteeName: string,[m
+[32m+[m[32m  inviterName: string,[m
+[32m+[m[32m  taskTitle: string,[m
+[32m+[m[32m  fromEmail?: string[m
+[32m+[m[32m): Promise<void> {[m
+[32m+[m[32m  await send([m
+[32m+[m[32m    to,[m
+[32m+[m[32m    `🤝 You've been invited to collaborate on "${taskTitle}"`,[m
+[32m+[m[32m    wrap('Collaboration Invite', `[m
+[32m+[m[32m      ${h1('Collaboration Invitation')}[m
+[32m+[m[32m      ${p('Hi ' + inviteeName + ', ' + inviterName + ' has invited you to help with a task.')}[m
+[32m+[m[32m      ${info('Task', taskTitle)}[m
+[32m+[m[32m      ${highlight('Your access to the linked document will be <strong>automatically revoked</strong> once the task is completed or cancelled.')}[m
+[32m+[m[32m      ${btn('View the Task', `${APP_URL}/workspace/tasks`)}[m
+[32m+[m[32m    `),[m
+[32m+[m[32m    fromEmail[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m// ═════════════════════════════════════════════════════════════════[m
+[32m+[m[32m// MESSAGES[m
+[32m+[m[32m// ═════════════════════════════════════════════════════════════════[m
+[32m+[m
+[32m+[m[32m/** Sent when a user receives a new direct message. */[m
+[32m+[m[32mexport async function sendNewMessageEmail([m
+[32m+[m[32m  to: string,[m
+[32m+[m[32m  recipientName: string,[m
+[32m+[m[32m  senderName: string,[m
+[32m+[m[32m  subject?: string,[m
+[32m+[m[32m  bodyPreview?: string,[m
+[32m+[m[32m  fromEmail?: string[m
+[32m+[m[32m): Promise<void> {[m
+[32m+[m[32m  await send([m
+[32m+[m[32m    to,[m
+[32m+[m[32m    `💬 New message from ${senderName}${subject ? ': ' + subject : ''}`,[m
+[32m+[m[32m    wrap('New Message', `[m
+[32m+[m[32m      ${h1('New message from ' + senderName)}[m
+[32m+[m[32m      ${p('Hi ' + recipientName + ', you have a new message in PeakInsights.')}[m
+[32m+[m[32m      ${subject ? info('Subject', subject) : ''}[m
+[32m+[m[32m      ${bodyPreview[m
+[32m+[m[32m        ? highlight('"' + bodyPreview.slice(0, 200) + (bodyPreview.length > 200 ? '…' : '') + '"')[m
+[32m+[m[32m        : ''}[m
+[32m+[m[32m      ${btn('Read & Reply', `${APP_URL}/workspace/messages`)}[m
+[32m+[m[32m    `),[m
+[32m+[m[32m    fromEmail[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m
+[32m+[m[32m// ═════════════════════════════════════════════════════════════════[m
+[32m+[m[32m// DIRECT USER EMAIL[m
+[32m+[m[32m// ═════════════════════════════════════════════════════════════════[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Sends a direct email composed by a user (not a system notification).[m
+[32m+[m[32m */[m
+[32m+[m
+[32m+[m[32mexport async function sendDirectUserEmail(options: DirectEmailOptions): Promise<{ messageId?: string }> {[m
+[32m+[m[32m  const {[m
+[32m+[m[32m    toEmail,[m
+[32m+[m[32m    toName,[m
+[32m+[m[32m    fromName = 'A colleague',[m
+[32m+[m[32m    fromEmail = '',[m
+[32m+[m[32m    subject,[m
+[32m+[m[32m    body,[m
+[32m+[m[32m  } = options;[m
+[32m+[m
+[32m+[m[32m  const MAX_SUBJECT_LENGTH = 150;[m
+[32m+[m[32m  const MAX_BODY_LENGTH = 5000;[m
+[32m+[m
+[32m+[m[32m  const safeSubject = subject.slice(0, MAX_SUBJECT_LENGTH);[m
+[32m+[m[32m  const trimmedBody = body.slice(0, MAX_BODY_LENGTH);[m
+[32m+[m
+[32m+[m[32m  function escapeHtml(input: string): string {[m
+[32m+[m[32m    return input[m
+[32m+[m[32m      .replace(/&/g, '&amp;')[m
+[32m+[m[32m      .replace(/</g, '&lt;')[m
+[32m+[m[32m      .replace(/>/g, '&gt;')[m
+[32m+[m[32m      .replace(/"/g, '&quot;')[m
+[32m+[m[32m      .replace(/'/g, '&#039;');[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  const safeBody = escapeHtml(trimmedBody).replace(/\n/g, '<br/>');[m
+[32m+[m
+[32m+[m[32m  const senderLine = fromEmail[m
+[32m+[m[32m    ? `${fromName} (${fromEmail})`[m
+[32m+[m[32m    : fromName;[m
+[32m+[m
+[32m+[m[32m  // ✅ Audit log[m
+[32m+[m[32m  console.log('📨 Direct Email Sent', {[m
+[32m+[m[32m    to: toEmail,[m
+[32m+[m[32m    from: fromEmail,[m
+[32m+[m[32m    subject: safeSubject,[m
+[32m+[m[32m    timestamp: new Date().toISOString(),[m
+[32m+[m[32m  });[m
+[32m+[m
+[32m+[m[32m  const result = await send([m
+[32m+[m[32m    toEmail,[m
+[32m+[m[32m    safeSubject,[m
+[32m+[m[32m    wrap('New Email Message', `[m
+[32m+[m[32m      ${h1('New message for ' + (toName ?? 'you'))}[m
+[32m+[m[32m      ${p('<strong>From:</strong> ' + senderLine)}[m
+[32m+[m[32m      ${p(safeBody)}[m
+[32m+[m[32m      ${highlight('Reply directly to respond to the sender.')}[m
+[32m+[m[32m    `),[m
+[32m+[m[32m    fromEmail || undefined[m[41m [m
+[32m+[m[32m  );[m
+[32m+[m
+[32m+[m[32m  if (!result?.messageId) {[m
+[32m+[m[32m    console.error('Email failed: SMTP rejected sender or send failed');[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  return {[m
+[32m+[m[32m    messageId: result?.messageId,[m
+[32m+[m[32m  };[m
+[32m+[m
+[32m+[m[32m}[m
+\ No newline at end of file[m
+[1mdiff --git a/src/services/emailWorkflowService.ts b/src/services/emailWorkflowService.ts[m
+[1mnew file mode 100644[m
+[1mindex 0000000..0cd7bb7[m
+[1m--- /dev/null[m
+[1m+++ b/src/services/emailWorkflowService.ts[m
+[36m@@ -0,0 +1,82 @@[m
+[32m+[m[32mimport { EmailLog } from '../models/EmailLog';[m
+[32m+[m[32mimport { sendDirectUserEmail } from './emailService';[m
+[32m+[m[32mimport { AuditLog } from '../models/AuditLog';[m
+[32m+[m
+[32m+[m[32mexport async function sendTrackedEmail({[m
+[32m+[m[32m  senderId,[m
+[32m+[m[32m  receiverId,[m
+[32m+[m[32m  receiverEmail,[m
+[32m+[m[32m  receiverName,[m
+[32m+[m[32m  senderName,[m
+[32m+[m[32m  senderEmail,[m
+[32m+[m[32m  subject,[m
+[32m+[m[32m  body,[m
+[32m+[m[32m  ipAddress,[m
+[32m+[m[32m  userAgent,[m
+[32m+[m[32m  supervisorId,[m
+[32m+[m[32m}: any) {[m
+[32m+[m
+[32m+[m[32m  // 1. create log FIRST[m
+[32m+[m[32m  const log = await EmailLog.create({[m
+[32m+[m[32m    senderId,[m
+[32m+[m[32m    receiverId,[m
+[32m+[m[32m    toEmail: receiverEmail,[m
+[32m+[m[32m    subject,[m
+[32m+[m[32m    body,[m
+[32m+[m[32m    bodyPreview: body.slice(0, 200),[m
+[32m+[m[32m    status: 'pending',[m
+[32m+[m[32m  });[m
+[32m+[m
+[32m+[m[32m  try {[m
+[32m+[m[32m    // 2. send email[m
+[32m+[m[32m    const result = await sendDirectUserEmail({[m
+[32m+[m[32m      toEmail: receiverEmail,[m
+[32m+[m[32m      toName: receiverName,[m
+[32m+[m[32m      fromName: senderName,[m
+[32m+[m[32m      fromEmail: senderEmail,[m
+[32m+[m[32m      subject,[m
+[32m+[m[32m      body,[m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m    // 3. mark success[m
+[32m+[m[32m    await EmailLog.findByIdAndUpdate(log._id, {[m
+[32m+[m[32m      status: 'sent',[m
+[32m+[m[32m      sentAt: new Date(),[m
+[32m+[m[32m      messageId: result?.messageId,[m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m    // 4. audit success[m
+[32m+[m[32m    await AuditLog.create({[m
+[32m+[m[32m      actorId: senderId,[m
+[32m+[m[32m      action: 'email_sent',[m
+[32m+[m[32m      targetUserId: receiverId,[m
+[32m+[m[32m      supervisorIdAtTime: supervisorId,[m
+[32m+[m[32m      details: { toEmail: receiverEmail, subject },[m
+[32m+[m[32m      ipAddress,[m
+[32m+[m[32m      userAgent,[m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m    return { success: true, logId: log._id, messageId: result?.messageId };[m
+[32m+[m
+[32m+[m[32m  } catch (err: any) {[m
+[32m+[m
+[32m+[m[32m    // 5. mark failure[m
+[32m+[m[32m    await EmailLog.findByIdAndUpdate(log._id, {[m
+[32m+[m[32m      status: 'failed',[m
+[32m+[m[32m      error: err.message,[m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m    // 6. audit failure[m
+[32m+[m[32m    await AuditLog.create({[m
+[32m+[m[32m      actorId: senderId,[m
+[32m+[m[32m      action: 'email_failed',[m
+[32m+[m[32m      targetUserId: receiverId,[m
+[32m+[m[32m      supervisorIdAtTime: supervisorId,[m
+[32m+[m[32m      details: { toEmail: receiverEmail, subject, error: err.message },[m
+[32m+[m[32m      ipAddress,[m
+[32m+[m[32m      userAgent,[m
+[32m+[m[32m    });[m
+[32m+[m
+[32m+[m[32m    throw err;[m
+[32m+[m[32m  }[m
+[32m+[m[32m}[m
+\ No newline at end of file[m
+[1mdiff --git a/src/services/notificationService.ts b/src/services/notificationService.ts[m
+[1mindex e978e3c..e05db45 100644[m
+[1m--- a/src/services/notificationService.ts[m
+[1m+++ b/src/services/notificationService.ts[m
+[36m@@ -1,4 +1,5 @@[m
+[31m-import Notification from '../models/Notification';[m
+[32m+[m[32mimport Notification, { INotification } from '../models/Notification';[m
+[32m+[m[32mimport { Types } from 'mongoose';[m
+ [m
+ /**[m
+  * Creates a persistent notification in the database and, if the[m
+[36m@@ -10,28 +11,42 @@[m [mimport Notification from '../models/Notification';[m
+ export const createNotification = async ([m
+   userId: string,[m
+   message: string,[m
+[31m-  type: string[m
+[31m-): Promise<void> => {[m
+[32m+[m[32m  type: string,[m
+[32m+[m[32m  meta?: Record<string, any>[m
+[32m+[m[32m): Promise<INotification | null> => {[m
+[32m+[m[32m  if (!userId || !message || !type) {[m
+[32m+[m[32m    throw new Error('Invalid notification payload');[m
+[32m+[m[32m  }[m
+[32m+[m
+   try {[m
+[31m-    const notification = await Notification.create({ userId, message, type });[m
+[32m+[m[32m    const notification = await Notification.create({[m
+[32m+[m[32m      userId: new Types.ObjectId(userId),[m[41m [m
+[32m+[m[32m      message,[m
+[32m+[m[32m      type,[m
+[32m+[m[32m      meta,[m
+[32m+[m[32m      read: false,[m
+[32m+[m[32m    });[m
+ [m
+[31m-    // Real-time delivery — safe to fail silently (socket may not be[m
+[31m-    // initialised in test environments)[m
+     try {[m
+       const { getIO } = await import('../socket/socketServer');[m
+[31m-      const io = getIO();[m
+[31m-      io.to(`user:${userId}`).emit('notification', {[m
+[31m-        _id:     notification._id,[m
+[31m-        message,[m
+[31m-        type,[m
+[31m-        read:    false,[m
+[31m-        createdAt: notification.createdAt,[m
+[31m-      });[m
+[32m+[m[32m      const io = getIO?.();[m
+[32m+[m
+[32m+[m[32m      if (io) {[m
+[32m+[m[32m        io.to(`user:${userId}`).emit('notification', {[m
+[32m+[m[32m          _id: notification._id,[m
+[32m+[m[32m          message,[m
+[32m+[m[32m          type,[m
+[32m+[m[32m          read: false,[m
+[32m+[m[32m          createdAt: notification.createdAt,[m
+[32m+[m[32m        });[m
+[32m+[m[32m      }[m
+     } catch {[m
+[31m-      // Socket not available — notification still persisted in DB[m
+[32m+[m[32m      // socket optional[m
+     }[m
+[32m+[m
+[32m+[m[32m    return notification;[m
+   } catch (err) {[m
+[31m-    // Never let notification failures crash the calling operation[m
+     console.error('[Notification] Failed to create notification:', err);[m
+[32m+[m[32m    return null;[m
+   }[m
+ };[m
+\ No newline at end of file[m
+[1mdiff --git a/src/types/index.ts b/src/types/index.ts[m
+[1mindex 277c089..f7b1d20 100644[m
+[1m--- a/src/types/index.ts[m
+[1m+++ b/src/types/index.ts[m
+[36m@@ -2,7 +2,7 @@[m [mexport type UserRole = 'ceo' | 'supervisor' | 'user';[m
+ export type AccountStatus = 'pending' | 'active' | 'rejected' | 'disabled';[m
+ export type DocumentStatus = 'draft' | 'in_progress' | 'pending_completion' | 'completed' | 'archived';[m
+ export type DocumentPriority = 'low' | 'medium' | 'high' | 'critical';[m
+[31m-export type AuditAction = 'created' | 'viewed' | 'edited' | 'submitted' | 'completed' | 'invited' | 'access_revoked' | 'deleted' | 'downloaded';[m
+[32m+[m[32mexport type AuditAction = 'created' | 'viewed' | 'edited' | 'submitted' | 'completed' | 'invited' | 'access_revoked' | 'deleted' | 'downloaded' | 'email_sent';[m
+ export type MappingStatus = 'active' | 'historical';[m
+ [m
+ export interface JwtPayload {[m
+[1mdiff --git a/src/utils/emailService.ts b/src/utils/emailService.ts[m
+[1mdeleted file mode 100644[m
+[1mindex 41f6e7f..0000000[m
+[1m--- a/src/utils/emailService.ts[m
+[1m+++ /dev/null[m
+[36m@@ -1,28 +0,0 @@[m
+[31m-import nodemailer from "nodemailer";[m
+[31m-[m
+[31m-const transporter = nodemailer.createTransport({[m
+[31m-[m
+[31m-  host: process.env.SMTP_HOST,[m
+[31m-  port: Number(process.env.SMTP_PORT),[m
+[31m-[m
+[31m-  auth: {[m
+[31m-    user: process.env.SMTP_USER,[m
+[31m-    pass: process.env.SMTP_PASS[m
+[31m-  }[m
+[31m-[m
+[31m-});[m
+[31m-[m
+[31m-export const sendEmail = async ([m
+[31m-  to: string,[m
+[31m-  subject: string,[m
+[31m-  text: string[m
+[31m-) => {[m
+[31m-[m
+[31m-  await transporter.sendMail({[m
+[31m-    from: process.env.SMTP_USER,[m
+[31m-    to,[m
+[31m-    subject,[m
+[31m-    text[m
+[31m-  });[m
+[31m-[m
+[31m-};[m
+\ No newline at end of file[m

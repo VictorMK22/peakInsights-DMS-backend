@@ -406,7 +406,9 @@ export const getEmailAnalytics = async (
 ) => {
   try {
     const match =
-      req.user?.role === "ceo" ? {} : { senderId: req.user!.userId };
+      req.user?.role === "ceo" || req.user?.role === "tech"
+        ? {}
+        : { senderId: req.user!.userId };
 
     const stats = await EmailLog.aggregate([
       { $match: match },

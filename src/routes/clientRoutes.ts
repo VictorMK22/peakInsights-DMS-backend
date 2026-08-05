@@ -23,6 +23,8 @@ import {
   createClientMeeting,
   updateClientMeeting,
   deleteClientMeeting,
+  getClientScheduledMeetings,
+  getClientMeetingActivityFeed,
   getClientCalls,
   createClientCall,
   deleteClientCall,
@@ -79,10 +81,15 @@ router.post("/:id/notes", createClientNote);
 router.delete("/:id/notes/:noteId", deleteClientNote);
 
 // Meetings
+// "/meetings" = manual log (informal, off-system meetings)
+// "/meetings/scheduled" = auto-synced from the Meeting & Calendar module
+// "/meetings/activity" = automatic lifecycle activity trail
 router.get("/:id/meetings", getClientMeetings);
 router.post("/:id/meetings", createClientMeeting);
 router.put("/:id/meetings/:meetingId", updateClientMeeting);
 router.delete("/:id/meetings/:meetingId", deleteClientMeeting);
+router.get("/:id/meetings/scheduled", getClientScheduledMeetings);
+router.get("/:id/meetings/activity", getClientMeetingActivityFeed);
 
 // Calls
 router.get("/:id/calls", getClientCalls);

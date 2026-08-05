@@ -1,6 +1,6 @@
-import { Router } from 'express';
-import { authenticate, authorize } from '../middleware/auth';
-import { uploadToLocal } from '../middleware/upload';
+import { Router } from "express";
+import { authenticate, authorize } from "../middleware/auth";
+import { uploadToLocal } from "../middleware/upload";
 import {
   createTask,
   getTasks,
@@ -13,7 +13,7 @@ import {
   revokeTaskCollaborator,
   getTaskLeaderboard,
   getUserAppraisal,
-} from '../controllers/taskController';
+} from "../controllers/taskController";
 
 /**
  * Tasks — own TAT, efficiency, collaboration, file uploads, document linking.
@@ -33,23 +33,27 @@ const router = Router();
 router.use(authenticate);
 
 // ── Appraisal (before /:id to avoid param collision) ─────────────
-router.get('/analytics/leaderboard',       authorize('ceo', 'supervisor'), getTaskLeaderboard);
-router.get('/analytics/appraisal/:userId', getUserAppraisal);
+router.get(
+  "/analytics/leaderboard",
+  authorize("ceo", "tech", "supervisor"),
+  getTaskLeaderboard,
+);
+router.get("/analytics/appraisal/:userId", getUserAppraisal);
 
 // ── CRUD ──────────────────────────────────────────────────────────
-router.get('/',    getTasks);
+router.get("/", getTasks);
 // CEO/Supervisor can upload briefing files when creating a task.
 // uploadToLocal.any() accepts any field name and any number of files.
-router.post('/',   uploadToLocal.any(), createTask);
+router.post("/", uploadToLocal.any(), createTask);
 
-router.get('/:id',            getTask);
-router.put('/:id',            updateTask);
-router.patch('/:id/status',   updateTaskStatus);
-router.patch('/:id/approve',  approveTask);
-router.delete('/:id',         deleteTask);
+router.get("/:id", getTask);
+router.put("/:id", updateTask);
+router.patch("/:id/status", updateTaskStatus);
+router.patch("/:id/approve", approveTask);
+router.delete("/:id", deleteTask);
 
 // ── Collaboration ─────────────────────────────────────────────────
-router.post('/:id/invite',                           inviteTaskCollaborator);
-router.delete('/:id/collaborators/:collaboratorId',  revokeTaskCollaborator);
+router.post("/:id/invite", inviteTaskCollaborator);
+router.delete("/:id/collaborators/:collaboratorId", revokeTaskCollaborator);
 
 export default router;

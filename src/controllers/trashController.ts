@@ -39,7 +39,7 @@ export const getTrash = async (req: AuthRequest, res: Response) => {
     const role = req.user!.role;
 
     let ownerFilter: Record<string, unknown>;
-    if (role === "ceo") {
+    if (role === "ceo" || role === "tech") {
       ownerFilter = {};
     } else if (role === "supervisor") {
       const maps = await SupervisorMapping.find({

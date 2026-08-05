@@ -1,4 +1,10 @@
-export type UserRole = "ceo" | "supervisor" | "user" | "sales_person";
+export type UserRole =
+  | "ceo"
+  | "supervisor"
+  | "user"
+  | "sales_person"
+  | "accountant"
+  | "tech";
 
 // Shape of the decoded JWT payload — used by middleware/auth.ts and
 // authController.ts wherever the auth token is signed/verified.

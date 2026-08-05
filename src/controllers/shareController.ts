@@ -16,7 +16,7 @@ const canShare = (
   userId: string,
   role: string,
 ): boolean => {
-  if (role === "ceo") return true;
+  if (role === "ceo" || role === "tech") return true;
   if (doc.ownerId.toString() === userId) return true;
   if (role === "supervisor" && doc.documentType === "learning") return true;
   return false;

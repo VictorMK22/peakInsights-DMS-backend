@@ -23,6 +23,20 @@ import filesRoutes from "./routes/files";
 import departmentRoutes from "./routes/departments";
 import trashRoutes from "./routes/trash";
 import learningCategoryRoutes from "./routes/learningCategories";
+import meetingRoutes from "./routes/meetings";
+import calendarBlockRoutes from "./routes/calendarBlocks";
+import livekitWebhookRoutes from "./routes/livekitWebhook";
+
+// ── ICT workspace routes ────────────────────────────────────────
+import projectRoutes from "./routes/projects";
+import ticketRoutes from "./routes/tickets";
+import assetRoutes from "./routes/assets";
+import deploymentRoutes from "./routes/deployments";
+import kbRoutes from "./routes/knowledgeBase";
+import securityRoutes from "./routes/security";
+import infrastructureRoutes from "./routes/infrastructure";
+import systemRoutes from "./routes/systems";
+import ictSeedRoutes from "./routes/ictSeed";
 
 dotenv.config();
 
@@ -77,6 +91,19 @@ app.use(
 
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(morgan("dev"));
+
+// Must be mounted before express.json() below: LiveKit signs the
+// exact raw bytes of the request body, and express.json() would
+// otherwise consume the stream and hand this route a parsed object
+// instead of the raw buffer verifyWebhookEvent() needs. LiveKit sends
+// Content-Type: application/webhook+json specifically so it's never
+// accidentally caught by a generic `application/json` parser either.
+app.use(
+  "/webhooks/livekit",
+  express.raw({ type: "application/webhook+json", limit: "1mb" }),
+  livekitWebhookRoutes,
+);
+
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -116,6 +143,17 @@ app.use("/api/files", filesRoutes);
 app.use("/api/departments", departmentRoutes);
 app.use("/api/trash", trashRoutes);
 app.use("/api/learning-categories", learningCategoryRoutes);
+app.use("/api/meetings", meetingRoutes);
+app.use("/api/calendar-blocks", calendarBlockRoutes);
+app.use("/api/projects", projectRoutes);
+app.use("/api/tickets", ticketRoutes);
+app.use("/api/assets", assetRoutes);
+app.use("/api/deployments", deploymentRoutes);
+app.use("/api/knowledge-base", kbRoutes);
+app.use("/api/security", securityRoutes);
+app.use("/api/infrastructure", infrastructureRoutes);
+app.use("/api/systems", systemRoutes);
+app.use("/api/ict-seed", ictSeedRoutes);
 
 // ── Health check ──────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {

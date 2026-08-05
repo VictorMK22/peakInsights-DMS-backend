@@ -117,7 +117,7 @@ export const disconnectZoho = async (req: AuthRequest, res: Response) => {
 // the team has actually connected their mailbox, since this whole feature
 // depends on opt-in — visibility of *coverage*, not just of messages.
 export const getAllIntegrations = async (req: AuthRequest, res: Response) => {
-  if (req.user!.role !== "ceo") {
+  if (req.user!.role !== "ceo" && req.user!.role !== "tech") {
     return res.status(403).json({ success: false, message: "CEO only" });
   }
   const integrations = await EmailIntegrationModel.find()

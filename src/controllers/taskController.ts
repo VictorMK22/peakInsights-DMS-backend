@@ -38,6 +38,7 @@ const canViewTask = (
   role: string,
 ): boolean =>
   role === "ceo" ||
+  role === "tech" ||
   idOf(task.assignedBy) === userId ||
   idOf(task.assignedTo) === userId ||
   task.collaborators.some(
@@ -96,7 +97,7 @@ export const createTask = async (
     const role = req.user!.role;
     const actorId = req.user!.userId;
 
-    if (role === "user") {
+    if (role === "user" || role === "accountant") {
       res
         .status(403)
         .json({ success: false, message: "Users cannot assign tasks" });
@@ -236,7 +237,7 @@ export const getTasks = async (
     if (status) filter["status"] = status;
     if (priority) filter["priority"] = priority;
 
-    if (role === "user") {
+    if (role === "user" || role === "accountant") {
       filter["$or"] = [
         { assignedTo: userId },
         {
@@ -326,7 +327,7 @@ export const updateTask = async (
 
     const isAssigner = task.assignedBy.toString() === req.user!.userId;
     const isAssignee = task.assignedTo.toString() === req.user!.userId;
-    const isCEO = req.user!.role === "ceo";
+    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
 
     if (!isAssigner && !isAssignee && !isCEO) {
       res.status(403).json({ success: false, message: "Access denied" });
@@ -395,7 +396,7 @@ export const updateTaskStatus = async (
     const userId = req.user!.userId;
     const isAssignee = task.assignedTo.toString() === userId;
     const isAssigner = task.assignedBy.toString() === userId;
-    const isCEO = req.user!.role === "ceo";
+    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
     const isSupervisor = req.user!.role === "supervisor";
 
     const {
@@ -644,7 +645,7 @@ export const deleteTask = async (
     }
 
     const isAssigner = task.assignedBy.toString() === req.user!.userId;
-    const isCEO = req.user!.role === "ceo";
+    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
 
     if (!isAssigner && !isCEO) {
       res.status(403).json({
@@ -683,7 +684,7 @@ export const inviteTaskCollaborator = async (
     }
 
     const isAssignee = task.assignedTo.toString() === req.user!.userId;
-    const isCEO = req.user!.role === "ceo";
+    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
 
     if (!isAssignee && !isCEO) {
       res.status(403).json({
@@ -924,7 +925,7 @@ export const revokeTaskCollaborator = async (
     }
 
     const isAssignee = task.assignedTo.toString() === req.user!.userId;
-    const isCEO = req.user!.role === "ceo";
+    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
 
     if (!isAssignee && !isCEO) {
       res.status(403).json({
@@ -1034,7 +1035,10 @@ export const getUserAppraisal = async (
   try {
     const { userId } = req.params as { userId: string };
 
-    if (req.user!.role === "user" && req.user!.userId !== userId) {
+    if (
+      (req.user!.role === "user" || req.user!.role === "accountant") &&
+      req.user!.userId !== userId
+    ) {
       res.status(403).json({
         success: false,
         message: "You can only view your own appraisal",
@@ -1156,10 +1160,10 @@ export const approveTask = async (
     const userId = req.user!.userId;
     const role = req.user!.role;
 
-    if (role !== "ceo" && role !== "supervisor") {
+    if (role !== "ceo" && role !== "tech" && role !== "supervisor") {
       res.status(403).json({
         success: false,
-        message: "Only CEO or Supervisor can approve tasks",
+        message: "Only CEO, Tech, or Supervisor can approve tasks",
       });
       return;
     }

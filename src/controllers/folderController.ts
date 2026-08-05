@@ -58,7 +58,7 @@ const canAccessFolder = async (
   userId: string,
   role: string,
 ): Promise<boolean> => {
-  if (role === "ceo") return true;
+  if (role === "ceo" || role === "tech") return true;
   if (folder.ownerId.toString() === userId) return true;
   if (role === "supervisor") {
     const mapping = await SupervisorMapping.findOne({
@@ -201,7 +201,7 @@ export const getStarredFolders = async (req: AuthRequest, res: Response) => {
     const uid = new mongoose.Types.ObjectId(userId);
 
     let ownerFilter: Record<string, unknown>;
-    if (role === "ceo") {
+    if (role === "ceo" || role === "tech") {
       ownerFilter = {};
     } else if (role === "supervisor") {
       const maps = await SupervisorMapping.find({
@@ -238,7 +238,7 @@ export const getRootContents = async (req: AuthRequest, res: Response) => {
 
     let ownerFilter: Record<string, unknown>;
 
-    if (role === "ceo") {
+    if (role === "ceo" || role === "tech") {
       // CEO sees everything
       ownerFilter = {};
     } else if (role === "supervisor") {
@@ -426,12 +426,10 @@ export const updateFolder = async (req: AuthRequest, res: Response) => {
       name: trimmedName,
     });
     if (clash) {
-      res
-        .status(409)
-        .json({
-          success: false,
-          message: "A folder with this name already exists here",
-        });
+      res.status(409).json({
+        success: false,
+        message: "A folder with this name already exists here",
+      });
       return;
     }
 
@@ -451,12 +449,10 @@ export const updateFolder = async (req: AuthRequest, res: Response) => {
     return;
   } catch (err: any) {
     if (err?.code === 11000) {
-      res
-        .status(409)
-        .json({
-          success: false,
-          message: "A folder with this name already exists here",
-        });
+      res.status(409).json({
+        success: false,
+        message: "A folder with this name already exists here",
+      });
       return;
     }
     console.error("updateFolder error:", err);

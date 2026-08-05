@@ -173,9 +173,17 @@ export async function sendAccountCreatedByCEOEmail(
   to: string,
   name: string,
   temporaryPassword: string,
-  role: "user" | "supervisor" | "sales_person",
+  role: "user" | "supervisor" | "sales_person" | "accountant" | "tech",
   fromEmail?: string,
 ): Promise<void> {
+  const roleLabel =
+    role === "sales_person"
+      ? "Sales Person / Business Development Officer"
+      : role === "accountant"
+        ? "Accountant"
+        : role === "tech"
+          ? "Tech / Admin"
+          : role;
   await send(
     to,
     "Your PeakInsights Hub account is ready",
@@ -183,7 +191,7 @@ export async function sendAccountCreatedByCEOEmail(
       "Account Created",
       `
       ${h1("Welcome to PeakInsights Hub, " + name + "!")}
-      ${p("The CEO has created a <strong>" + (role === "sales_person" ? "Sales Person / Business Development Officer" : role) + "</strong> account for you. Your account is active immediately.")}
+      ${p("The CEO has created a <strong>" + roleLabel + "</strong> account for you. Your account is active immediately.")}
       ${info("Email", to)}
       ${highlight(
         "<strong>Temporary password:</strong> " +
@@ -476,4 +484,109 @@ export async function sendDirectUserEmail(
   }
 
   return { messageId: result.messageId };
+}
+
+// ═════════════════════════════════════════════════════════════════
+// MEETINGS & CALENDAR
+// ═════════════════════════════════════════════════════════════════
+
+interface MeetingEmailData {
+  toEmail: string;
+  toName: string;
+  meetingId: string;
+  title: string;
+  organizerName: string;
+  startTime: Date;
+  endTime: Date;
+  location?: string;
+  meetingLink?: string;
+  isRecurring?: boolean;
+  /** True when this recipient has no login (external attendee) — swaps the CTA button for a plain "add to calendar" note instead of a deep link. */
+  isExternal?: boolean;
+}
+
+const formatMeetingWindow = (start: Date, end: Date) =>
+  `${start.toLocaleString([], { dateStyle: "medium", timeStyle: "short" })} – ${end.toLocaleTimeString(
+    [],
+    { timeStyle: "short" },
+  )}`;
+
+/** Sent to every internal + external invitee when a meeting is created. */
+export async function sendMeetingInviteEmail(
+  data: MeetingEmailData,
+  fromEmail?: string,
+): Promise<void> {
+  await send(
+    data.toEmail,
+    `📅 You're invited: "${data.title}"`,
+    wrap(
+      "Meeting Invitation",
+      `
+      ${h1("Meeting Invitation")}
+      ${p("Hi " + data.toName + ", " + data.organizerName + " has invited you to a meeting.")}
+      ${info("Title", data.title)}
+      ${info("When", formatMeetingWindow(data.startTime, data.endTime) + (data.isRecurring ? " (recurring)" : ""))}
+      ${data.location ? info("Location", data.location) : ""}
+      ${data.meetingLink ? info("Meeting link", `<a href="${data.meetingLink}">${data.meetingLink}</a>`) : ""}
+      ${
+        data.isExternal
+          ? highlight(
+              "This invitation was sent to your email address. Please add it to your own calendar — you'll receive an email if it's rescheduled or cancelled.",
+            )
+          : btn("View & Respond", `${APP_URL}/meetings`)
+      }
+    `,
+    ),
+    fromEmail,
+  );
+}
+
+/** Sent when a meeting's time, location, or link changes materially. */
+export async function sendMeetingUpdatedEmail(
+  data: MeetingEmailData,
+  fromEmail?: string,
+): Promise<void> {
+  await send(
+    data.toEmail,
+    `🔄 Updated: "${data.title}"`,
+    wrap(
+      "Meeting Updated",
+      `
+      ${h1("Meeting Updated")}
+      ${p("Hi " + data.toName + ", " + data.organizerName + " updated the meeting details.")}
+      ${info("Title", data.title)}
+      ${info("New time", formatMeetingWindow(data.startTime, data.endTime))}
+      ${data.location ? info("Location", data.location) : ""}
+      ${data.meetingLink ? info("Meeting link", `<a href="${data.meetingLink}">${data.meetingLink}</a>`) : ""}
+      ${
+        data.isExternal
+          ? highlight("Please update your own calendar to match.")
+          : btn("View Meeting", `${APP_URL}/meetings`)
+      }
+    `,
+    ),
+    fromEmail,
+  );
+}
+
+/** Sent when a meeting (or an occurrence of a series) is cancelled. */
+export async function sendMeetingCancelledEmail(
+  data: MeetingEmailData & { reason?: string },
+  fromEmail?: string,
+): Promise<void> {
+  await send(
+    data.toEmail,
+    `❌ Cancelled: "${data.title}"`,
+    wrap(
+      "Meeting Cancelled",
+      `
+      ${h1("Meeting Cancelled")}
+      ${p("Hi " + data.toName + ", " + data.organizerName + " cancelled this meeting.")}
+      ${info("Title", data.title)}
+      ${info("Was scheduled for", formatMeetingWindow(data.startTime, data.endTime))}
+      ${data.reason ? info("Reason", data.reason) : ""}
+    `,
+    ),
+    fromEmail,
+  );
 }

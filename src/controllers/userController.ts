@@ -20,7 +20,7 @@ export const createUserByCEO = async (
 ): Promise<void> => {
   try {
     // Belt-and-suspenders check in addition to route middleware
-    if (req.user?.role !== "ceo") {
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
       res.status(403).json({
         success: false,
         message: "Only the CEO can create user accounts directly",
@@ -86,7 +86,7 @@ export const createSupervisor = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo") {
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
       res.status(403).json({
         success: false,
         message: "Only the CEO can create supervisor accounts",
@@ -158,7 +158,7 @@ export const createSalesPerson = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo") {
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
       res.status(403).json({
         success: false,
         message: "Only the CEO can create sales person accounts",
@@ -220,6 +220,151 @@ export const createSalesPerson = async (
 };
 
 /**
+ * CEO ONLY — creates an accountant account directly. Accountants serve
+ * clients assigned to them by the CEO — both existing clients and
+ * clients won by the sales team — and communicate with those clients
+ * (messages, email, WhatsApp) the same way a sales person or regular
+ * user does, scoped by Client.assignedTo (see clientController.canAccess).
+ */
+export const createAccountant = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
+      res.status(403).json({
+        success: false,
+        message: "Only the CEO can create accountant accounts",
+      });
+      return;
+    }
+
+    const { name, email, password, department } = req.body as {
+      name: string;
+      email: string;
+      password: string;
+      department?: string;
+    };
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      res.status(409).json({
+        success: false,
+        message: "Email already registered",
+      });
+      return;
+    }
+
+    const user = await User.create({
+      name,
+      email,
+      password,
+      role: "accountant",
+      department,
+      createdBy: req.user?.userId,
+      accountStatus: "active",
+      isActive: true,
+      approvedBy: req.user?.userId as unknown as mongoose.Types.ObjectId,
+      approvedAt: new Date(),
+    });
+
+    const token = generateToken(user);
+
+    sendAccountCreatedByCEOEmail(
+      user.email,
+      user.name,
+      password,
+      "accountant",
+    ).catch((err) =>
+      console.error(
+        "❌ sendAccountCreatedByCEOEmail failed (account still created):",
+        err,
+      ),
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Accountant account created",
+      data: { user, token },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * CEO ONLY — creates a "tech" (admin) account. Tech accounts have
+ * near-CEO level access: user management, all clients/documents, and
+ * system configuration (departments, learning categories, email
+ * integrations). See every `role === "ceo" || role === "tech"` check
+ * across the controllers/routes for the exact scope. Tech accounts are
+ * protected from deletion/demotion the same way CEO accounts are.
+ */
+export const createTech = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    if (req.user?.role !== "ceo") {
+      res.status(403).json({
+        success: false,
+        message: "Only the CEO can create tech/admin accounts",
+      });
+      return;
+    }
+
+    const { name, email, password, department } = req.body as {
+      name: string;
+      email: string;
+      password: string;
+      department?: string;
+    };
+
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      res.status(409).json({
+        success: false,
+        message: "Email already registered",
+      });
+      return;
+    }
+
+    const user = await User.create({
+      name,
+      email,
+      password,
+      role: "tech",
+      department,
+      createdBy: req.user?.userId,
+      accountStatus: "active",
+      isActive: true,
+      approvedBy: req.user?.userId as unknown as mongoose.Types.ObjectId,
+      approvedAt: new Date(),
+    });
+
+    const token = generateToken(user);
+
+    sendAccountCreatedByCEOEmail(user.email, user.name, password, "tech").catch(
+      (err) =>
+        console.error(
+          "❌ sendAccountCreatedByCEOEmail failed (account still created):",
+          err,
+        ),
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Tech/admin account created",
+      data: { user, token },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
  * CEO ONLY — promotes an existing normal user to supervisor.
  */
 export const promoteToSupervisor = async (
@@ -228,7 +373,7 @@ export const promoteToSupervisor = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo") {
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
       res
         .status(403)
         .json({ success: false, message: "Only the CEO can promote users" });
@@ -241,10 +386,10 @@ export const promoteToSupervisor = async (
       res.status(404).json({ success: false, message: "User not found" });
       return;
     }
-    if (user.role === "ceo") {
+    if (user.role === "ceo" || user.role === "tech") {
       res
         .status(403)
-        .json({ success: false, message: "Cannot change CEO role" });
+        .json({ success: false, message: "Cannot change CEO/tech role" });
       return;
     }
     if (user.role === "supervisor") {
@@ -426,10 +571,13 @@ export const permanentlyDeleteUser = async (
       return;
     }
 
-    if (user.role === "ceo") {
+    if (user.role === "ceo" || user.role === "tech") {
       res
         .status(403)
-        .json({ success: false, message: "CEO accounts cannot be deleted" });
+        .json({
+          success: false,
+          message: "CEO/tech accounts cannot be deleted",
+        });
       return;
     }
 
@@ -479,7 +627,7 @@ export const assignUserToSupervisor = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo") {
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
       res.status(403).json({
         success: false,
         message: "Only the CEO can assign users to supervisors",
@@ -587,7 +735,7 @@ export const deleteMapping = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo") {
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
       res
         .status(403)
         .json({ success: false, message: "Only the CEO can remove mappings" });
@@ -626,7 +774,7 @@ export const demoteSupervisor = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo") {
+    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
       res.status(403).json({
         success: false,
         message: "Only the CEO can demote supervisors",
@@ -640,10 +788,10 @@ export const demoteSupervisor = async (
       res.status(404).json({ success: false, message: "User not found" });
       return;
     }
-    if (user.role === "ceo") {
+    if (user.role === "ceo" || user.role === "tech") {
       res
         .status(403)
-        .json({ success: false, message: "Cannot demote the CEO" });
+        .json({ success: false, message: "Cannot demote the CEO/tech" });
       return;
     }
     if (user.role !== "supervisor") {

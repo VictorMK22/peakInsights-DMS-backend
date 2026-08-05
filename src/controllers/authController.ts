@@ -11,6 +11,24 @@ import {
   sendPasswordChangedEmail,
 } from "../services/emailService";
 import crypto from "crypto";
+import { SecurityEvent } from "../models/SecurityEvent";
+
+// Best-effort security event logging — never allowed to affect the
+// actual login outcome, so every call site wraps this in a swallowed
+// catch. This is what powers the ICT Security Center's "real" login
+// activity feed instead of it being purely manual/mock data.
+const logSecurityEvent = (data: {
+  type: "login" | "failed_login";
+  actor?: string;
+  actorLabel?: string;
+  detail: string;
+  severity: "info" | "low" | "medium" | "high" | "critical";
+  ipAddress?: string;
+}) => {
+  SecurityEvent.create(data).catch(() => {
+    /* logging must never break auth */
+  });
+};
 
 export const loginValidation = [
   body("email")
@@ -41,7 +59,28 @@ export const login = async (
     }
 
     const { email, password } = req.body as { email: string; password: string };
-    const result = await loginUser(email, password);
+    let result;
+    try {
+      result = await loginUser(email, password);
+    } catch (loginErr) {
+      logSecurityEvent({
+        type: "failed_login",
+        actorLabel: email,
+        detail: `Failed login attempt for ${email}`,
+        severity: "low",
+        ipAddress: req.ip,
+      });
+      throw loginErr;
+    }
+
+    logSecurityEvent({
+      type: "login",
+      actor: result.user._id?.toString(),
+      actorLabel: result.user.name,
+      detail: `${result.user.name} logged in`,
+      severity: "info",
+      ipAddress: req.ip,
+    });
 
     res.json({ success: true, message: "Login successful", data: result });
   } catch (err) {

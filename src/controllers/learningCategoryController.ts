@@ -63,7 +63,11 @@ export const createLearningCategory = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user!.role !== "ceo" && req.user!.role !== "supervisor") {
+    if (
+      req.user!.role !== "ceo" &&
+      req.user!.role !== "tech" &&
+      req.user!.role !== "supervisor"
+    ) {
       res.status(403).json({
         success: false,
         message: "Only the CEO or a supervisor can create categories",
@@ -121,7 +125,11 @@ export const updateLearningCategory = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user!.role !== "ceo" && req.user!.role !== "supervisor") {
+    if (
+      req.user!.role !== "ceo" &&
+      req.user!.role !== "tech" &&
+      req.user!.role !== "supervisor"
+    ) {
       res.status(403).json({
         success: false,
         message: "Only the CEO or a supervisor can edit categories",
@@ -183,7 +191,11 @@ export const deleteLearningCategory = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user!.role !== "ceo" && req.user!.role !== "supervisor") {
+    if (
+      req.user!.role !== "ceo" &&
+      req.user!.role !== "tech" &&
+      req.user!.role !== "supervisor"
+    ) {
       res.status(403).json({
         success: false,
         message: "Only the CEO or a supervisor can delete categories",

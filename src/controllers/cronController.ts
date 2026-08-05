@@ -2,6 +2,10 @@ import { Request, Response } from "express";
 import { DocumentModel } from "../models/Document";
 import { processDocumentDirectly } from "../services/documentProcessor";
 import { syncAllConnectedMailboxes } from "../services/emailSyncService";
+import {
+  runMeetingReminderSweep,
+  runMeetingAutoCompleteSweep,
+} from "./meetingController";
 
 // ═════════════════════════════════════════════════════════════════
 // These two endpoints replace the BullMQ-queued background jobs used
@@ -72,5 +76,27 @@ export const runDocumentRetrySweep = async (_req: Request, res: Response) => {
   } catch (err) {
     console.error("Cron document retry sweep failed:", err);
     res.status(500).json({ success: false, message: "Retry sweep failed" });
+  }
+};
+
+/**
+ * POST /api/cron/meeting-reminders — call every ~5 minutes.
+ * Sends a reminder notification to every organizer/attendee of a
+ * scheduled meeting whose reminder window has just been entered (see
+ * meetingController.runMeetingReminderSweep / Meeting.reminderMinutesBefore).
+ */
+export const runMeetingReminders = async (_req: Request, res: Response) => {
+  try {
+    const { sent } = await runMeetingReminderSweep();
+    const { completed } = await runMeetingAutoCompleteSweep();
+    res.json({
+      success: true,
+      message: `Meeting sweep: sent ${sent} reminder(s), auto-completed ${completed} meeting(s)`,
+    });
+  } catch (err) {
+    console.error("Cron meeting reminder sweep failed:", err);
+    res
+      .status(500)
+      .json({ success: false, message: "Meeting reminder sweep failed" });
   }
 };

@@ -16,9 +16,10 @@ export const canSendTo = async (
   const receiver = await User.findById(receiverId).select("role isActive");
   if (!receiver || !receiver.isActive)
     return { allowed: false, message: "Recipient not found or inactive" };
-  if (senderRole === "ceo") return { allowed: true };
+  if (senderRole === "ceo" || senderRole === "tech") return { allowed: true };
   if (senderRole === "supervisor") {
-    if (receiver.role === "ceo") return { allowed: true };
+    if (receiver.role === "ceo" || receiver.role === "tech")
+      return { allowed: true };
     if (receiver.role === "user") {
       const mapping = await SupervisorMapping.findOne({
         supervisorId: senderId,
@@ -376,7 +377,7 @@ export const getContacts = async (req: AuthRequest, res: Response) => {
     const role = req.user!.role;
     let contacts: any[] = [];
 
-    if (role === "ceo") {
+    if (role === "ceo" || role === "tech") {
       contacts = await User.find({ _id: { $ne: userId }, isActive: true })
         .select("_id name email role profilePicture department")
         .lean();
@@ -389,13 +390,10 @@ export const getContacts = async (req: AuthRequest, res: Response) => {
         "subordinateId",
         "_id name email role profilePicture department",
       );
-      const ceo = await User.findOne({ role: "ceo" })
+      const admins = await User.find({ role: { $in: ["ceo", "tech"] } })
         .select("_id name email role profilePicture department")
         .lean();
-      contacts = [
-        ...(ceo ? [ceo] : []),
-        ...mappings.map((m: any) => m.subordinateId),
-      ];
+      contacts = [...admins, ...mappings.map((m: any) => m.subordinateId)];
     }
     if (role === "user") {
       const mapping = await SupervisorMapping.findOne({

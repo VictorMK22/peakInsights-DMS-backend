@@ -14,7 +14,8 @@ import mongoose from "mongoose";
 
 // ── helpers ───────────────────────────────────────────────────────
 
-const isCEO = (r: AuthRequest) => r.user!.role === "ceo";
+const isCEO = (r: AuthRequest) =>
+  r.user!.role === "ceo" || r.user!.role === "tech";
 const isSalesPerson = (r: AuthRequest) => r.user!.role === "sales_person";
 
 /** Attach fresh short-lived signed URLs to a set of stored attachments. */
@@ -30,7 +31,7 @@ export const canAccess = async (
   userId: string,
   role: string,
 ): Promise<boolean> => {
-  if (role === "ceo") return true;
+  if (role === "ceo" || role === "tech") return true;
   const client = await ClientModel.findById(clientId).select("assignedTo");
   if (!client) return false;
   // Direct assignee
@@ -189,12 +190,10 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
     (isSalesPerson(req) &&
       (await canAccess(req.params.id, req.user!.userId, req.user!.role)));
   if (!allowed)
-    return res
-      .status(403)
-      .json({
-        success: false,
-        message: "Only CEO or the assigned sales person can update this client",
-      });
+    return res.status(403).json({
+      success: false,
+      message: "Only CEO or the assigned sales person can update this client",
+    });
   try {
     const { name, email, phone, company, industry, address, notes } = req.body;
     const client = await ClientModel.findByIdAndUpdate(
@@ -559,7 +558,7 @@ export const getAssignableEmployees = async (
   if (!isCEO(req)) return res.status(403).json({ success: false });
   try {
     const employees = await User.find({
-      role: { $in: ["user", "supervisor", "sales_person"] },
+      role: { $in: ["user", "supervisor", "sales_person", "accountant"] },
       isActive: true,
     })
       .select("_id name email role profilePicture department")

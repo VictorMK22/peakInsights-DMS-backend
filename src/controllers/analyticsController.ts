@@ -7,6 +7,8 @@ import { AuditLog } from "../models/AuditLog";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import mongoose from "mongoose";
 import { EmailLog } from "../models/EmailLog";
+import { MeetingModel } from "../models/Meeting";
+import { getRecentMeetingActivity } from "../services/meetingActivityService";
 
 // ─── Design note ─────────────────────────────────────────────────
 //
@@ -152,12 +154,10 @@ export const getTrendAnalysis = async (
         // team's (or another supervisor's) performance data just by
         // guessing a userId.
         if (!teamIds.includes(userId)) {
-          res
-            .status(403)
-            .json({
-              success: false,
-              message: "You can only view trends for your own team",
-            });
+          res.status(403).json({
+            success: false,
+            message: "You can only view trends for your own team",
+          });
           return;
         }
         matchStage["assignedTo"] = new mongoose.Types.ObjectId(userId);
@@ -212,7 +212,7 @@ export const getDashboardStats = async (
     let docFilter: Record<string, unknown> = {};
     let taskFilter: Record<string, unknown> = {};
 
-    if (role === "user") {
+    if (role === "user" || role === "accountant") {
       docFilter["ownerId"] = new mongoose.Types.ObjectId(userId);
       taskFilter["assignedTo"] = new mongoose.Types.ObjectId(userId);
     } else if (role === "supervisor") {
@@ -229,7 +229,7 @@ export const getDashboardStats = async (
     }
 
     let auditFilter: Record<string, unknown> = {};
-    if (role === "user") {
+    if (role === "user" || role === "accountant") {
       auditFilter = { actorId: new mongoose.Types.ObjectId(userId) };
     } else if (role === "supervisor") {
       const supId = new mongoose.Types.ObjectId(userId);
@@ -237,6 +237,37 @@ export const getDashboardStats = async (
         $or: [{ supervisorIdAtTime: supId }, { actorId: supId }],
       };
     }
+
+    // Meetings — same visibility rules as documents/tasks: everyone
+    // sees their own, supervisors additionally see their team's, and
+    // ceo/tech see everything.
+    let meetingFilter: Record<string, unknown> = {};
+    if (role === "ceo" || role === "tech") {
+      meetingFilter = {};
+    } else if (role === "supervisor") {
+      const mappings = await SupervisorMapping.find({
+        supervisorId: userId,
+        status: "active",
+      }).select("subordinateId");
+      const ids = [
+        ...mappings.map((m) => m.subordinateId),
+        new mongoose.Types.ObjectId(userId),
+      ];
+      meetingFilter = {
+        $or: [
+          { organizer: { $in: ids } },
+          { "attendees.userId": { $in: ids } },
+        ],
+      };
+    } else {
+      const uid = new mongoose.Types.ObjectId(userId);
+      meetingFilter = {
+        $or: [{ organizer: uid }, { "attendees.userId": uid }],
+      };
+    }
+    const now = new Date();
+    const weekAhead = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
     const [
       totalDocs,
@@ -250,6 +281,11 @@ export const getDashboardStats = async (
       totalUsers,
       recentAudit,
       collaborationStats,
+      upcomingMeetings,
+      meetingsThisWeek,
+      completedMeetings,
+      cancelledMeetings,
+      meetingIdsForActivity,
     ] = await Promise.all([
       DocumentModel.countDocuments(docFilter),
       DocumentModel.countDocuments({ ...docFilter, status: "completed" }),
@@ -259,13 +295,15 @@ export const getDashboardStats = async (
       TaskModel.countDocuments({ ...taskFilter, status: "pending" }),
       TaskModel.countDocuments({ ...taskFilter, status: "submitted" }),
       TaskModel.countDocuments({ ...taskFilter, status: "in_progress" }),
-      role === "ceo" ? User.countDocuments({ isActive: true }) : 0,
+      role === "ceo" || role === "tech"
+        ? User.countDocuments({ isActive: true })
+        : 0,
       AuditLog.find(auditFilter)
         .populate("actorId", "name email")
         .populate("documentId", "title")
         .sort({ timestamp: -1 })
         .limit(10),
-      role !== "user"
+      role !== "user" && role !== "accountant"
         ? TaskModel.aggregate([
             { $match: { ...taskFilter, "collaborators.0": { $exists: true } } },
             { $unwind: "$collaborators" },
@@ -283,7 +321,40 @@ export const getDashboardStats = async (
             { $unwind: "$user" },
           ])
         : Promise.resolve([]),
+      MeetingModel.countDocuments({
+        ...meetingFilter,
+        status: "scheduled",
+        startTime: { $gte: now, $lte: weekAhead },
+      }),
+      MeetingModel.countDocuments({
+        ...meetingFilter,
+        startTime: { $gte: now, $lte: weekAhead },
+      }),
+      MeetingModel.countDocuments({
+        ...meetingFilter,
+        status: "completed",
+        endTime: { $gte: thirtyDaysAgo },
+      }),
+      MeetingModel.countDocuments({
+        ...meetingFilter,
+        status: "cancelled",
+        updatedAt: { $gte: thirtyDaysAgo },
+      }),
+      // ceo/tech get the org-wide activity feed unfiltered; everyone
+      // else only sees activity for meetings they can actually see.
+      role === "ceo" || role === "tech"
+        ? Promise.resolve(undefined)
+        : MeetingModel.find(meetingFilter).select("_id").limit(500).lean(),
     ]);
+
+    const recentMeetingActivity = await getRecentMeetingActivity(
+      10,
+      meetingIdsForActivity
+        ? (meetingIdsForActivity as { _id: mongoose.Types.ObjectId }[]).map(
+            (m) => m._id,
+          )
+        : undefined,
+    );
 
     // Task efficiency stats (replaces document TAT stats)
     const taskEfficiency = await TaskModel.aggregate([
@@ -331,9 +402,17 @@ export const getDashboardStats = async (
           avgTaskTatMinutes: Math.round(taskEfficiency[0]?.avgTat ?? 0),
           // Users (CEO only)
           totalUsers,
+          // Meetings & Calendar — automatically populated, nobody
+          // logs these numbers by hand (spec: activity should show
+          // up in dashboards without manual entry).
+          upcomingMeetings,
+          meetingsThisWeek,
+          completedMeetings,
+          cancelledMeetings,
         },
         recentAudit,
         collaborationStats,
+        recentMeetingActivity,
       },
     });
   } catch (err) {
@@ -365,7 +444,7 @@ export const getAuditTrail = async (
     if (actorId) filter["actorId"] = new mongoose.Types.ObjectId(actorId);
     if (action) filter["action"] = action;
 
-    if (req.user?.role === "user") {
+    if (req.user?.role === "user" || req.user?.role === "accountant") {
       filter["actorId"] = new mongoose.Types.ObjectId(req.user.userId);
     } else if (req.user?.role === "supervisor") {
       // Without this, a supervisor could see the entire company's audit
@@ -519,7 +598,9 @@ export const getEmailAnalytics = async (
 ) => {
   try {
     const match =
-      req.user?.role === "ceo" ? {} : { senderId: req.user!.userId };
+      req.user?.role === "ceo" || req.user?.role === "tech"
+        ? {}
+        : { senderId: req.user!.userId };
 
     const stats = await EmailLog.aggregate([
       { $match: match },

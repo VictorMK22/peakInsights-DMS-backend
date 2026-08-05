@@ -36,7 +36,7 @@ export const searchDocuments = async (
     // document list shows, just the same set filtered by the query.
     // =========================
 
-    if (req.user?.role === "user") {
+    if (req.user?.role === "user" || req.user?.role === "accountant") {
       const activeTasks = await TaskModel.find({
         status: "in_progress",
         documentId: { $exists: true },
