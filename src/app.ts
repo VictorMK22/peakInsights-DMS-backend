@@ -72,13 +72,23 @@ const app = express();
 // rather than blindly trusting an arbitrary chain of proxies.
 app.set("trust proxy", 1);
 
-const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
+// Strip any trailing slash: the browser's Origin header never has one,
+// so a stray slash here (easy to introduce via an env var) would make
+// the CORS origin check fail even though the URLs are "the same".
+const FRONTEND_URL = (
+  process.env.FRONTEND_URL ?? "http://localhost:5173"
+).replace(/\/+$/, "");
 
 // ── Security ──────────────────────────────────────────────────────
 app.use(
   helmet({
     // Disable frameguard so PDFs can be embedded in iframes
     frameguard: false,
+    // Files served from /api/files/* are meant to be loaded cross-origin
+    // (frontend and API live on different origins/subdomains) and are
+    // already gated by their own short-lived signed token — so relaxing
+    // this from Helmet's default "same-origin" is safe here.
+    crossOriginResourcePolicy: { policy: "cross-origin" },
     contentSecurityPolicy: {
       useDefaults: true,
       directives: {
