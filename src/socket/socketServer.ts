@@ -2,6 +2,7 @@ import { Server } from "socket.io";
 import jwt from "jsonwebtoken";
 import { User } from "../models/User";
 import { TokenBlacklist } from "../models/TokenBlacklist";
+import { FRONTEND_URL } from "../app";
 
 interface Viewer {
   id: string;
@@ -25,7 +26,10 @@ const getSafeUser = (socket: any): Viewer | null => {
 export const initSocket = (server: any) => {
   io = new Server(server, {
     cors: {
-      origin: process.env.FRONTEND_URL,
+      // Reuse the same trimmed value app.ts's REST CORS uses, so a
+      // trailing slash in the FRONTEND_URL env var can't break the
+      // socket handshake the way it broke plain HTTP requests earlier.
+      origin: FRONTEND_URL,
       credentials: true,
     },
   });

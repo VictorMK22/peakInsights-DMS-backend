@@ -75,7 +75,7 @@ app.set("trust proxy", 1);
 // Strip any trailing slash: the browser's Origin header never has one,
 // so a stray slash here (easy to introduce via an env var) would make
 // the CORS origin check fail even though the URLs are "the same".
-const FRONTEND_URL = (
+export const FRONTEND_URL = (
   process.env.FRONTEND_URL ?? "http://localhost:5173"
 ).replace(/\/+$/, "");
 
