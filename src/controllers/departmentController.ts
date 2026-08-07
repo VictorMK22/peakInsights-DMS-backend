@@ -15,7 +15,7 @@ export const createDepartment = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
+    if (req.user?.role !== "ceo") {
       res.status(403).json({
         success: false,
         message: "Only the CEO can create departments",
@@ -113,7 +113,7 @@ export const updateDepartment = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
+    if (req.user?.role !== "ceo") {
       res
         .status(403)
         .json({ success: false, message: "Only the CEO can edit departments" });
@@ -183,7 +183,7 @@ export const deleteDepartment = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
+    if (req.user?.role !== "ceo") {
       res.status(403).json({
         success: false,
         message: "Only the CEO can delete departments",

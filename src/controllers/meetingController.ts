@@ -28,6 +28,9 @@ import {
   createParticipantToken,
   startRoomRecording,
   stopRoomRecording,
+  setPresenter,
+  createBreakoutRooms,
+  closeBreakoutRooms,
 } from "../services/livekitService";
 import { isLivekitConfigured } from "../config/livekit";
 import { getSignedFileUrl } from "../services/s3Storage";
@@ -503,6 +506,170 @@ export const getJoinToken = async (
 };
 
 // ─────────────────────────────────────────────────────────────────
+// PRESENTER TRANSFER — host-only. Grants screen-share rights to one
+// participant at a time (everyone's join token restricts it by
+// default — see livekitService.createParticipantToken) and revokes
+// it from whoever had it before. Pass the host's own identity to
+// hand presenting back to the host.
+// ─────────────────────────────────────────────────────────────────
+export const transferPresenter = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    if (!isLivekitConfigured) {
+      res.status(503).json({
+        success: false,
+        message: "Video calling is not configured on this server",
+      });
+      return;
+    }
+    const { identity } = req.body as { identity?: string };
+    if (!identity) {
+      res.status(400).json({ success: false, message: "identity is required" });
+      return;
+    }
+
+    const meeting = await MeetingModel.findById(req.params.id);
+    if (!meeting) {
+      res.status(404).json({ success: false, message: "Meeting not found" });
+      return;
+    }
+    const actorId = req.user!.userId;
+    const role = req.user!.role;
+    const isHost = idOf(meeting.organizer) === actorId;
+    if (!isHost && role !== "ceo" && role !== "tech") {
+      res.status(403).json({
+        success: false,
+        message: "Only the organizer can transfer the presenter role",
+      });
+      return;
+    }
+    // A non-organizer ceo/tech acting here still needs *a* host
+    // identity to exempt from revocation — the organizer's is the
+    // right one, since that's whose token was minted with permanent
+    // screen-share rights.
+    await setPresenter({
+      meetingId: meeting._id,
+      presenterIdentity: identity,
+      hostIdentity: idOf(meeting.organizer),
+    });
+
+    res.json({ success: true, message: "Presenter updated", data: {} });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────
+// BREAKOUT ROOMS — host-only. Auto-splits everyone currently in the
+// call (except the host) evenly across N breakout rooms and pushes
+// each participant a move signal over LiveKit's data channel; see
+// components/meetings/LiveCallRoom.tsx on the frontend for the
+// listener that actually performs the reconnect.
+// ─────────────────────────────────────────────────────────────────
+export const startBreakoutRooms = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    if (!isLivekitConfigured) {
+      res.status(503).json({
+        success: false,
+        message: "Video calling is not configured on this server",
+      });
+      return;
+    }
+    const { count } = req.body as { count?: number };
+    if (!count || count < 2 || count > 20) {
+      res.status(400).json({
+        success: false,
+        message: "count must be between 2 and 20",
+      });
+      return;
+    }
+
+    const meeting = await MeetingModel.findById(req.params.id);
+    if (!meeting) {
+      res.status(404).json({ success: false, message: "Meeting not found" });
+      return;
+    }
+    const actorId = req.user!.userId;
+    const role = req.user!.role;
+    const isHost = idOf(meeting.organizer) === actorId;
+    if (!isHost && role !== "ceo" && role !== "tech") {
+      res.status(403).json({
+        success: false,
+        message: "Only the organizer can start breakout rooms",
+      });
+      return;
+    }
+
+    const result = await createBreakoutRooms({
+      meetingId: meeting._id,
+      hostIdentity: idOf(meeting.organizer),
+      count,
+    });
+
+    res.json({
+      success: true,
+      message: "Breakout rooms created",
+      data: result,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+export const endBreakoutRooms = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    if (!isLivekitConfigured) {
+      res.status(503).json({
+        success: false,
+        message: "Video calling is not configured on this server",
+      });
+      return;
+    }
+    const { count } = req.body as { count?: number };
+    if (!count || count < 2 || count > 20) {
+      res.status(400).json({
+        success: false,
+        message: "count must be between 2 and 20",
+      });
+      return;
+    }
+
+    const meeting = await MeetingModel.findById(req.params.id);
+    if (!meeting) {
+      res.status(404).json({ success: false, message: "Meeting not found" });
+      return;
+    }
+    const actorId = req.user!.userId;
+    const role = req.user!.role;
+    const isHost = idOf(meeting.organizer) === actorId;
+    if (!isHost && role !== "ceo" && role !== "tech") {
+      res.status(403).json({
+        success: false,
+        message: "Only the organizer can end breakout rooms",
+      });
+      return;
+    }
+
+    await closeBreakoutRooms({ meetingId: meeting._id, count });
+
+    res.json({ success: true, message: "Breakout rooms closed", data: {} });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────
 // CHECK AVAILABILITY (used live by the create/edit form, no meeting
 // is created — just returns conflicts + suggested alternative slots)
 // ─────────────────────────────────────────────────────────────────
@@ -595,9 +762,35 @@ export const getMeetings = async (
         filter["$or"] = [{ organizer: userId }, { "attendees.userId": userId }];
       }
     } else if (mine === "true") {
+      // Explicit "just show me mine" override — available to everyone
+      // regardless of role, since even a CEO sometimes wants their own
+      // agenda instead of the whole org's.
       filter["organizer"] = userId;
     } else {
-      filter["$or"] = [{ organizer: userId }, { "attendees.userId": userId }];
+      // Default calendar visibility, matching the same rule used by
+      // getMeeting (single) and analyticsController's meetingFilter:
+      // ceo/tech see the organisation's full calendar, a supervisor
+      // additionally sees their team's meetings, everyone else sees
+      // only what they organize or are invited to.
+      const role = req.user!.role;
+      if (role === "ceo" || role === "tech") {
+        // No filter — full org visibility.
+      } else if (role === "supervisor") {
+        const mappings = await SupervisorMapping.find({
+          supervisorId: userId,
+          status: "active",
+        }).select("subordinateId");
+        const ids = [
+          ...mappings.map((m) => m.subordinateId),
+          new mongoose.Types.ObjectId(userId),
+        ];
+        filter["$or"] = [
+          { organizer: { $in: ids } },
+          { "attendees.userId": { $in: ids } },
+        ];
+      } else {
+        filter["$or"] = [{ organizer: userId }, { "attendees.userId": userId }];
+      }
     }
 
     // A meeting is "in range" if it starts before `to` and ends after

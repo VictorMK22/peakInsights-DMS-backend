@@ -13,21 +13,17 @@ import {
 const router = Router();
 router.use(authenticate);
 router.get("/dashboard", getDashboardStats);
-router.get(
-  "/leaderboard",
-  authorize("ceo", "tech", "supervisor"),
-  getLeaderboard,
-);
+router.get("/leaderboard", authorize("ceo", "supervisor"), getLeaderboard);
 router.get(
   "/bottlenecks",
-  authorize("ceo", "tech", "supervisor"),
+  authorize("ceo", "supervisor"),
   getBottleneckAnalysis,
 );
-router.get("/trends", authorize("ceo", "tech", "supervisor"), getTrendAnalysis);
+router.get("/trends", authorize("ceo", "supervisor"), getTrendAnalysis);
 router.get("/audit-trail", getAuditTrail);
 router.get(
   "/collaboration-frequency",
-  authorize("ceo", "tech", "supervisor"),
+  authorize("ceo", "supervisor"),
   getCollaborationFrequency,
 );
 router.get("/email-stats", getEmailAnalytics);

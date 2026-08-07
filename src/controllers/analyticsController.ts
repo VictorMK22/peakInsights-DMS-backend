@@ -237,6 +237,11 @@ export const getDashboardStats = async (
         $or: [{ supervisorIdAtTime: supId }, { actorId: supId }],
       };
     }
+    // tech falls through with auditFilter = {}, which would be the
+    // unrestricted company-wide feed — but the audit trail is CEO-only
+    // (see getAuditTrail below), so that's handled explicitly at the
+    // query below instead of here, rather than leaking it through this
+    // combined endpoint as a side door.
 
     // Meetings — same visibility rules as documents/tasks: everyone
     // sees their own, supervisors additionally see their team's, and
@@ -295,15 +300,19 @@ export const getDashboardStats = async (
       TaskModel.countDocuments({ ...taskFilter, status: "pending" }),
       TaskModel.countDocuments({ ...taskFilter, status: "submitted" }),
       TaskModel.countDocuments({ ...taskFilter, status: "in_progress" }),
-      role === "ceo" || role === "tech"
-        ? User.countDocuments({ isActive: true })
-        : 0,
-      AuditLog.find(auditFilter)
-        .populate("actorId", "name email")
-        .populate("documentId", "title")
-        .sort({ timestamp: -1 })
-        .limit(10),
-      role !== "user" && role !== "accountant"
+      role === "ceo" ? User.countDocuments({ isActive: true }) : 0,
+      role === "tech"
+        ? Promise.resolve([])
+        : AuditLog.find(auditFilter)
+            .populate("actorId", "name email")
+            .populate("documentId", "title")
+            .sort({ timestamp: -1 })
+            .limit(10),
+      // Same data as the dedicated /analytics/collaboration-frequency
+      // endpoint, which is ceo/supervisor only — tech is excluded here
+      // too so this combined dashboard can't be used as a side door
+      // around that restriction.
+      role === "ceo" || role === "supervisor"
         ? TaskModel.aggregate([
             { $match: { ...taskFilter, "collaborators.0": { $exists: true } } },
             { $unwind: "$collaborators" },
@@ -429,6 +438,20 @@ export const getAuditTrail = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
+    // Audit trail is CEO-only now — see the ICT workspace redesign
+    // notes. Every other analytics endpoint on this router scopes tech
+    // out via authorize("ceo","supervisor"); this one has no requireRole
+    // wrapper (user/accountant/supervisor all get a legitimately scoped
+    // view below), so tech needs an explicit reject here or it would
+    // silently fall through to the same unscoped access as ceo.
+    if (req.user?.role === "tech") {
+      res.status(403).json({
+        success: false,
+        message: "The company-wide audit trail is CEO-only",
+      });
+      return;
+    }
+
     const {
       documentId,
       actorId,

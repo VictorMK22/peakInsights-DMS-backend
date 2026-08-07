@@ -12,6 +12,9 @@ import {
   getJoinToken,
   getMeetingAttendance,
   getMeetingRecordingUrl,
+  transferPresenter,
+  startBreakoutRooms,
+  endBreakoutRooms,
 } from "../controllers/meetingController";
 
 /**
@@ -31,6 +34,10 @@ import {
  *                                from LiveKit webhooks (see routes/livekitWebhook.ts)
  *   GET    /:id/recording        Short-lived S3 download URL, once recordingStatus
  *                                is "available" (recordingEnabled meetings only)
+ *   POST   /:id/presenter        Host-only — transfer screen-share rights to one
+ *                                participant (or back to the host)
+ *   POST   /:id/breakout-rooms          Host-only — auto-split the call into N breakout rooms
+ *   POST   /:id/breakout-rooms/close    Host-only — end breakout rooms, move everyone back
  *
  * See routes/calendarBlocks.ts for personal unavailability blocks,
  * controllers/cronController.ts (runMeetingReminders) for the
@@ -54,5 +61,8 @@ router.get("/:id/activity", getMeetingActivityHistory);
 router.get("/:id/join-token", getJoinToken);
 router.get("/:id/attendance", getMeetingAttendance);
 router.get("/:id/recording", getMeetingRecordingUrl);
+router.post("/:id/presenter", transferPresenter);
+router.post("/:id/breakout-rooms", startBreakoutRooms);
+router.post("/:id/breakout-rooms/close", endBreakoutRooms);
 
 export default router;

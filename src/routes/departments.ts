@@ -16,8 +16,8 @@ router.use(authenticate);
 router.get("/", getAllDepartments);
 
 // CEO only — management actions.
-router.post("/", requireRole("ceo", "tech"), createDepartment);
-router.put("/:id", requireRole("ceo", "tech"), updateDepartment);
-router.delete("/:id", requireRole("ceo", "tech"), deleteDepartment);
+router.post("/", requireRole("ceo"), createDepartment);
+router.put("/:id", requireRole("ceo"), updateDepartment);
+router.delete("/:id", requireRole("ceo"), deleteDepartment);
 
 export default router;
