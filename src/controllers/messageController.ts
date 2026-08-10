@@ -20,26 +20,27 @@ export const canSendTo = async (
   if (senderRole === "supervisor") {
     if (receiver.role === "ceo" || receiver.role === "tech")
       return { allowed: true };
-    if (receiver.role === "user") {
-      const mapping = await SupervisorMapping.findOne({
-        supervisorId: senderId,
-        subordinateId: receiverId,
-        status: "active",
-      });
-      if (mapping) return { allowed: true };
-    }
-    return { allowed: false, message: "You can only message your team or CEO" };
-  }
-  if (senderRole === "user") {
+    // Any staff role (sales_person, accountant, or a tech/accountant
+    // assigned under this supervisor) can be a subordinate — there's
+    // no single "normal user" role anymore, so the mapping itself
+    // (not the receiver's specific role) is what decides this.
     const mapping = await SupervisorMapping.findOne({
-      subordinateId: senderId,
-      supervisorId: receiverId,
+      supervisorId: senderId,
+      subordinateId: receiverId,
       status: "active",
     });
     if (mapping) return { allowed: true };
-    return { allowed: false, message: "You can only message your supervisor" };
+    return { allowed: false, message: "You can only message your team or CEO" };
   }
-  return { allowed: false, message: "Not allowed" };
+  // Every other staff role (sales_person, accountant — tech already
+  // bypassed above) can only message the supervisor they're mapped to.
+  const mapping = await SupervisorMapping.findOne({
+    subordinateId: senderId,
+    supervisorId: receiverId,
+    status: "active",
+  });
+  if (mapping) return { allowed: true };
+  return { allowed: false, message: "You can only message your supervisor" };
 };
 
 export const sendMessage = async (
@@ -395,7 +396,10 @@ export const getContacts = async (req: AuthRequest, res: Response) => {
         .lean();
       contacts = [...admins, ...mappings.map((m: any) => m.subordinateId)];
     }
-    if (role === "user") {
+    // Any non-admin, non-supervisor staff role (sales_person,
+    // accountant — tech is covered by the ceo/tech branch above)
+    // only has their own supervisor as a contact.
+    if (role === "sales_person" || role === "accountant") {
       const mapping = await SupervisorMapping.findOne({
         subordinateId: userId,
         status: "active",

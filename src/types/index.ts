@@ -1,7 +1,6 @@
 export type UserRole =
   | "ceo"
   | "supervisor"
-  | "user"
   | "sales_person"
   | "accountant"
   | "tech";

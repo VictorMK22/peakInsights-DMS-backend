@@ -1,6 +1,7 @@
 import { Response, NextFunction } from "express";
 import { AuthRequest } from "../types/auth";
 import { Deployment } from "../models/Deployment";
+import { enrichAttachments } from "./attachmentController";
 
 export const listDeployments = async (
   _req: AuthRequest,
@@ -12,7 +13,13 @@ export const listDeployments = async (
       .populate("deployedBy", "name email")
       .sort({ createdAt: -1 })
       .limit(100);
-    res.json({ success: true, message: "Deployments retrieved", data: { deployments } });
+    res.json({
+      success: true,
+      message: "Deployments retrieved",
+      data: {
+        deployments: deployments.map((d) => enrichAttachments(d.toObject())),
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -24,9 +31,15 @@ export const createDeployment = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const { project, version, environment, status, scheduledFor, notes } = req.body;
+    const { project, version, environment, status, scheduledFor, notes } =
+      req.body;
     if (!project?.trim() || !version?.trim() || !environment) {
-      res.status(400).json({ success: false, message: "project, version and environment are required" });
+      res
+        .status(400)
+        .json({
+          success: false,
+          message: "project, version and environment are required",
+        });
       return;
     }
     const deployment = await Deployment.create({
@@ -38,7 +51,13 @@ export const createDeployment = async (
       notes,
       deployedBy: req.user!.userId,
     });
-    res.status(201).json({ success: true, message: "Deployment logged", data: { deployment } });
+    res
+      .status(201)
+      .json({
+        success: true,
+        message: "Deployment logged",
+        data: { deployment },
+      });
   } catch (err) {
     next(err);
   }
@@ -50,12 +69,20 @@ export const updateDeployment = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const deployment = await Deployment.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    const deployment = await Deployment.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true },
+    );
     if (!deployment) {
       res.status(404).json({ success: false, message: "Deployment not found" });
       return;
     }
-    res.json({ success: true, message: "Deployment updated", data: { deployment } });
+    res.json({
+      success: true,
+      message: "Deployment updated",
+      data: { deployment },
+    });
   } catch (err) {
     next(err);
   }

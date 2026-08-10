@@ -4,6 +4,13 @@ export type ProjectStatus = "planning" | "active" | "on_hold" | "completed";
 export type ProjectPriority = "low" | "medium" | "high" | "critical";
 export type ProjectRisk = "low" | "medium" | "high";
 
+export interface IMilestone {
+  _id: mongoose.Types.ObjectId;
+  title: string;
+  date: Date;
+  done: boolean;
+}
+
 export interface IProject extends Document {
   _id: mongoose.Types.ObjectId;
   key: string; // short code e.g. "PLAT"
@@ -14,7 +21,9 @@ export interface IProject extends Document {
   risk: ProjectRisk;
   lead: mongoose.Types.ObjectId;
   members: mongoose.Types.ObjectId[];
+  startDate?: Date;
   dueDate?: Date;
+  milestones: IMilestone[];
   createdBy: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
@@ -22,7 +31,13 @@ export interface IProject extends Document {
 
 const ProjectSchema = new Schema<IProject>(
   {
-    key: { type: String, required: true, uppercase: true, trim: true, maxlength: 8 },
+    key: {
+      type: String,
+      required: true,
+      uppercase: true,
+      trim: true,
+      maxlength: 8,
+    },
     name: { type: String, required: true, trim: true },
     description: { type: String, trim: true },
     status: {
@@ -38,7 +53,15 @@ const ProjectSchema = new Schema<IProject>(
     risk: { type: String, enum: ["low", "medium", "high"], default: "low" },
     lead: { type: Schema.Types.ObjectId, ref: "User", required: true },
     members: [{ type: Schema.Types.ObjectId, ref: "User" }],
+    startDate: { type: Date },
     dueDate: { type: Date },
+    milestones: [
+      {
+        title: { type: String, required: true, trim: true },
+        date: { type: Date, required: true },
+        done: { type: Boolean, default: false },
+      },
+    ],
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   },
   { timestamps: true },

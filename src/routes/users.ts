@@ -1,6 +1,5 @@
 import { Router } from "express";
 import {
-  createUserByCEO,
   createSupervisor,
   createSalesPerson,
   promoteToSupervisor,
@@ -17,6 +16,9 @@ import {
   getUserProfile,
   getNotifications,
   getMyTeammates,
+  getDirectory,
+  createTech,
+  createAccountant,
 } from "../controllers/userController";
 import { authenticate, requireRole } from "../middleware/auth";
 
@@ -38,16 +40,14 @@ router.get("/notifications", getNotifications);
 // collaboration "invite" picker. Any authenticated role can call this.
 router.get("/teammates", getMyTeammates);
 
+// Minimal user picker for the ICT Team page — ceo/tech only, name +
+// email + department, nothing admin-y. See getDirectory's comment.
+router.get("/directory", requireRole("ceo", "tech"), getDirectory);
+
 // ─── CEO ONLY ─────────────────────────────────────────────────────
 // All account creation routes are restricted to CEO at the router
 // level. The controller also checks the role as a belt-and-suspenders
 // guard. Supervisors cannot create any accounts.
-
-router.post(
-  "/create-user",
-  requireRole("ceo"), // ← enforced here — supervisors get 403
-  createUserByCEO,
-);
 
 router.post(
   "/supervisor",
@@ -60,6 +60,16 @@ router.post(
   requireRole("ceo"), // ← CEO only — sales / BD accounts
   createSalesPerson,
 );
+
+// Both of these were fully implemented in userController but never
+// had a route pointing at them — the frontend's "Create Tech/Admin"
+// and "Create Accountant" forms have been hitting 404s the whole
+// time. createAccountant's internal role check was also loosened to
+// "ceo" only here to match its own docstring and its sibling
+// account-creation endpoints (createSupervisor/createSalesPerson),
+// which were already CEO-only.
+router.post("/tech", requireRole("ceo"), createTech);
+router.post("/accountant", requireRole("ceo"), createAccountant);
 
 router.post("/assign", requireRole("ceo"), assignUserToSupervisor);
 

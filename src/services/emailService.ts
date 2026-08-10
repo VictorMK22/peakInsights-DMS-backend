@@ -173,7 +173,7 @@ export async function sendAccountCreatedByCEOEmail(
   to: string,
   name: string,
   temporaryPassword: string,
-  role: "user" | "supervisor" | "sales_person" | "accountant" | "tech",
+  role: "supervisor" | "sales_person" | "accountant" | "tech",
   fromEmail?: string,
 ): Promise<void> {
   const roleLabel =

@@ -556,7 +556,7 @@ export const getDocumentTypeCounts = async (
 
     // Same visibility rule getDocuments uses for documents.
     const docFilter: Record<string, unknown> = { isDeleted: { $ne: true } };
-    if (role === "user" || role === "accountant") {
+    if (role === "accountant") {
       const activeTasks = await TaskModel.find({
         status: "in_progress",
         documentId: { $exists: true },
@@ -592,7 +592,7 @@ export const getDocumentTypeCounts = async (
       }).select("subordinateId");
       const subIds = maps.map((m) => m.subordinateId);
       folderOwnerFilter = { ownerId: { $in: [uid, ...subIds] } };
-    } else if (role === "user" || role === "accountant") {
+    } else if (role === "accountant") {
       folderOwnerFilter = { ownerId: uid };
     }
     // ceo: no filter
@@ -705,7 +705,7 @@ export const getDocuments = async (
         readStatus === "read" ? { $in: readIds } : { $nin: readIds };
     }
 
-    if (req.user!.role === "user" || req.user!.role === "accountant") {
+    if (req.user!.role === "accountant") {
       // Own docs + docs linked to active tasks where user is collaborator
       const activeTasks = await TaskModel.find({
         status: "in_progress",

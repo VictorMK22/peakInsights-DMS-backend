@@ -1,4 +1,5 @@
 import mongoose, { Document, Schema } from "mongoose";
+import { AttachmentSchema, IAttachment } from "./shared/AttachmentSchema";
 
 export type AssetType =
   | "laptop"
@@ -22,6 +23,7 @@ export interface IAsset extends Document {
   purchaseDate?: Date;
   warrantyExpiry?: Date;
   maintenanceHistory: { note: string; at: Date; by: mongoose.Types.ObjectId }[];
+  attachments: IAttachment[];
   createdBy: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
@@ -32,7 +34,17 @@ const AssetSchema = new Schema<IAsset>(
     name: { type: String, required: true, trim: true },
     type: {
       type: String,
-      enum: ["laptop", "desktop", "printer", "switch", "router", "firewall", "license", "software", "accessory"],
+      enum: [
+        "laptop",
+        "desktop",
+        "printer",
+        "switch",
+        "router",
+        "firewall",
+        "license",
+        "software",
+        "accessory",
+      ],
       required: true,
     },
     owner: { type: Schema.Types.ObjectId, ref: "User" },
@@ -51,6 +63,7 @@ const AssetSchema = new Schema<IAsset>(
         by: { type: Schema.Types.ObjectId, ref: "User", required: true },
       },
     ],
+    attachments: { type: [AttachmentSchema], default: [] },
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   },
   { timestamps: true },

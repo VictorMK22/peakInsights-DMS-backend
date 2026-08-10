@@ -8,11 +8,17 @@ import {
   getAuditTrail,
   getCollaborationFrequency,
   getEmailAnalytics,
+  getAccountantWorkspace,
 } from "../controllers/analyticsController";
 
 const router = Router();
 router.use(authenticate);
 router.get("/dashboard", getDashboardStats);
+router.get(
+  "/accountant-workspace",
+  authorize("accountant", "ceo"),
+  getAccountantWorkspace,
+);
 router.get("/leaderboard", authorize("ceo", "supervisor"), getLeaderboard);
 router.get(
   "/bottlenecks",

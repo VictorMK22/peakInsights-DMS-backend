@@ -1,6 +1,12 @@
 import mongoose, { Document, Schema } from "mongoose";
+import { AttachmentSchema, IAttachment } from "./shared/AttachmentSchema";
 
-export type DeploymentStatus = "success" | "failed" | "in_progress" | "scheduled" | "rolled_back";
+export type DeploymentStatus =
+  | "success"
+  | "failed"
+  | "in_progress"
+  | "scheduled"
+  | "rolled_back";
 export type DeploymentEnvironment = "production" | "staging" | "development";
 
 export interface IDeployment extends Document {
@@ -12,6 +18,7 @@ export interface IDeployment extends Document {
   deployedBy: mongoose.Types.ObjectId;
   scheduledFor?: Date;
   notes?: string;
+  attachments: IAttachment[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -33,10 +40,14 @@ const DeploymentSchema = new Schema<IDeployment>(
     deployedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     scheduledFor: { type: Date },
     notes: { type: String, trim: true },
+    attachments: { type: [AttachmentSchema], default: [] },
   },
   { timestamps: true },
 );
 
 DeploymentSchema.index({ status: 1, createdAt: -1 });
 
-export const Deployment = mongoose.model<IDeployment>("Deployment", DeploymentSchema);
+export const Deployment = mongoose.model<IDeployment>(
+  "Deployment",
+  DeploymentSchema,
+);

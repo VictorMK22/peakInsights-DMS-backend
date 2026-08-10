@@ -1,8 +1,19 @@
 import mongoose, { Document, Schema } from "mongoose";
+import { AttachmentSchema, IAttachment } from "./shared/AttachmentSchema";
 
-export type TicketStatus = "open" | "in_progress" | "escalated" | "resolved" | "closed";
+export type TicketStatus =
+  | "open"
+  | "in_progress"
+  | "escalated"
+  | "resolved"
+  | "closed";
 export type TicketPriority = "low" | "medium" | "high" | "critical";
-export type TicketCategory = "hardware" | "software" | "network" | "access" | "other";
+export type TicketCategory =
+  | "hardware"
+  | "software"
+  | "network"
+  | "access"
+  | "other";
 
 // SLA targets in hours, by priority — used to compute slaDueAt on create
 // and to flag tickets at risk of breaching on the frontend.
@@ -27,6 +38,7 @@ export interface ITicket extends Document {
   slaDueAt: Date;
   resolvedAt?: Date;
   internalNotes: { note: string; by: mongoose.Types.ObjectId; at: Date }[];
+  attachments: IAttachment[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -63,6 +75,7 @@ const TicketSchema = new Schema<ITicket>(
         at: { type: Date, default: Date.now },
       },
     ],
+    attachments: { type: [AttachmentSchema], default: [] },
   },
   { timestamps: true },
 );

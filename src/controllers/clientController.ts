@@ -558,7 +558,7 @@ export const getAssignableEmployees = async (
   if (!isCEO(req)) return res.status(403).json({ success: false });
   try {
     const employees = await User.find({
-      role: { $in: ["user", "supervisor", "sales_person", "accountant"] },
+      role: { $in: ["supervisor", "sales_person", "accountant"] },
       isActive: true,
     })
       .select("_id name email role profilePicture department")

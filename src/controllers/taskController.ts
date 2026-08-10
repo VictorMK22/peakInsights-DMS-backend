@@ -97,10 +97,10 @@ export const createTask = async (
     const role = req.user!.role;
     const actorId = req.user!.userId;
 
-    if (role === "user" || role === "accountant") {
+    if (role === "accountant") {
       res
         .status(403)
-        .json({ success: false, message: "Users cannot assign tasks" });
+        .json({ success: false, message: "Accountants cannot assign tasks" });
       return;
     }
 
@@ -237,7 +237,7 @@ export const getTasks = async (
     if (status) filter["status"] = status;
     if (priority) filter["priority"] = priority;
 
-    if (role === "user" || role === "accountant") {
+    if (role === "accountant") {
       filter["$or"] = [
         { assignedTo: userId },
         {
@@ -758,7 +758,14 @@ export const inviteTaskCollaborator = async (
         });
         return;
       }
-    } else if (req.user!.role === "user") {
+    } else if (
+      req.user!.role === "sales_person" ||
+      req.user!.role === "accountant"
+    ) {
+      // Same "share a supervisor" restriction that used to apply only
+      // to the "user" role, now applied to every staff role that can
+      // be a supervisor's subordinate (tech is already exempt above
+      // alongside ceo, since neither hits this else-if).
       const inviter = await User.findById(req.user!.userId).select(
         "supervisorId",
       );
@@ -990,7 +997,10 @@ export const getTaskLeaderboard = async (
         status: "active",
       }).select("subordinateId");
       matchStage["assignedTo"] = { $in: mappings.map((m) => m.subordinateId) };
-    } else if (req.user!.role === "user") {
+    } else if (
+      req.user!.role === "sales_person" ||
+      req.user!.role === "accountant"
+    ) {
       matchStage["assignedTo"] = new mongoose.Types.ObjectId(req.user!.userId);
     }
 
@@ -1036,7 +1046,7 @@ export const getUserAppraisal = async (
     const { userId } = req.params as { userId: string };
 
     if (
-      (req.user!.role === "user" || req.user!.role === "accountant") &&
+      (req.user!.role === "sales_person" || req.user!.role === "accountant") &&
       req.user!.userId !== userId
     ) {
       res.status(403).json({

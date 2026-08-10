@@ -9,6 +9,9 @@ import mongoose from "mongoose";
 import { EmailLog } from "../models/EmailLog";
 import { MeetingModel } from "../models/Meeting";
 import { getRecentMeetingActivity } from "../services/meetingActivityService";
+import { ClientModel } from "../models/Client";
+import { ClientInvoiceModel } from "../models/ClientInvoice";
+import { ClientNoteModel } from "../models/ClientNote";
 
 // ─── Design note ─────────────────────────────────────────────────
 //
@@ -212,7 +215,7 @@ export const getDashboardStats = async (
     let docFilter: Record<string, unknown> = {};
     let taskFilter: Record<string, unknown> = {};
 
-    if (role === "user" || role === "accountant") {
+    if (role === "accountant") {
       docFilter["ownerId"] = new mongoose.Types.ObjectId(userId);
       taskFilter["assignedTo"] = new mongoose.Types.ObjectId(userId);
     } else if (role === "supervisor") {
@@ -229,7 +232,7 @@ export const getDashboardStats = async (
     }
 
     let auditFilter: Record<string, unknown> = {};
-    if (role === "user" || role === "accountant") {
+    if (role === "accountant") {
       auditFilter = { actorId: new mongoose.Types.ObjectId(userId) };
     } else if (role === "supervisor") {
       const supId = new mongoose.Types.ObjectId(userId);
@@ -467,7 +470,7 @@ export const getAuditTrail = async (
     if (actorId) filter["actorId"] = new mongoose.Types.ObjectId(actorId);
     if (action) filter["action"] = action;
 
-    if (req.user?.role === "user" || req.user?.role === "accountant") {
+    if (req.user?.role === "accountant") {
       filter["actorId"] = new mongoose.Types.ObjectId(req.user.userId);
     } else if (req.user?.role === "supervisor") {
       // Without this, a supervisor could see the entire company's audit
@@ -695,6 +698,187 @@ export const getEmailAnalytics = async (
     res.json({
       success: true,
       data: stats[0],
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────
+// ACCOUNTANT WORKSPACE SUMMARY — a book-of-clients rollup purpose-
+// built for accountants' daily workflow: receivables that need
+// chasing, task/filing deadlines, today's client meetings, and a
+// combined recent-activity feed across every client they serve.
+// This intentionally does NOT replace PeakBooks — it's a lightweight
+// reference view over the CRM-side invoice/task/meeting records that
+// already live on the Client model, scoped to this accountant's book.
+// ─────────────────────────────────────────────────────────────────
+export const getAccountantWorkspace = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const uid = new mongoose.Types.ObjectId(req.user!.userId);
+    const now = new Date();
+    const weekAhead = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const clients = await ClientModel.find({ assignedTo: uid })
+      .select("name company email")
+      .lean();
+    const clientIds = clients.map((c) => c._id);
+
+    if (clientIds.length === 0) {
+      res.json({
+        success: true,
+        data: {
+          clientCount: 0,
+          invoiceSummary: [],
+          overdueInvoices: [],
+          dueSoonInvoices: [],
+          taskDeadlines: { overdue: [], dueSoon: [] },
+          upcomingMeetings: [],
+          recentActivity: [],
+        },
+      });
+      return;
+    }
+
+    const overdueCond = {
+      $and: [
+        { $in: ["$status", ["unpaid", "overdue"]] },
+        { $ne: ["$dueDate", null] },
+        { $lt: ["$dueDate", now] },
+      ],
+    };
+    const outstandingCond = { $in: ["$status", ["unpaid", "overdue"]] };
+    const paidThisMonthCond = {
+      $and: [
+        { $eq: ["$status", "paid"] },
+        { $ne: ["$paidAt", null] },
+        { $gte: ["$paidAt", startOfMonth] },
+      ],
+    };
+
+    const [
+      invoiceSummary,
+      overdueInvoices,
+      dueSoonInvoices,
+      overdueTasks,
+      dueSoonTasks,
+      upcomingMeetings,
+      recentNotes,
+      recentInvoiceActivity,
+    ] = await Promise.all([
+      ClientInvoiceModel.aggregate([
+        { $match: { clientId: { $in: clientIds } } },
+        {
+          $group: {
+            _id: "$currency",
+            outstandingAmount: {
+              $sum: { $cond: [outstandingCond, "$amount", 0] },
+            },
+            outstandingCount: { $sum: { $cond: [outstandingCond, 1, 0] } },
+            overdueAmount: { $sum: { $cond: [overdueCond, "$amount", 0] } },
+            overdueCount: { $sum: { $cond: [overdueCond, 1, 0] } },
+            paidThisMonthAmount: {
+              $sum: { $cond: [paidThisMonthCond, "$amount", 0] },
+            },
+            paidThisMonthCount: {
+              $sum: { $cond: [paidThisMonthCond, 1, 0] },
+            },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      ClientInvoiceModel.find({
+        clientId: { $in: clientIds },
+        status: { $in: ["unpaid", "overdue"] },
+        dueDate: { $ne: null, $lt: now },
+      })
+        .populate("clientId", "name company")
+        .sort({ dueDate: 1 })
+        .limit(8)
+        .lean(),
+      ClientInvoiceModel.find({
+        clientId: { $in: clientIds },
+        status: { $in: ["unpaid", "overdue"] },
+        dueDate: { $ne: null, $gte: now, $lte: weekAhead },
+      })
+        .populate("clientId", "name company")
+        .sort({ dueDate: 1 })
+        .limit(8)
+        .lean(),
+      TaskModel.find({
+        assignedTo: uid,
+        status: { $nin: ["completed", "cancelled"] },
+        dueDate: { $ne: null, $lt: now },
+      })
+        .populate("clientId", "name company")
+        .sort({ dueDate: 1 })
+        .limit(8)
+        .lean(),
+      TaskModel.find({
+        assignedTo: uid,
+        status: { $nin: ["completed", "cancelled"] },
+        dueDate: { $ne: null, $gte: now, $lte: weekAhead },
+      })
+        .populate("clientId", "name company")
+        .sort({ dueDate: 1 })
+        .limit(8)
+        .lean(),
+      MeetingModel.find({
+        $or: [{ organizer: uid }, { "attendees.userId": uid }],
+        status: "scheduled",
+        startTime: { $gte: now, $lte: weekAhead },
+      })
+        .populate("clientId", "name company")
+        .sort({ startTime: 1 })
+        .limit(6)
+        .lean(),
+      ClientNoteModel.find({ clientId: { $in: clientIds } })
+        .populate("authorId", "name")
+        .populate("clientId", "name company")
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .lean(),
+      ClientInvoiceModel.find({ clientId: { $in: clientIds } })
+        .populate("clientId", "name company")
+        .sort({ updatedAt: -1 })
+        .limit(5)
+        .lean(),
+    ]);
+
+    const recentActivity = [
+      ...recentNotes.map((n: any) => ({
+        type: "note" as const,
+        at: n.createdAt,
+        client: n.clientId,
+        summary: n.body,
+        by: n.authorId?.name,
+      })),
+      ...recentInvoiceActivity.map((inv: any) => ({
+        type: "invoice" as const,
+        at: inv.updatedAt,
+        client: inv.clientId,
+        summary: `${inv.invoiceNumber ? `#${inv.invoiceNumber} — ` : ""}${inv.status} · ${inv.currency} ${inv.amount}`,
+      })),
+    ]
+      .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+      .slice(0, 8);
+
+    res.json({
+      success: true,
+      data: {
+        clientCount: clients.length,
+        invoiceSummary,
+        overdueInvoices,
+        dueSoonInvoices,
+        taskDeadlines: { overdue: overdueTasks, dueSoon: dueSoonTasks },
+        upcomingMeetings,
+        recentActivity,
+      },
     });
   } catch (err) {
     next(err);

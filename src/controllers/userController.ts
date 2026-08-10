@@ -10,71 +10,27 @@ import mongoose from "mongoose";
 import Notification from "../models/Notification";
 
 /**
- * CEO ONLY — creates a normal user account that is immediately active.
- * Middleware: requireCEO must be applied on the route.
+ * There is no generic "normal user" role in this system — every
+ * account is one of: ceo, supervisor, sales_person, accountant, tech.
+ * When a supervisor is demoted, they don't fall back to a blank
+ * catch-all role; they fall back to whichever *staff* role matches
+ * the department they're already in. This is the single place that
+ * mapping lives, shared by demoteSupervisor and the one-off
+ * migration script (scripts/migrateNormalUsers.ts) that moved any
+ * pre-existing "user"-role accounts onto a real role.
+ *
+ * Falls back to "sales_person" when the department doesn't match a
+ * known pattern (or is blank) — sales_person is the closest thing
+ * this system has to a general-purpose staff role.
  */
-export const createUserByCEO = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction,
-): Promise<void> => {
-  try {
-    // Belt-and-suspenders check in addition to route middleware
-    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
-      res.status(403).json({
-        success: false,
-        message: "Only the CEO can create user accounts directly",
-      });
-      return;
-    }
-
-    const { name, email, password, department } = req.body as {
-      name: string;
-      email: string;
-      password: string;
-      department?: string;
-    };
-
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      res
-        .status(409)
-        .json({ success: false, message: "Email already registered" });
-      return;
-    }
-
-    const user = await User.create({
-      name,
-      email,
-      password,
-      role: "user",
-      department,
-      createdBy: req.user?.userId,
-      accountStatus: "active",
-      isActive: true,
-      approvedBy: req.user?.userId as unknown as mongoose.Types.ObjectId,
-      approvedAt: new Date(),
-    });
-
-    const token = generateToken(user);
-
-    sendAccountCreatedByCEOEmail(user.email, user.name, password, "user").catch(
-      (err) =>
-        console.error(
-          "❌ sendAccountCreatedByCEOEmail failed (account still created):",
-          err,
-        ),
-    );
-
-    res.status(201).json({
-      success: true,
-      message: "User account created",
-      data: { user, token },
-    });
-  } catch (err) {
-    next(err);
-  }
-};
+export function roleForDepartment(
+  department?: string,
+): "accountant" | "tech" | "sales_person" {
+  const dept = (department ?? "").trim();
+  if (/account(ing|s)?|finance/i.test(dept)) return "accountant";
+  if (/^ict$|information\s*technology|\btech\b/i.test(dept)) return "tech";
+  return "sales_person";
+}
 
 /**
  * CEO ONLY — creates a supervisor account directly.
@@ -232,7 +188,7 @@ export const createAccountant = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
+    if (req.user?.role !== "ceo") {
       res.status(403).json({
         success: false,
         message: "Only the CEO can create accountant accounts",
@@ -240,7 +196,7 @@ export const createAccountant = async (
       return;
     }
 
-    const { name, email, password, department } = req.body as {
+    const { name, email, password } = req.body as {
       name: string;
       email: string;
       password: string;
@@ -256,12 +212,17 @@ export const createAccountant = async (
       return;
     }
 
+    // Accountants are always placed in the Accounting department —
+    // hardcoded server-side (not just defaulted client-side) so this
+    // can never drift, whether from a stale frontend, a direct API
+    // call, or a future form change. Any `department` sent in the
+    // request body is intentionally ignored.
     const user = await User.create({
       name,
       email,
       password,
       role: "accountant",
-      department,
+      department: "Accounting",
       createdBy: req.user?.userId,
       accountStatus: "active",
       isActive: true,
@@ -315,7 +276,7 @@ export const createTech = async (
       return;
     }
 
-    const { name, email, password, department } = req.body as {
+    const { name, email, password } = req.body as {
       name: string;
       email: string;
       password: string;
@@ -331,12 +292,15 @@ export const createTech = async (
       return;
     }
 
+    // Tech accounts are always placed in the ICT department — same
+    // hardcoded-server-side rule as createAccountant/Accounting. Any
+    // `department` sent in the request body is intentionally ignored.
     const user = await User.create({
       name,
       email,
       password,
       role: "tech",
-      department,
+      department: "ICT",
       createdBy: req.user?.userId,
       accountStatus: "active",
       isActive: true,
@@ -365,7 +329,9 @@ export const createTech = async (
 };
 
 /**
- * CEO ONLY — promotes an existing normal user to supervisor.
+ * CEO ONLY — promotes an existing user to supervisor. Any non-CEO role
+ * (normal user, tech, accountant) is eligible — the only account that
+ * can never be promoted/demoted is the CEO's own.
  */
 export const promoteToSupervisor = async (
   req: AuthRequest,
@@ -386,10 +352,10 @@ export const promoteToSupervisor = async (
       res.status(404).json({ success: false, message: "User not found" });
       return;
     }
-    if (user.role === "ceo" || user.role === "tech") {
+    if (user.role === "ceo") {
       res
         .status(403)
-        .json({ success: false, message: "Cannot change CEO/tech role" });
+        .json({ success: false, message: "Cannot change the CEO's role" });
       return;
     }
     if (user.role === "supervisor") {
@@ -488,6 +454,19 @@ export const updateUser = async (
       department: string;
       isActive: boolean;
     }>;
+
+    // Accountants and tech accounts always stay in their fixed
+    // department (Accounting / ICT respectively) — same rule enforced
+    // at creation time (see createAccountant/createTech). An edit
+    // should never be able to drift either out of it, so any
+    // department change in this request is dropped for those roles.
+    if (updates.department !== undefined) {
+      const existing = await User.findById(id).select("role");
+      if (existing?.role === "accountant" || existing?.role === "tech") {
+        delete updates.department;
+      }
+    }
+
     const user = await User.findByIdAndUpdate(id, updates, {
       new: true,
       runValidators: true,
@@ -536,7 +515,11 @@ export const deleteUser = async (
  * erase the account" case.
  *
  * Guardrails, in order:
- *  1. Can never delete a CEO account.
+ *  1. Can never delete a CEO or tech account — those roles are
+ *     edit/deactivate-activate only, protected by their near-CEO
+ *     trust level. Accountants CAN be permanently deleted (subject to
+ *     the same owned-content check as everyone else below) — the CEO
+ *     just needs to reassign/clear their clients and documents first.
  *  2. If they're a supervisor with anyone currently assigned to them,
  *     refuse — those people need to be reassigned first, or they'd be
  *     left pointing at a supervisor that no longer exists.
@@ -572,12 +555,10 @@ export const permanentlyDeleteUser = async (
     }
 
     if (user.role === "ceo" || user.role === "tech") {
-      res
-        .status(403)
-        .json({
-          success: false,
-          message: "CEO/tech accounts cannot be deleted",
-        });
+      res.status(403).json({
+        success: false,
+        message: "CEO/tech accounts cannot be deleted — deactivate instead",
+      });
       return;
     }
 
@@ -679,7 +660,21 @@ export const assignUserToSupervisor = async (
     // department they were just assigned under, so it shows correctly
     // everywhere else (user lists, contacts, dropdowns) without the
     // CEO having to set it twice.
-    await User.findByIdAndUpdate(userId, { department: effectiveDepartment });
+    //
+    // Exception: tech and accountant accounts have a fixed department
+    // (ICT / Accounting respectively — see createTech/createAccountant
+    // and updateUser) that must never drift, even when they're
+    // assigned under a supervisor from a different department. So the
+    // sync is skipped for those two roles; the mapping itself still
+    // records `effectiveDepartment` for reporting purposes.
+    const subordinate = await User.findById(userId).select("role");
+    if (
+      subordinate &&
+      subordinate.role !== "tech" &&
+      subordinate.role !== "accountant"
+    ) {
+      await User.findByIdAndUpdate(userId, { department: effectiveDepartment });
+    }
 
     const populated = await SupervisorMapping.findById(mapping._id)
       .populate("supervisorId", "name email department")
@@ -788,10 +783,10 @@ export const demoteSupervisor = async (
       res.status(404).json({ success: false, message: "User not found" });
       return;
     }
-    if (user.role === "ceo" || user.role === "tech") {
+    if (user.role === "ceo") {
       res
         .status(403)
-        .json({ success: false, message: "Cannot demote the CEO/tech" });
+        .json({ success: false, message: "Cannot demote the CEO" });
       return;
     }
     if (user.role !== "supervisor") {
@@ -806,13 +801,18 @@ export const demoteSupervisor = async (
       { status: "historical", deactivationDate: new Date() },
     );
 
-    user.role = "user";
+    // A demoted supervisor doesn't fall back to a blank "normal user"
+    // role — there isn't one. They land on whichever staff role
+    // matches the department they're already in (see
+    // roleForDepartment's docstring for the full rationale/mapping).
+    const newRole = roleForDepartment(user.department);
+    user.role = newRole;
     user.accountStatus = "active";
     await user.save();
 
     res.json({
       success: true,
-      message: `${user.name} demoted to Normal User`,
+      message: `${user.name} demoted to ${newRole.replace("_", " ")}`,
       data: { user },
     });
   } catch (err) {
@@ -959,5 +959,24 @@ export const getMyTeammates = async (
     console.error("getMyTeammates error:", err);
     res.status(500).json({ success: false });
     return;
+  }
+};
+
+// Deliberately separate from getAllUsers (CEO-only, full admin
+// record) — this exists so the ICT Team page can offer a "pick a
+// person" list without tech needing full user-management access.
+// Minimal fields only, same rationale as getMyTeammates above.
+export const getDirectory = async (
+  _req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    const users = await User.find({ isActive: true })
+      .select("name email department")
+      .sort({ name: 1 });
+    res.json({ success: true, data: { users } });
+  } catch (err) {
+    console.error("getDirectory error:", err);
+    res.status(500).json({ success: false });
   }
 };

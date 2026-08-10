@@ -2,7 +2,6 @@ import { Server } from "socket.io";
 import jwt from "jsonwebtoken";
 import { User } from "../models/User";
 import { TokenBlacklist } from "../models/TokenBlacklist";
-import { FRONTEND_URL } from "../app";
 
 interface Viewer {
   id: string;
@@ -24,12 +23,18 @@ const getSafeUser = (socket: any): Viewer | null => {
 };
 
 export const initSocket = (server: any) => {
+  // Mirrors app.ts's FRONTEND_URL fallback. Without this, an unset
+  // FRONTEND_URL becomes `origin: undefined` here — which socket.io
+  // does NOT treat as "allow all" the way an omitted `cors` option
+  // would; it just sends no Access-Control-Allow-Origin header at
+  // all, and every socket.io request gets blocked by CORS while the
+  // regular REST API (which has this same fallback in app.ts) keeps
+  // working fine. That mismatch is exactly what makes this bug
+  // confusing to debug — half the app looks broken, half doesn't.
+  const frontendUrl = process.env.FRONTEND_URL ?? "http://localhost:5173";
   io = new Server(server, {
     cors: {
-      // Reuse the same trimmed value app.ts's REST CORS uses, so a
-      // trailing slash in the FRONTEND_URL env var can't break the
-      // socket handshake the way it broke plain HTTP requests earlier.
-      origin: FRONTEND_URL,
+      origin: frontendUrl,
       credentials: true,
     },
   });

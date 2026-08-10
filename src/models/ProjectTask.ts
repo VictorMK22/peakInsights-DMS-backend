@@ -1,6 +1,11 @@
 import mongoose, { Document, Schema } from "mongoose";
 
-export type ProjectTaskColumn = "backlog" | "todo" | "in_progress" | "review" | "done";
+export type ProjectTaskColumn =
+  | "backlog"
+  | "todo"
+  | "in_progress"
+  | "review"
+  | "done";
 export type ProjectTaskPriority = "low" | "medium" | "high" | "critical";
 
 /**
@@ -16,6 +21,7 @@ export type ProjectTaskPriority = "low" | "medium" | "high" | "critical";
 export interface IProjectTask extends Document {
   _id: mongoose.Types.ObjectId;
   projectId: mongoose.Types.ObjectId;
+  sprintId?: mongoose.Types.ObjectId;
   title: string;
   description?: string;
   column: ProjectTaskColumn;
@@ -25,6 +31,7 @@ export interface IProjectTask extends Document {
   dueDate?: Date;
   points?: number;
   order: number;
+  completedAt?: Date;
   createdBy: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
@@ -33,6 +40,7 @@ export interface IProjectTask extends Document {
 const ProjectTaskSchema = new Schema<IProjectTask>(
   {
     projectId: { type: Schema.Types.ObjectId, ref: "Project", required: true },
+    sprintId: { type: Schema.Types.ObjectId, ref: "Sprint" },
     title: { type: String, required: true, trim: true },
     description: { type: String, trim: true },
     column: {
@@ -50,6 +58,7 @@ const ProjectTaskSchema = new Schema<IProjectTask>(
     dueDate: { type: Date },
     points: { type: Number, min: 0 },
     order: { type: Number, default: 0 },
+    completedAt: { type: Date },
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   },
   { timestamps: true },
@@ -57,4 +66,7 @@ const ProjectTaskSchema = new Schema<IProjectTask>(
 
 ProjectTaskSchema.index({ projectId: 1, column: 1, order: 1 });
 
-export const ProjectTask = mongoose.model<IProjectTask>("ProjectTask", ProjectTaskSchema);
+export const ProjectTask = mongoose.model<IProjectTask>(
+  "ProjectTask",
+  ProjectTaskSchema,
+);

@@ -9,6 +9,9 @@ import {
   createProjectTask,
   updateProjectTask,
   deleteProjectTask,
+  addMilestone,
+  updateMilestone,
+  deleteMilestone,
 } from "../controllers/projectController";
 
 const router = Router();
@@ -23,5 +26,9 @@ router.get("/tasks/all", listProjectTasks);
 router.post("/tasks", createProjectTask);
 router.put("/tasks/:id", updateProjectTask);
 router.delete("/tasks/:id", deleteProjectTask);
+
+router.post("/:id/milestones", addMilestone);
+router.put("/:id/milestones/:milestoneId", updateMilestone);
+router.delete("/:id/milestones/:milestoneId", deleteMilestone);
 
 export default router;

@@ -1,6 +1,7 @@
 import { Response, NextFunction } from "express";
 import { AuthRequest } from "../types/auth";
 import { Ticket, SLA_HOURS, TicketPriority } from "../models/Ticket";
+import { enrichAttachments } from "./attachmentController";
 
 const nextTicketNumber = async (): Promise<string> => {
   const last = await Ticket.findOne()
@@ -50,7 +51,7 @@ export const listTickets = async (
             ((t.resolvedAt.getTime() - t.createdAt.getTime()) / 3600000) * 10,
           ) / 10
         : undefined;
-      return { ...obj, slaHoursLeft, resolutionTimeHrs };
+      return { ...enrichAttachments(obj), slaHoursLeft, resolutionTimeHrs };
     });
 
     res.json({

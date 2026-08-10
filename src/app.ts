@@ -37,6 +37,8 @@ import securityRoutes from "./routes/security";
 import infrastructureRoutes from "./routes/infrastructure";
 import systemRoutes from "./routes/systems";
 import ictSeedRoutes from "./routes/ictSeed";
+import sprintRoutes from "./routes/sprints";
+import teamMemberRoutes from "./routes/teamMembers";
 
 dotenv.config();
 
@@ -72,23 +74,13 @@ const app = express();
 // rather than blindly trusting an arbitrary chain of proxies.
 app.set("trust proxy", 1);
 
-// Strip any trailing slash: the browser's Origin header never has one,
-// so a stray slash here (easy to introduce via an env var) would make
-// the CORS origin check fail even though the URLs are "the same".
-export const FRONTEND_URL = (
-  process.env.FRONTEND_URL ?? "http://localhost:5173"
-).replace(/\/+$/, "");
+const FRONTEND_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
 
 // ── Security ──────────────────────────────────────────────────────
 app.use(
   helmet({
     // Disable frameguard so PDFs can be embedded in iframes
     frameguard: false,
-    // Files served from /api/files/* are meant to be loaded cross-origin
-    // (frontend and API live on different origins/subdomains) and are
-    // already gated by their own short-lived signed token — so relaxing
-    // this from Helmet's default "same-origin" is safe here.
-    crossOriginResourcePolicy: { policy: "cross-origin" },
     contentSecurityPolicy: {
       useDefaults: true,
       directives: {
@@ -164,6 +156,8 @@ app.use("/api/security", securityRoutes);
 app.use("/api/infrastructure", infrastructureRoutes);
 app.use("/api/systems", systemRoutes);
 app.use("/api/ict-seed", ictSeedRoutes);
+app.use("/api/sprints", sprintRoutes);
+app.use("/api/team-members", teamMemberRoutes);
 
 // ── Health check ──────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
