@@ -5,6 +5,7 @@ import helmet from "helmet";
 import morgan from "morgan";
 import rateLimit from "express-rate-limit";
 import { errorHandler, notFound } from "./middleware/errorHandler";
+import { validateWhatsappEnv } from "./config/validateWhatsappEnv";
 
 import authRoutes from "./routes/auth";
 import userRoutes from "./routes/users";
@@ -41,6 +42,10 @@ import sprintRoutes from "./routes/sprints";
 import teamMemberRoutes from "./routes/teamMembers";
 
 dotenv.config();
+
+// Runs once per process (cold start on Vercel, once at boot locally) —
+// app.ts is the shared module both entry points import.
+validateWhatsappEnv();
 
 // ═════════════════════════════════════════════════════════════════
 // This file builds and exports the configured Express app, with NO
@@ -106,7 +111,21 @@ app.use(
   livekitWebhookRoutes,
 );
 
-app.use(express.json({ limit: "10mb" }));
+// The `verify` callback stashes the exact raw bytes of every JSON body
+// on the request before Express parses them. Needed specifically for
+// the WhatsApp webhook, whose X-Hub-Signature-256 header is an HMAC
+// over those exact bytes — re-serializing the parsed body would very
+// likely produce a different signature (key order, whitespace) even
+// with byte-identical semantic content. Cheap to do unconditionally
+// for every route since it's just a buffer reference, not a copy.
+app.use(
+  express.json({
+    limit: "10mb",
+    verify: (req, _res, buf) => {
+      (req as any).rawBody = buf;
+    },
+  }),
+);
 app.use(express.urlencoded({ extended: true }));
 
 app.use(
@@ -116,6 +135,11 @@ app.use(
     standardHeaders: true,
     legacyHeaders: false,
     message: "Too many requests, please try again later.",
+    // Meta's webhook has its own signature-based auth (see
+    // controllers/clientWhatsappController.ts) and can legitimately
+    // burst well above normal user traffic when many clients message
+    // at once — it authenticates the request, not this limiter.
+    skip: (req) => req.path.startsWith("/webhooks/"),
   }),
 );
 

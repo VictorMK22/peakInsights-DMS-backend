@@ -10,3 +10,7 @@ process.env.AWS_REGION ??= "us-east-1";
 process.env.S3_ACCESS_KEY ??= "test-access-key";
 process.env.AWS_SECRET_KEY ??= "test-secret-key";
 process.env.S3_BUCKET ??= "test-bucket";
+process.env.WHATSAPP_VERIFY_TOKEN ??= "test-verify-token";
+process.env.META_APP_SECRET ??= "test-app-secret";
+process.env.WHATSAPP_ACCESS_TOKEN ??= "test-access-token";
+process.env.WHATSAPP_PHONE_NUMBER_ID ??= "test-phone-number-id";

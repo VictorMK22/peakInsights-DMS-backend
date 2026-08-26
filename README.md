@@ -1,4 +1,4 @@
-# PeakInsights DMS — Backend API
+# PeakInsights Hub — Backend API
 
 Node.js + Express + TypeScript + MongoDB
 
@@ -14,11 +14,13 @@ npm run dev
 ## API Endpoints
 
 ### Auth
+
 - `POST /api/auth/login` — Login
 - `GET /api/auth/me` — Get current user
 - `PUT /api/auth/change-password` — Change password
 
 ### Users (CEO only for write operations)
+
 - `GET /api/users` — List users
 - `POST /api/users` — Create user
 - `PUT /api/users/:id` — Update user
@@ -27,6 +29,7 @@ npm run dev
 - `GET /api/users/mappings` — Get supervisor-user mappings
 
 ### Documents
+
 - `GET /api/documents` — List documents (role-filtered)
 - `POST /api/documents` — Upload new document (multipart/form-data)
 - `GET /api/documents/:id` — Get document detail
@@ -35,6 +38,7 @@ npm run dev
 - `POST /api/documents/:id/invite` — Invite collaborator
 
 ### Analytics
+
 - `GET /api/analytics/dashboard` — Dashboard stats
 - `GET /api/analytics/leaderboard` — Efficiency leaderboard
 - `GET /api/analytics/bottlenecks` — Bottleneck heatmap data

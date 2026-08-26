@@ -6,6 +6,7 @@ import { ClientWhatsappMessageModel } from "../models/ClientWhatsappMessage";
 import {
   sendWhatsappTextMessage,
   verifyWebhookToken,
+  verifyWebhookSignature,
   normalizePhone,
   resolveMediaUrl,
   whatsappIsConfigured,
@@ -106,10 +107,27 @@ export const verifyWhatsappWebhook = (req: Request, res: Response) => {
   res.sendStatus(403);
 };
 
-/** POST — actual message/status events from Meta. Always respond 200
- *  quickly (per Meta's requirements) even if we can't match a client,
- *  otherwise Meta will retry and eventually disable the webhook. */
+/**
+ * POST — actual message/status events from Meta.
+ *
+ * Signature check happens FIRST, before the 200 ack: a request that
+ * fails HMAC verification did not come from Meta (or the App Secret is
+ * misconfigured), so there's no "avoid Meta's retry/disable" concern —
+ * it's simply rejected. Once the signature is confirmed, we ack 200
+ * immediately per Meta's requirements and process the payload after,
+ * so a slow DB write never causes Meta to see a timeout and retry.
+ */
 export const receiveWhatsappWebhook = async (req: Request, res: Response) => {
+  const signatureOk = verifyWebhookSignature(
+    (req as any).rawBody,
+    req.header("x-hub-signature-256"),
+  );
+  if (!signatureOk) {
+    console.warn("WhatsApp webhook: rejected request with invalid signature");
+    res.sendStatus(401);
+    return;
+  }
+
   res.sendStatus(200); // ack immediately
 
   try {
@@ -130,7 +148,12 @@ export const receiveWhatsappWebhook = async (req: Request, res: Response) => {
       }
     }
   } catch (err) {
-    console.error("WhatsApp webhook processing error:", err);
+    // Never log err.config/headers here — could contain the access
+    // token on an axios error bubbled up from elsewhere in the chain.
+    console.error(
+      "WhatsApp webhook processing error:",
+      err instanceof Error ? err.message : err,
+    );
   }
 };
 
@@ -157,6 +180,10 @@ async function handleInboundMessage(msg: any) {
   let body = "";
   let mediaUrl: string | undefined;
   let mediaMimeType: string | undefined;
+  let metadata: Record<string, unknown> | undefined;
+  // Normalized to one of the model's messageType values below —
+  // covers every inbound type Meta's Cloud API can send.
+  const messageType: string = msg.type || "unknown";
 
   if (msg.type === "text") {
     body = msg.text?.body ?? "";
@@ -170,6 +197,37 @@ async function handleInboundMessage(msg: any) {
         mediaMimeType = resolved.mimeType;
       }
     }
+  } else if (msg.type === "location") {
+    const loc = msg.location ?? {};
+    body = loc.name || loc.address || "[Location shared]";
+    metadata = {
+      latitude: loc.latitude,
+      longitude: loc.longitude,
+      name: loc.name,
+      address: loc.address,
+    };
+  } else if (msg.type === "contacts") {
+    const names = (msg.contacts ?? [])
+      .map((c: any) => c?.name?.formatted_name)
+      .filter(Boolean);
+    body = names.length
+      ? `[Contact shared: ${names.join(", ")}]`
+      : "[Contact shared]";
+    metadata = { contacts: msg.contacts };
+  } else if (msg.type === "button") {
+    // Reply to a template's quick-reply button.
+    body = msg.button?.text || "[Button reply]";
+    metadata = { payload: msg.button?.payload, text: msg.button?.text };
+  } else if (msg.type === "interactive") {
+    // Reply to a list picker or reply-button message we sent.
+    const reply = msg.interactive?.button_reply || msg.interactive?.list_reply;
+    body = reply?.title || "[Interactive reply]";
+    metadata = {
+      interactiveType: msg.interactive?.type,
+      id: reply?.id,
+      title: reply?.title,
+      description: reply?.description,
+    };
   } else {
     body = `[Unsupported message type: ${msg.type}]`;
   }
@@ -183,9 +241,11 @@ async function handleInboundMessage(msg: any) {
   await ClientWhatsappMessageModel.create({
     clientId: matched._id,
     direction: "inbound",
+    messageType,
     body,
     mediaUrl,
     mediaMimeType,
+    metadata,
     waMessageId: msg.id,
     waStatus: "delivered",
     timestamp: msg.timestamp
@@ -196,17 +256,21 @@ async function handleInboundMessage(msg: any) {
 
 async function handleStatusUpdate(status: any) {
   if (!status?.id) return;
-  const mapped =
-    status.status === "delivered"
-      ? "delivered"
-      : status.status === "read"
-        ? "read"
-        : status.status === "failed"
-          ? "failed"
-          : undefined;
+  const mapped = (["sent", "delivered", "read", "failed"] as const).includes(
+    status.status,
+  )
+    ? (status.status as "sent" | "delivered" | "read" | "failed")
+    : undefined;
   if (!mapped) return;
+
+  const update: Record<string, unknown> = { waStatus: mapped };
+  if (mapped === "failed") {
+    // Meta's failure detail lives under errors[0], not a flat field.
+    const reason = status.errors?.[0]?.message || status.errors?.[0]?.title;
+    if (reason) update.waError = reason;
+  }
   await ClientWhatsappMessageModel.updateOne(
     { waMessageId: status.id },
-    { $set: { waStatus: mapped } },
+    { $set: update },
   );
 }
