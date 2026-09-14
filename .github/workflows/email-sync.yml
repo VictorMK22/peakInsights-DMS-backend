@@ -1,0 +1,48 @@
+name: Email sync cron
+
+# Calls POST /api/cron/sync-emails on the deployed backend on a schedule.
+# This exists because the app's own in-process scheduler
+# (config/emailSyncQueue.ts, started from src/index.ts) only runs on the
+# traditional long-lived server — it never runs on Vercel's serverless
+# deployment, which is what production actually uses. This workflow is
+# the external trigger that route was built to expect (see
+# src/middleware/cronAuth.ts).
+#
+# Setup required (once):
+#   1. Repo Settings → Secrets and variables → Actions → New repository
+#      secret:
+#        CRON_SECRET = <same value as the CRON_SECRET env var on Vercel>
+#        API_BASE_URL = https://api.peak-insights.com   (no trailing slash)
+#   2. Nothing else — this workflow picks both up automatically.
+#
+# GitHub's scheduled workflows have a documented 5-minute floor and can
+# occasionally run a few minutes late under platform load — fine for a
+# mailbox sync, not a guarantee of exact timing.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *" # every 10 minutes
+  workflow_dispatch: {} # lets you trigger a run manually from the Actions tab, for testing
+
+jobs:
+  sync-emails:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /api/cron/sync-emails
+        run: |
+          http_status=$(curl -s -o /tmp/response.json -w "%{http_code}" \
+            -X POST "${API_BASE_URL}/api/cron/sync-emails" \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            -H "Content-Type: application/json")
+
+          echo "HTTP status: $http_status"
+          cat /tmp/response.json
+          echo ""
+
+          if [ "$http_status" -ge 400 ]; then
+            echo "::error::Email sync cron call failed with status $http_status"
+            exit 1
+          fi
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
