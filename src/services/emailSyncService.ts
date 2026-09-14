@@ -69,7 +69,9 @@ function computeInternalDedupeKey(
   return crypto.createHash("sha256").update(normalized).digest("hex");
 }
 
-async function syncOneMailbox(integration: IEmailIntegration): Promise<void> {
+async function syncOneMailbox(
+  integration: IEmailIntegration,
+): Promise<{ messagesFound: number; messagesSynced: number }> {
   const accessToken = await ensureFreshToken(integration);
   const accountId = integration.providerAccountId;
 
@@ -91,7 +93,11 @@ async function syncOneMailbox(integration: IEmailIntegration): Promise<void> {
     staff.map((s) => [String(s.email).toLowerCase(), s._id]),
   );
 
-  if (clientByEmail.size === 0 && staffByEmail.size === 0) return;
+  let messagesFound = 0;
+  let messagesSynced = 0;
+
+  if (clientByEmail.size === 0 && staffByEmail.size === 0)
+    return { messagesFound, messagesSynced };
 
   const folders = await listFolders(accessToken, accountId);
   const inbox = folders.find((f) =>
@@ -134,8 +140,10 @@ async function syncOneMailbox(integration: IEmailIntegration): Promise<void> {
       const staffUserId = staffByEmail.get(counterpart);
       if (!clientId && !staffUserId) continue; // unrelated mail — never logged
 
+      messagesFound++;
+      let wasLogged = false;
       if (clientId) {
-        await syncClientMessage(
+        wasLogged = await syncClientMessage(
           integration,
           target.direction,
           target.folderId,
@@ -146,7 +154,7 @@ async function syncOneMailbox(integration: IEmailIntegration): Promise<void> {
           accountId,
         );
       } else if (staffUserId) {
-        await syncInternalMessage(
+        wasLogged = await syncInternalMessage(
           integration,
           target.direction,
           target.folderId,
@@ -157,6 +165,7 @@ async function syncOneMailbox(integration: IEmailIntegration): Promise<void> {
           accountId,
         );
       }
+      if (wasLogged) messagesSynced++;
 
       newestSeen = Math.max(newestSeen, Number(msg.receivedTime));
     }
@@ -166,6 +175,8 @@ async function syncOneMailbox(integration: IEmailIntegration): Promise<void> {
   integration.status = "connected";
   integration.lastError = undefined;
   await integration.save();
+
+  return { messagesFound, messagesSynced };
 }
 
 async function syncClientMessage(
@@ -177,14 +188,14 @@ async function syncClientMessage(
   clientId: any,
   accessToken: string,
   accountId: string,
-): Promise<void> {
+): Promise<boolean> {
   // Idempotency: skip if we've already logged this exact message
   // (unique index also protects against a race, this just avoids
   // the extra failed insert + noisy error log).
   const exists = await ClientEmailModel.exists({
     externalMessageId: msg.messageId,
   });
-  if (exists) return;
+  if (exists) return false;
 
   let body = "";
   try {
@@ -226,6 +237,7 @@ async function syncClientMessage(
       externalMessageId: msg.messageId,
       syncedFromUserId: integration.userId,
     });
+    return true;
   } catch (err: any) {
     // Duplicate key race (unique index) — safe to ignore
     if (err?.code !== 11000) {
@@ -234,6 +246,7 @@ async function syncClientMessage(
         err,
       );
     }
+    return false;
   }
 }
 
@@ -246,7 +259,7 @@ async function syncInternalMessage(
   otherUserId: any,
   accessToken: string,
   accountId: string,
-): Promise<void> {
+): Promise<boolean> {
   const epochMs = Number(msg.receivedTime);
   const dedupeKey = computeInternalDedupeKey(
     [integration.emailAddress, counterpart],
@@ -255,7 +268,7 @@ async function syncInternalMessage(
   );
 
   const exists = await EmailLog.exists({ dedupeKey });
-  if (exists) return;
+  if (exists) return false;
 
   let body = "";
   try {
@@ -293,6 +306,7 @@ async function syncInternalMessage(
       source: "external_sync",
       dedupeKey,
     });
+    return true;
   } catch (err: any) {
     // Duplicate key race (unique index) — safe to ignore, this is the
     // expected outcome when the other participant's sync already logged it
@@ -302,6 +316,7 @@ async function syncInternalMessage(
         err,
       );
     }
+    return false;
   }
 }
 
@@ -353,18 +368,43 @@ async function syncAttachments(
 }
 
 /** Entry point called by the scheduled job (queue-backed or setInterval fallback). */
-export async function syncAllConnectedMailboxes(): Promise<void> {
+export async function syncAllConnectedMailboxes(): Promise<{
+  mailboxesChecked: number;
+  mailboxesFailed: number;
+  messagesFound: number;
+  messagesSynced: number;
+}> {
   const integrations = await EmailIntegrationModel.find({
     status: { $ne: "disconnected" },
   });
+
+  let mailboxesFailed = 0;
+  let messagesFound = 0;
+  let messagesSynced = 0;
+
   for (const integration of integrations) {
     try {
-      await syncOneMailbox(integration);
+      const result = await syncOneMailbox(integration);
+      messagesFound += result.messagesFound;
+      messagesSynced += result.messagesSynced;
     } catch (err: any) {
+      mailboxesFailed++;
       console.error(`Zoho sync failed for ${integration.emailAddress}:`, err);
       integration.status = "error";
       integration.lastError = err?.message || "Unknown sync error";
       await integration.save().catch(() => undefined);
     }
   }
+
+  const summary = {
+    mailboxesChecked: integrations.length,
+    mailboxesFailed,
+    messagesFound,
+    messagesSynced,
+  };
+  // On-success logging (everything else in this file only logs on error) —
+  // without this, a Vercel log search after a cron run can't tell "ran
+  // fine, nothing new" apart from "never actually ran".
+  console.log("Zoho email sync summary:", summary);
+  return summary;
 }

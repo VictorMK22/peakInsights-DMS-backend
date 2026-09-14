@@ -19,8 +19,12 @@ import {
 /** POST /api/cron/sync-emails — call every ~5 minutes. */
 export const runEmailSync = async (_req: Request, res: Response) => {
   try {
-    await syncAllConnectedMailboxes();
-    res.json({ success: true, message: "Email sync run completed" });
+    const summary = await syncAllConnectedMailboxes();
+    res.json({
+      success: true,
+      message: "Email sync run completed",
+      ...summary,
+    });
   } catch (err) {
     console.error("Cron email sync failed:", err);
     res.status(500).json({ success: false, message: "Email sync run failed" });
