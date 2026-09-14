@@ -183,6 +183,19 @@ app.use("/api/ict-seed", ictSeedRoutes);
 app.use("/api/sprints", sprintRoutes);
 app.use("/api/team-members", teamMemberRoutes);
 
+// ── Root ──────────────────────────────────────────────────────────
+// This API has no UI of its own — every real route lives under /api
+// or /webhooks. This just gives anyone who hits the bare domain
+// directly (browser, uptime monitor) something reassuring instead of
+// a bare 404, without acting as a real endpoint the frontend depends on.
+app.get("/", (_req, res) => {
+  res.json({
+    service: "PeakInsights DMS API",
+    status: "ok",
+    docs: "/api/health",
+  });
+});
+
 // ── Health check ──────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", service: "PeakInsights DMS API", version: "1.0.0" });
