@@ -1,0 +1,19 @@
+# Local runtime caches / uploads — not needed in the deployed function and
+
+# only add dead weight to the bundle Vercel has to package on every deploy,
+
+# which slows cold starts. Real uploads live in S3 (see s3Storage.ts), not
+
+# on the function's local disk, which is ephemeral on Vercel anyway.
+
+uploads
+pdf_cache
+
+# Dev/test-only, never needed at runtime
+
+src/tests
+tests
+jest.config.js
+docs
+scripts
+\*.test.ts
