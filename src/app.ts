@@ -18,6 +18,7 @@ import emailRoutes from "./routes/emails";
 import clientRoutes from "./routes/clientRoutes";
 import whatsappWebhookRoutes from "./routes/whatsappWebhook";
 import emailIntegrationRoutes from "./routes/emailIntegrationRoutes";
+import googleCalendarRoutes from "./routes/googleCalendarRoutes";
 import cronRoutes from "./routes/cron";
 import shareRoutes from "./routes/share";
 import filesRoutes from "./routes/files";
@@ -26,7 +27,6 @@ import trashRoutes from "./routes/trash";
 import learningCategoryRoutes from "./routes/learningCategories";
 import meetingRoutes from "./routes/meetings";
 import calendarBlockRoutes from "./routes/calendarBlocks";
-import livekitWebhookRoutes from "./routes/livekitWebhook";
 
 // ── ICT workspace routes ────────────────────────────────────────
 import projectRoutes from "./routes/projects";
@@ -99,18 +99,6 @@ app.use(
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(morgan("dev"));
 
-// Must be mounted before express.json() below: LiveKit signs the
-// exact raw bytes of the request body, and express.json() would
-// otherwise consume the stream and hand this route a parsed object
-// instead of the raw buffer verifyWebhookEvent() needs. LiveKit sends
-// Content-Type: application/webhook+json specifically so it's never
-// accidentally caught by a generic `application/json` parser either.
-app.use(
-  "/webhooks/livekit",
-  express.raw({ type: "application/webhook+json", limit: "1mb" }),
-  livekitWebhookRoutes,
-);
-
 // The `verify` callback stashes the exact raw bytes of every JSON body
 // on the request before Express parses them. Needed specifically for
 // the WhatsApp webhook, whose X-Hub-Signature-256 header is an HMAC
@@ -159,6 +147,7 @@ app.use("/api/messages", messageRoutes);
 app.use("/api/emails", emailRoutes);
 app.use("/api/clients", clientRoutes);
 app.use("/api/integrations", emailIntegrationRoutes);
+app.use("/api/integrations", googleCalendarRoutes);
 // Public — Meta calls this directly, must not require our app auth.
 app.use("/webhooks/whatsapp", whatsappWebhookRoutes);
 // Secret-protected (not user auth) — called by an external scheduler,

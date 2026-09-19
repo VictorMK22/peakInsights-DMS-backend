@@ -74,22 +74,17 @@ export interface IMeeting extends Document {
   location?: string;
   meetingLink?: string;
 
-  // Built-in video call via LiveKit (see services/livekitService.ts).
-  // Independent of meetingLink so an organizer can still paste an
-  // external Zoom/Meet link instead if they prefer — the two are not
-  // mutually exclusive in the schema, but the frontend should only
-  // show the "Join call" button when isVirtual is true.
-  isVirtual: boolean;
-  recordingEnabled: boolean;
-
-  // Set once recording actually starts (see meetingController.getJoinToken,
-  // services/livekitService.startRoomRecording). "starting" is a brief
-  // claim state to stop two simultaneous joiners both kicking off egress.
-  recordingEgressId?: string;
-  recordingS3Key?: string;
-  recordingStatus?: "starting" | "recording" | "available" | "failed";
-  recordingDurationSeconds?: number;
-  recordingSizeBytes?: number;
+  // Set when meetingLink was auto-generated via the organizer's
+  // connected Google account (see services/googleCalendarService.ts)
+  // rather than pasted in by hand. "google_meet" links get an extra
+  // "Join Google Meet" affordance in the UI and their underlying
+  // Calendar event is kept in sync / cleaned up automatically —
+  // see meetingController's use of googleEventId below.
+  conferenceProvider?: "custom" | "google_meet";
+  // The Google Calendar event backing a google_meet meetingLink, on
+  // the organizer's own calendar — needed to patch its time on
+  // reschedule and delete it on cancellation.
+  googleEventId?: string;
 
   status: MeetingStatus;
   cancellationReason?: string;
@@ -170,17 +165,8 @@ const MeetingSchema = new Schema<IMeeting>(
 
     location: { type: String, trim: true },
     meetingLink: { type: String, trim: true },
-
-    isVirtual: { type: Boolean, default: false },
-    recordingEnabled: { type: Boolean, default: false },
-    recordingEgressId: { type: String },
-    recordingS3Key: { type: String },
-    recordingStatus: {
-      type: String,
-      enum: ["starting", "recording", "available", "failed"],
-    },
-    recordingDurationSeconds: { type: Number },
-    recordingSizeBytes: { type: Number },
+    conferenceProvider: { type: String, enum: ["custom", "google_meet"] },
+    googleEventId: { type: String },
 
     status: {
       type: String,

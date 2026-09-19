@@ -2,7 +2,6 @@ import { Response, NextFunction } from "express";
 import mongoose from "mongoose";
 import { AuthRequest } from "../types/auth";
 import { MeetingModel, IMeeting, RsvpStatus } from "../models/Meeting";
-import { MeetingAttendanceModel } from "../models/MeetingAttendance";
 import { User } from "../models/User";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { createNotification } from "../services/notificationService";
@@ -22,18 +21,13 @@ import {
   logMeetingActivity,
   getMeetingActivity,
 } from "../services/meetingActivityService";
-import {
-  ensureRoom,
-  deleteRoom,
-  createParticipantToken,
-  startRoomRecording,
-  stopRoomRecording,
-  setPresenter,
-  createBreakoutRooms,
-  closeBreakoutRooms,
-} from "../services/livekitService";
-import { isLivekitConfigured } from "../config/livekit";
 import { getSignedFileUrl } from "../services/s3Storage";
+import {
+  getValidGoogleAccessToken,
+  createMeetEvent,
+  updateMeetEventTime,
+  deleteMeetEvent,
+} from "../services/googleCalendarService";
 
 // A recurring series is capped so "invite everyone, repeat forever"
 // can't silently generate an unbounded number of documents — see
@@ -142,8 +136,8 @@ export const createMeeting = async (
       endTime,
       location,
       meetingLink,
-      isVirtual = false,
-      recordingEnabled = false,
+      conferenceProvider,
+      googleEventId,
       attendeeIds = [],
       targetDepartments = [],
       organizationWide = false,
@@ -160,8 +154,8 @@ export const createMeeting = async (
       endTime: string;
       location?: string;
       meetingLink?: string;
-      isVirtual?: boolean;
-      recordingEnabled?: boolean;
+      conferenceProvider?: "custom" | "google_meet";
+      googleEventId?: string;
       attendeeIds?: string[];
       targetDepartments?: string[];
       organizationWide?: boolean;
@@ -258,8 +252,16 @@ export const createMeeting = async (
         endTime: occ.endTime,
         location,
         meetingLink,
-        isVirtual: Boolean(isVirtual),
-        recordingEnabled: Boolean(isVirtual && recordingEnabled),
+        // A Google Meet link is only trustworthy as "google_meet" on
+        // the very first (non-recurring-expansion) occurrence — the
+        // same googleEventId/link would otherwise be duplicated
+        // across every generated occurrence, which isn't meaningful
+        // since each occurrence is its own Calendar event in reality.
+        // Recurring series should be created without a Meet link, or
+        // organizers can attach one per-occurrence via edit.
+        conferenceProvider:
+          index === 0 && meetingLink ? conferenceProvider : undefined,
+        googleEventId: index === 0 ? googleEventId : undefined,
         status: "scheduled" as const,
         recurrence: {
           frequency: rule.frequency ?? "none",
@@ -397,275 +399,96 @@ export const createMeeting = async (
 };
 
 // ─────────────────────────────────────────────────────────────────
-// JOIN — mints a LiveKit access token for the built-in video call.
-// The LiveKit room itself is provisioned lazily here (not at
-// createMeeting time) so a 52-occurrence recurring series doesn't
-// create 52 empty rooms up front — only the ones people actually
-// join. Attendance and "meeting started" activity are then driven
-// automatically off LiveKit's webhooks, not from this endpoint.
+// GOOGLE MEET — generates a real, clickable meet.google.com link via
+// the organizer's own connected Google account (see
+// services/googleCalendarService.ts), for use as this meeting's
+// meetingLink. Called from the create/edit form *before* the meeting
+// itself is saved, so the returned link + googleEventId are just
+// handed back to the client to include in the createMeeting /
+// updateMeeting payload — this endpoint does not touch MeetingModel.
 // ─────────────────────────────────────────────────────────────────
-export const getJoinToken = async (
+export const generateGoogleMeetLink = async (
   req: AuthRequest,
   res: Response,
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (!isLivekitConfigured) {
-      res.status(503).json({
-        success: false,
-        message: "Video calling is not configured on this server",
-      });
-      return;
-    }
-
-    const meeting = await MeetingModel.findById(req.params.id);
-    if (!meeting) {
-      res.status(404).json({ success: false, message: "Meeting not found" });
-      return;
-    }
-    if (!meeting.isVirtual) {
-      res.status(400).json({
-        success: false,
-        message: "This meeting doesn't have a built-in video call",
-      });
-      return;
-    }
-    if (meeting.status !== "scheduled") {
-      res.status(400).json({
-        success: false,
-        message: `Can't join a meeting that is ${meeting.status}`,
-      });
-      return;
-    }
-
     const actorId = req.user!.userId;
-    const role = req.user!.role;
-    const isHost = idOf(meeting.organizer) === actorId;
+    const {
+      title,
+      startTime,
+      endTime,
+      attendeeIds = [],
+    } = req.body as {
+      title?: string;
+      startTime?: string;
+      endTime?: string;
+      attendeeIds?: string[];
+    };
+
+    if (!title || !startTime || !endTime) {
+      res.status(400).json({
+        success: false,
+        message: "title, startTime and endTime are required",
+      });
+      return;
+    }
+    const start = new Date(startTime);
+    const end = new Date(endTime);
     if (
-      !isHost &&
-      role !== "ceo" &&
-      role !== "tech" &&
-      !isParticipant(meeting as unknown as IMeeting, actorId)
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      end <= start
     ) {
-      res
-        .status(403)
-        .json({ success: false, message: "You are not part of this meeting" });
+      res.status(400).json({
+        success: false,
+        message: "endTime must be after startTime",
+      });
       return;
     }
 
-    await ensureRoom({
-      meetingId: meeting._id,
-      title: meeting.title,
-      recordingEnabled: meeting.recordingEnabled,
-    });
-
-    if (meeting.recordingEnabled && !meeting.recordingEgressId) {
-      // Atomic claim: only the request that actually flips this filter
-      // from "no egress yet" to "starting" gets to call LiveKit — a
-      // second simultaneous joiner's update matches zero documents and
-      // claimed comes back null, so recording only ever starts once.
-      const claimed = await MeetingModel.findOneAndUpdate(
-        { _id: meeting._id, recordingEgressId: { $exists: false } },
-        { $set: { recordingStatus: "starting" } },
-      );
-      if (claimed) {
-        try {
-          const { egressId, s3Key } = await startRoomRecording({
-            meetingId: meeting._id,
-          });
-          await MeetingModel.findByIdAndUpdate(meeting._id, {
-            recordingEgressId: egressId,
-            recordingS3Key: s3Key,
-            recordingStatus: "recording",
-          });
-        } catch (err) {
-          console.error("Failed to start meeting recording:", err);
-          await MeetingModel.findByIdAndUpdate(meeting._id, {
-            recordingStatus: "failed",
-          });
-        }
-      }
+    const accessToken = await getValidGoogleAccessToken(actorId);
+    if (!accessToken) {
+      res.status(409).json({
+        success: false,
+        message:
+          "Connect your Google account first to generate a Google Meet link",
+        data: { needsGoogleConnect: true },
+      });
+      return;
     }
 
-    const actorUser = await User.findById(actorId).select("name").lean();
-    const { token, wsUrl, roomName } = await createParticipantToken({
-      meetingId: meeting._id,
-      identity: actorId,
-      name: actorUser?.name ?? "Participant",
-      isHost,
+    const attendeeUsers = attendeeIds.length
+      ? await User.find({ _id: { $in: attendeeIds } })
+          .select("email")
+          .lean()
+      : [];
+
+    const { eventId, hangoutLink } = await createMeetEvent({
+      accessToken,
+      title,
+      startTime: start,
+      endTime: end,
+      attendeeEmails: attendeeUsers
+        .map((u) => u.email)
+        .filter((e): e is string => Boolean(e)),
     });
 
     res.json({
       success: true,
-      message: "Join token issued",
-      data: { token, wsUrl, roomName, isHost },
+      message: "Google Meet link created",
+      data: { meetingLink: hangoutLink, googleEventId: eventId },
     });
-  } catch (err) {
-    next(err);
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────
-// PRESENTER TRANSFER — host-only. Grants screen-share rights to one
-// participant at a time (everyone's join token restricts it by
-// default — see livekitService.createParticipantToken) and revokes
-// it from whoever had it before. Pass the host's own identity to
-// hand presenting back to the host.
-// ─────────────────────────────────────────────────────────────────
-export const transferPresenter = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction,
-): Promise<void> => {
-  try {
-    if (!isLivekitConfigured) {
-      res.status(503).json({
-        success: false,
-        message: "Video calling is not configured on this server",
-      });
-      return;
-    }
-    const { identity } = req.body as { identity?: string };
-    if (!identity) {
-      res.status(400).json({ success: false, message: "identity is required" });
-      return;
-    }
-
-    const meeting = await MeetingModel.findById(req.params.id);
-    if (!meeting) {
-      res.status(404).json({ success: false, message: "Meeting not found" });
-      return;
-    }
-    const actorId = req.user!.userId;
-    const role = req.user!.role;
-    const isHost = idOf(meeting.organizer) === actorId;
-    if (!isHost && role !== "ceo" && role !== "tech") {
-      res.status(403).json({
-        success: false,
-        message: "Only the organizer can transfer the presenter role",
-      });
-      return;
-    }
-    // A non-organizer ceo/tech acting here still needs *a* host
-    // identity to exempt from revocation — the organizer's is the
-    // right one, since that's whose token was minted with permanent
-    // screen-share rights.
-    await setPresenter({
-      meetingId: meeting._id,
-      presenterIdentity: identity,
-      hostIdentity: idOf(meeting.organizer),
+  } catch (err: any) {
+    console.error(
+      "Google Meet link generation failed:",
+      err?.response?.data || err?.message || err,
+    );
+    res.status(502).json({
+      success: false,
+      message:
+        "Couldn't create a Google Meet link right now — check your Google connection and try again",
     });
-
-    res.json({ success: true, message: "Presenter updated", data: {} });
-  } catch (err) {
-    next(err);
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────
-// BREAKOUT ROOMS — host-only. Auto-splits everyone currently in the
-// call (except the host) evenly across N breakout rooms and pushes
-// each participant a move signal over LiveKit's data channel; see
-// components/meetings/LiveCallRoom.tsx on the frontend for the
-// listener that actually performs the reconnect.
-// ─────────────────────────────────────────────────────────────────
-export const startBreakoutRooms = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction,
-): Promise<void> => {
-  try {
-    if (!isLivekitConfigured) {
-      res.status(503).json({
-        success: false,
-        message: "Video calling is not configured on this server",
-      });
-      return;
-    }
-    const { count } = req.body as { count?: number };
-    if (!count || count < 2 || count > 20) {
-      res.status(400).json({
-        success: false,
-        message: "count must be between 2 and 20",
-      });
-      return;
-    }
-
-    const meeting = await MeetingModel.findById(req.params.id);
-    if (!meeting) {
-      res.status(404).json({ success: false, message: "Meeting not found" });
-      return;
-    }
-    const actorId = req.user!.userId;
-    const role = req.user!.role;
-    const isHost = idOf(meeting.organizer) === actorId;
-    if (!isHost && role !== "ceo" && role !== "tech") {
-      res.status(403).json({
-        success: false,
-        message: "Only the organizer can start breakout rooms",
-      });
-      return;
-    }
-
-    const result = await createBreakoutRooms({
-      meetingId: meeting._id,
-      hostIdentity: idOf(meeting.organizer),
-      count,
-    });
-
-    res.json({
-      success: true,
-      message: "Breakout rooms created",
-      data: result,
-    });
-  } catch (err) {
-    next(err);
-  }
-};
-
-export const endBreakoutRooms = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction,
-): Promise<void> => {
-  try {
-    if (!isLivekitConfigured) {
-      res.status(503).json({
-        success: false,
-        message: "Video calling is not configured on this server",
-      });
-      return;
-    }
-    const { count } = req.body as { count?: number };
-    if (!count || count < 2 || count > 20) {
-      res.status(400).json({
-        success: false,
-        message: "count must be between 2 and 20",
-      });
-      return;
-    }
-
-    const meeting = await MeetingModel.findById(req.params.id);
-    if (!meeting) {
-      res.status(404).json({ success: false, message: "Meeting not found" });
-      return;
-    }
-    const actorId = req.user!.userId;
-    const role = req.user!.role;
-    const isHost = idOf(meeting.organizer) === actorId;
-    if (!isHost && role !== "ceo" && role !== "tech") {
-      res.status(403).json({
-        success: false,
-        message: "Only the organizer can end breakout rooms",
-      });
-      return;
-    }
-
-    await closeBreakoutRooms({ meetingId: meeting._id, count });
-
-    res.json({ success: true, message: "Breakout rooms closed", data: {} });
-  } catch (err) {
-    next(err);
   }
 };
 
@@ -886,8 +709,8 @@ export const updateMeeting = async (
       endTime,
       location,
       meetingLink,
-      isVirtual,
-      recordingEnabled,
+      conferenceProvider,
+      googleEventId,
       attendeeIds,
       reminderMinutesBefore,
       force = false,
@@ -899,8 +722,8 @@ export const updateMeeting = async (
       endTime?: string;
       location?: string;
       meetingLink?: string;
-      isVirtual?: boolean;
-      recordingEnabled?: boolean;
+      conferenceProvider?: "custom" | "google_meet";
+      googleEventId?: string;
       attendeeIds?: string[];
       reminderMinutesBefore?: number;
       force?: boolean;
@@ -956,9 +779,9 @@ export const updateMeeting = async (
     if (agenda !== undefined) meeting.agenda = agenda;
     if (location !== undefined) meeting.location = location;
     if (meetingLink !== undefined) meeting.meetingLink = meetingLink;
-    if (isVirtual !== undefined) meeting.isVirtual = isVirtual;
-    if (recordingEnabled !== undefined)
-      meeting.recordingEnabled = meeting.isVirtual && recordingEnabled;
+    if (conferenceProvider !== undefined)
+      meeting.conferenceProvider = conferenceProvider;
+    if (googleEventId !== undefined) meeting.googleEventId = googleEventId;
     if (reminderMinutesBefore !== undefined)
       meeting.reminderMinutesBefore = reminderMinutesBefore;
     meeting.startTime = newStart;
@@ -994,6 +817,31 @@ export const updateMeeting = async (
     }
 
     await meeting.save();
+
+    // Best-effort — keep the underlying Google Calendar event (and
+    // therefore the Meet link's event details) in sync when the time
+    // or title changes. Never blocks the response or fails the update
+    // if Google is unreachable/the organizer's token has lapsed.
+    if (
+      meeting.conferenceProvider === "google_meet" &&
+      meeting.googleEventId &&
+      (timeChanged || title !== undefined)
+    ) {
+      getValidGoogleAccessToken(idOf(meeting.organizer))
+        .then((accessToken) => {
+          if (!accessToken) return;
+          return updateMeetEventTime({
+            accessToken,
+            eventId: meeting.googleEventId!,
+            title,
+            startTime: timeChanged ? newStart : undefined,
+            endTime: timeChanged ? newEnd : undefined,
+          });
+        })
+        .catch((err) =>
+          console.error("Google Calendar event sync on update failed:", err),
+        );
+    }
 
     const organizerUser = await User.findById(meeting.organizer)
       .select("name email")
@@ -1119,24 +967,25 @@ export const cancelMeeting = async (
       }),
     );
 
-    if (isLivekitConfigured) {
-      // Best-effort — a room only exists if someone had already
-      // joined it, and a stray room auto-closes via emptyTimeout
-      // anyway, so failures here are logged and ignored.
-      Promise.all(
-        targets.filter((m) => m.isVirtual).map((m) => deleteRoom(m._id)),
-      ).catch((err) =>
-        console.error("LiveKit room cleanup on cancel failed:", err),
-      );
-      Promise.all(
-        targets
-          .filter(
-            (m) => m.recordingStatus === "recording" && m.recordingEgressId,
-          )
-          .map((m) => stopRoomRecording(m.recordingEgressId!)),
-      ).catch((err) =>
-        console.error("LiveKit recording cleanup on cancel failed:", err),
-      );
+    // Best-effort — delete the Google Calendar event(s) backing any
+    // cancelled meeting's Meet link, so it disappears from the
+    // organizer's calendar instead of sitting there as a stale event.
+    const googleTargets = targets.filter(
+      (m) => m.conferenceProvider === "google_meet" && m.googleEventId,
+    );
+    if (googleTargets.length > 0) {
+      getValidGoogleAccessToken(idOf(meeting.organizer))
+        .then((accessToken) => {
+          if (!accessToken) return;
+          return Promise.all(
+            googleTargets.map((m) =>
+              deleteMeetEvent(accessToken, m.googleEventId!),
+            ),
+          );
+        })
+        .catch((err) =>
+          console.error("Google Calendar event cleanup on cancel failed:", err),
+        );
     }
 
     const organizerUser = await User.findById(meeting.organizer)
@@ -1420,172 +1269,6 @@ export const getMeetingActivityHistory = async (
       success: true,
       message: "Activity retrieved",
       data: { activity },
-    });
-  } catch (err) {
-    next(err);
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────
-// ATTENDANCE — reads the join/leave rows LiveKit's webhooks wrote
-// automatically (see services/livekitService.handleLivekitWebhookEvent)
-// and rolls them up into one entry per participant: total time in
-// the call, every join/leave session, and whether they're in the
-// call right now. Nobody ever marks this by hand.
-// ─────────────────────────────────────────────────────────────────
-export const getMeetingAttendance = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction,
-): Promise<void> => {
-  try {
-    const meeting = await MeetingModel.findById(req.params.id);
-    if (!meeting) {
-      res.status(404).json({ success: false, message: "Meeting not found" });
-      return;
-    }
-    const role = req.user!.role;
-    if (
-      role !== "ceo" &&
-      role !== "tech" &&
-      !isParticipant(meeting as unknown as IMeeting, req.user!.userId)
-    ) {
-      res
-        .status(403)
-        .json({ success: false, message: "You are not part of this meeting" });
-      return;
-    }
-
-    const rows = await MeetingAttendanceModel.find({ meetingId: meeting._id })
-      .sort({ joinedAt: 1 })
-      .lean();
-
-    const now = Date.now();
-    const byIdentity = new Map<
-      string,
-      {
-        identity: string;
-        userId?: string;
-        name: string;
-        totalSeconds: number;
-        currentlyInCall: boolean;
-        sessions: {
-          joinedAt: Date;
-          leftAt?: Date;
-          durationSeconds: number;
-        }[];
-      }
-    >();
-
-    for (const row of rows) {
-      const key = row.identity;
-      const liveSeconds = row.leftAt
-        ? (row.durationSeconds ?? 0)
-        : Math.max(0, Math.round((now - row.joinedAt.getTime()) / 1000));
-
-      const entry = byIdentity.get(key) ?? {
-        identity: row.identity,
-        userId: row.userId ? String(row.userId) : undefined,
-        name: row.name,
-        totalSeconds: 0,
-        currentlyInCall: false,
-        sessions: [],
-      };
-      entry.name = row.name; // most recent session's display name wins
-      entry.totalSeconds += liveSeconds;
-      entry.currentlyInCall = entry.currentlyInCall || !row.leftAt;
-      entry.sessions.push({
-        joinedAt: row.joinedAt,
-        leftAt: row.leftAt,
-        durationSeconds: liveSeconds,
-      });
-      byIdentity.set(key, entry);
-    }
-
-    const attendance = [...byIdentity.values()].sort(
-      (a, b) => b.totalSeconds - a.totalSeconds,
-    );
-
-    res.json({
-      success: true,
-      message: "Attendance retrieved",
-      data: { attendance },
-    });
-  } catch (err) {
-    next(err);
-  }
-};
-
-// ─────────────────────────────────────────────────────────────────
-// RECORDING — a short-lived presigned download URL for the S3 object
-// Egress uploaded (see services/livekitService.startRoomRecording and
-// the egress_ended webhook handler that flips recordingStatus to
-// "available"). Nothing is proxied through this server — the browser
-// downloads straight from S3.
-// ─────────────────────────────────────────────────────────────────
-export const getMeetingRecordingUrl = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction,
-): Promise<void> => {
-  try {
-    const meeting = await MeetingModel.findById(req.params.id);
-    if (!meeting) {
-      res.status(404).json({ success: false, message: "Meeting not found" });
-      return;
-    }
-    const role = req.user!.role;
-    if (
-      role !== "ceo" &&
-      role !== "tech" &&
-      !isParticipant(meeting as unknown as IMeeting, req.user!.userId)
-    ) {
-      res
-        .status(403)
-        .json({ success: false, message: "You are not part of this meeting" });
-      return;
-    }
-
-    if (
-      meeting.recordingStatus === "starting" ||
-      meeting.recordingStatus === "recording"
-    ) {
-      res.status(409).json({
-        success: false,
-        message: "This call is still being recorded — check back once it ends",
-      });
-      return;
-    }
-    if (meeting.recordingStatus === "failed") {
-      res
-        .status(422)
-        .json({ success: false, message: "Recording failed for this meeting" });
-      return;
-    }
-    if (!meeting.recordingS3Key || meeting.recordingStatus !== "available") {
-      res
-        .status(404)
-        .json({
-          success: false,
-          message: "No recording is available for this meeting",
-        });
-      return;
-    }
-
-    const url = await getSignedFileUrl(meeting.recordingS3Key, {
-      filename: `${meeting.title.replace(/[^\w\- ]+/g, "").trim() || "recording"}.mp4`,
-      forceAttachment: true,
-      expiresInSeconds: 900,
-    });
-
-    res.json({
-      success: true,
-      message: "Recording URL issued",
-      data: {
-        url,
-        durationSeconds: meeting.recordingDurationSeconds,
-        sizeBytes: meeting.recordingSizeBytes,
-      },
     });
   } catch (err) {
     next(err);

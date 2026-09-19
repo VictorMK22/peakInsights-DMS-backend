@@ -37,6 +37,9 @@ import {
 import {
   getClientWhatsappMessages,
   sendClientWhatsappMessage,
+  editClientWhatsappMessage,
+  resendClientWhatsappMessage,
+  deleteClientWhatsappMessage,
 } from "../controllers/clientWhatsappController";
 
 const router = Router();
@@ -74,6 +77,9 @@ router.delete("/:id/emails/:emailId", deleteClientEmail);
 // public webhook Meta calls into)
 router.get("/:id/whatsapp", getClientWhatsappMessages);
 router.post("/:id/whatsapp/send", sendClientWhatsappMessage);
+router.patch("/:id/whatsapp/:messageId", editClientWhatsappMessage);
+router.post("/:id/whatsapp/:messageId/resend", resendClientWhatsappMessage);
+router.delete("/:id/whatsapp/:messageId", deleteClientWhatsappMessage);
 
 // Notes — quick running log, separate from sales-stage notes
 router.get("/:id/notes", getClientNotes);

@@ -87,6 +87,181 @@ export const sendClientWhatsappMessage = async (
 };
 
 // ═══════════════════════════════════════════════════════════════
+// EDIT / DELETE / RESEND — CRUD on our own local record of a message.
+//
+// Important limitation: WhatsApp's Business Cloud API has no endpoint
+// to edit or recall a message that has already left our server (no
+// "edit sent message" call exists in the Graph API, and Meta doesn't
+// support us deleting it off the recipient's device either). So:
+//   - Editing is only allowed for a message that never actually
+//     reached the client (queued/failed) — you're correcting a draft
+//     before it goes out, not rewriting something already delivered.
+//   - Resending re-sends the (possibly just-edited) body as a brand
+//     new WhatsApp send for a failed attempt.
+//   - Deleting always just removes our own record of the message —
+//     it does not, and cannot, delete it from the client's phone if
+//     it was actually delivered. The UI should make that clear.
+// ═══════════════════════════════════════════════════════════════
+
+const canManageOwnMessage = (
+  message: { authorId?: unknown; direction: string },
+  userId: string,
+  role: string,
+) => {
+  if (role === "ceo" || role === "tech") return true;
+  if (message.direction !== "outbound") return false;
+  const authorId =
+    message.authorId &&
+    typeof message.authorId === "object" &&
+    "_id" in (message.authorId as any)
+      ? String((message.authorId as any)._id)
+      : String(message.authorId ?? "");
+  return authorId === userId;
+};
+
+/** PATCH /clients/:id/whatsapp/:messageId — edit the body of a message
+ *  that hasn't been delivered yet (queued or failed). */
+export const editClientWhatsappMessage = async (
+  req: AuthRequest,
+  res: Response,
+) => {
+  const ok = await canAccess(req.params.id, req.user!.userId, req.user!.role);
+  if (!ok)
+    return res.status(403).json({ success: false, message: "Access denied" });
+
+  const message = await ClientWhatsappMessageModel.findOne({
+    _id: req.params.messageId,
+    clientId: req.params.id,
+  });
+  if (!message)
+    return res
+      .status(404)
+      .json({ success: false, message: "Message not found" });
+
+  if (!canManageOwnMessage(message, req.user!.userId, req.user!.role)) {
+    return res.status(403).json({
+      success: false,
+      message: "You can only edit your own messages",
+    });
+  }
+  if (!["queued", "failed"].includes(message.waStatus)) {
+    return res.status(409).json({
+      success: false,
+      message:
+        "This message was already sent to WhatsApp and can't be edited — delete it instead if it's wrong",
+    });
+  }
+
+  const { body } = req.body as { body: string };
+  if (!body?.trim())
+    return res
+      .status(400)
+      .json({ success: false, message: "Message body is required" });
+
+  message.body = body.trim();
+  await message.save();
+
+  const populated = await message.populate(
+    "authorId",
+    "name role profilePicture",
+  );
+  return res.json({ success: true, data: { message: populated } });
+};
+
+/** POST /clients/:id/whatsapp/:messageId/resend — re-send a failed
+ *  outbound message (using its current, possibly just-edited, body). */
+export const resendClientWhatsappMessage = async (
+  req: AuthRequest,
+  res: Response,
+) => {
+  const ok = await canAccess(req.params.id, req.user!.userId, req.user!.role);
+  if (!ok)
+    return res.status(403).json({ success: false, message: "Access denied" });
+
+  const client = await ClientModel.findById(req.params.id).select("phone");
+  if (!client) return res.status(404).json({ success: false });
+  if (!client.phone)
+    return res
+      .status(400)
+      .json({ success: false, message: "Client has no phone number on file" });
+
+  const message = await ClientWhatsappMessageModel.findOne({
+    _id: req.params.messageId,
+    clientId: req.params.id,
+  });
+  if (!message)
+    return res
+      .status(404)
+      .json({ success: false, message: "Message not found" });
+
+  if (!canManageOwnMessage(message, req.user!.userId, req.user!.role)) {
+    return res.status(403).json({
+      success: false,
+      message: "You can only resend your own messages",
+    });
+  }
+  if (message.direction !== "outbound" || message.waStatus !== "failed") {
+    return res.status(409).json({
+      success: false,
+      message: "Only a failed outbound message can be resent",
+    });
+  }
+
+  const result = await sendWhatsappTextMessage(client.phone, message.body);
+
+  message.waMessageId = result.waMessageId;
+  message.waStatus = result.ok ? "sent" : "failed";
+  message.waError = result.error;
+  message.timestamp = new Date();
+  await message.save();
+
+  const populated = await message.populate(
+    "authorId",
+    "name role profilePicture",
+  );
+
+  if (!result.ok) {
+    return res.json({
+      success: true,
+      data: { message: populated },
+      warning: result.error,
+    });
+  }
+  return res.json({ success: true, data: { message: populated } });
+};
+
+/** DELETE /clients/:id/whatsapp/:messageId — removes our own record of
+ *  the message. Does not (and cannot) recall it on the client's phone
+ *  if it was actually delivered — see the module note above. */
+export const deleteClientWhatsappMessage = async (
+  req: AuthRequest,
+  res: Response,
+) => {
+  const ok = await canAccess(req.params.id, req.user!.userId, req.user!.role);
+  if (!ok)
+    return res.status(403).json({ success: false, message: "Access denied" });
+
+  const message = await ClientWhatsappMessageModel.findOne({
+    _id: req.params.messageId,
+    clientId: req.params.id,
+  });
+  if (!message)
+    return res
+      .status(404)
+      .json({ success: false, message: "Message not found" });
+
+  if (!canManageOwnMessage(message, req.user!.userId, req.user!.role)) {
+    return res.status(403).json({
+      success: false,
+      message: "You can only delete your own messages",
+    });
+  }
+
+  await message.deleteOne();
+  return res.json({ success: true, message: "Message deleted" });
+};
+
+// ═══════════════════════════════════════════════════════════════
 // META WEBHOOK — public routes, NOT behind the app's authenticate
 // middleware (Meta calls these directly). Mounted at /webhooks/whatsapp
 // in index.ts.
