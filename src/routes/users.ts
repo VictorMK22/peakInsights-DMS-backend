@@ -20,7 +20,11 @@ import {
   createTech,
   createAccountant,
 } from "../controllers/userController";
-import { authenticate, requireRole } from "../middleware/auth";
+import {
+  authenticate,
+  requireRole,
+  requireCeoOrTechSupervisor,
+} from "../middleware/auth";
 
 const router = Router();
 
@@ -84,7 +88,8 @@ router.get("/mappings", requireRole("ceo", "supervisor"), getMappings);
 router.get("/:id/profile", requireRole("ceo", "supervisor"), getUserProfile);
 
 // ─── CEO only (user list + update + deactivate) ───────────────────
-router.get("/", requireRole("ceo"), getAllUsers);
+// CEO, or a supervisor in the Tech department (not other supervisors).
+router.get("/", requireCeoOrTechSupervisor, getAllUsers);
 router.put("/:id", requireRole("ceo"), updateUser);
 router.delete("/:id", requireRole("ceo"), deleteUser);
 // Separate path from the deactivate route above — deliberately not the

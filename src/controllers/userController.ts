@@ -399,8 +399,10 @@ export const getAllUsers = async (
     if (role) filter["role"] = role;
     if (isActive) filter["isActive"] = isActive === "true";
 
-    // Supervisors can only see their own team members
-    if (req.user?.role === "supervisor") {
+    // Supervisors can only see their own team members, except Tech
+    // department supervisors (flagged by requireCeoOrTechSupervisor),
+    // who see the full list.
+    if (req.user?.role === "supervisor" && !res.locals.isTechSupervisor) {
       const mappings = await SupervisorMapping.find({
         supervisorId: req.user.userId,
         status: "active",

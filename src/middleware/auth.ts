@@ -72,6 +72,53 @@ export const authenticate = async (
   }
 };
 
+/**
+ * Departments that count as "Tech". Department is a free-text field set by
+ * the CEO, so match case-insensitively against a configurable list.
+ * Override with TECH_DEPARTMENT_NAMES="ICT,Tech,Technology".
+ */
+const TECH_DEPARTMENTS = (
+  process.env.TECH_DEPARTMENT_NAMES || "ICT,Tech,Technology,IT"
+)
+  .split(",")
+  .map((d) => d.trim().toLowerCase())
+  .filter(Boolean);
+
+/**
+ * Allows the CEO, plus supervisors whose own department is Tech.
+ * Every other supervisor (and every other role) gets a 403.
+ * Sets res.locals.isTechSupervisor so controllers don't re-query.
+ */
+export const requireCeoOrTechSupervisor = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    if (req.user?.role === "ceo") {
+      next();
+      return;
+    }
+    if (req.user?.role === "supervisor") {
+      const me = await User.findById(req.user.userId).select("department");
+      const dept = me?.department?.trim().toLowerCase();
+      if (dept && TECH_DEPARTMENTS.includes(dept)) {
+        res.locals.isTechSupervisor = true;
+        next();
+        return;
+      }
+    }
+    res.status(403).json({
+      success: false,
+      message:
+        "Only the CEO or a Tech department supervisor can view the user list",
+      yourRole: req.user?.role,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 export const authorize = (...roles: UserRole[]) => {
   return (req: AuthRequest, res: Response, next: NextFunction): void => {
     if (!req.user || !roles.includes(req.user.role)) {
