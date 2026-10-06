@@ -16,7 +16,10 @@ router.use(authenticate);
 router.get("/dashboard", getDashboardStats);
 router.get(
   "/accountant-workspace",
-  authorize("accountant", "ceo"),
+  // Scoped to the CALLER's own assigned clients (see the controller), so
+  // opening it to the CEO and supervisors — who can work in the Accountant
+  // workspace — never exposes anyone else's book.
+  authorize("accountant", "ceo", "supervisor"),
   getAccountantWorkspace,
 );
 router.get("/leaderboard", authorize("ceo", "supervisor"), getLeaderboard);

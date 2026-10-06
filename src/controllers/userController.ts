@@ -32,6 +32,88 @@ export function roleForDepartment(
   return "sales_person";
 }
 
+export type WorkspaceKey = "sales" | "accountant" | "tech";
+
+const WORKSPACE_FOR_ROLE: Partial<Record<string, WorkspaceKey>> = {
+  sales_person: "sales",
+  accountant: "accountant",
+  tech: "tech",
+};
+
+/**
+ * Which role-workspaces a supervisor should be able to work in: the ones
+ * their team actually uses.
+ *
+ * - Driven by the roles of the supervisor's ACTIVE, enabled subordinates,
+ *   most common first (so a mostly-sales team with one accountant lists
+ *   "sales" first).
+ * - A supervisor with no team yet falls back to the workspace implied by
+ *   their own department (same mapping demoteSupervisor uses), so a newly
+ *   promoted Finance supervisor isn't left with nothing.
+ *
+ * Pure function — no I/O — so it can be unit tested directly.
+ */
+export function workspacesForTeam(
+  subordinateRoles: string[],
+  supervisorDepartment?: string,
+): WorkspaceKey[] {
+  const counts = new Map<WorkspaceKey, number>();
+  for (const role of subordinateRoles) {
+    const ws = WORKSPACE_FOR_ROLE[role];
+    if (ws) counts.set(ws, (counts.get(ws) ?? 0) + 1);
+  }
+  if (counts.size > 0) {
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => k);
+  }
+  return [WORKSPACE_FOR_ROLE[roleForDepartment(supervisorDepartment)]!];
+}
+
+/**
+ * GET /users/me/workspaces
+ *
+ * The role-workspaces the caller may enter in addition to their home one.
+ * Only supervisors get a non-empty answer (CEO access is a fixed rule on
+ * the frontend; every other role has just their own workspace). Any
+ * authenticated role may call it — non-supervisors simply receive [].
+ */
+export const getMyWorkspaces = async (
+  req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    if (req.user!.role !== "supervisor") {
+      res.json({ success: true, data: { workspaces: [] } });
+      return;
+    }
+
+    const [me, mappings] = await Promise.all([
+      User.findById(req.user!.userId).select("department"),
+      SupervisorMapping.find({
+        supervisorId: req.user!.userId,
+        status: "active",
+      }).select("subordinateId"),
+    ]);
+
+    const subs = await User.find({
+      _id: { $in: mappings.map((m) => m.subordinateId) },
+      isActive: true,
+    }).select("role");
+
+    res.json({
+      success: true,
+      data: {
+        workspaces: workspacesForTeam(
+          subs.map((u) => u.role),
+          me?.department,
+        ),
+      },
+    });
+  } catch (err) {
+    console.error("getMyWorkspaces error:", err);
+    res.status(500).json({ success: false });
+  }
+};
+
 /**
  * CEO ONLY — creates a supervisor account directly.
  * Middleware: requireCEO must be applied on the route.

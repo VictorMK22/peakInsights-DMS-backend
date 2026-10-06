@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { authenticate, requireRole } from "../middleware/auth";
+import { authenticate, requireIctAccess } from "../middleware/auth";
 import { uploadToLocal } from "../middleware/upload";
 import {
   listKbArticles,
@@ -11,7 +11,7 @@ import {
 } from "../controllers/kbController";
 
 const router = Router();
-router.use(authenticate, requireRole("ceo", "tech"));
+router.use(authenticate, requireIctAccess);
 
 router.get("/", listKbArticles);
 router.get("/:id", getKbArticle);

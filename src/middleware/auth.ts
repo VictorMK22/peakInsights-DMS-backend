@@ -119,6 +119,48 @@ export const requireCeoOrTechSupervisor = async (
   }
 };
 
+/**
+ * Gate for the ICT workspace's resources (projects, tickets, assets,
+ * deployments, knowledge base, security, infrastructure, systems,
+ * sprints, team members).
+ *
+ * Allows: the CEO, Tech staff, and supervisors whose own department is
+ * Tech — a Tech supervisor works in the same ICT workspace as their
+ * team. Every other supervisor, and every other role, gets a 403.
+ *
+ * Deliberately NOT applied to the ICT demo-data seeder, which stays
+ * ceo/tech only.
+ */
+export const requireIctAccess = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const role = req.user?.role;
+    if (role === "ceo" || role === "tech") {
+      next();
+      return;
+    }
+    if (role === "supervisor") {
+      const me = await User.findById(req.user!.userId).select("department");
+      const dept = me?.department?.trim().toLowerCase();
+      if (dept && TECH_DEPARTMENTS.includes(dept)) {
+        next();
+        return;
+      }
+    }
+    res.status(403).json({
+      success: false,
+      message:
+        "Access denied. ICT resources require the CEO, a Tech user, or a Tech department supervisor.",
+      yourRole: role ?? "unauthenticated",
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 export const authorize = (...roles: UserRole[]) => {
   return (req: AuthRequest, res: Response, next: NextFunction): void => {
     if (!req.user || !roles.includes(req.user.role)) {

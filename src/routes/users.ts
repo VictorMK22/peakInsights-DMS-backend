@@ -16,6 +16,7 @@ import {
   getUserProfile,
   getNotifications,
   getMyTeammates,
+  getMyWorkspaces,
   getDirectory,
   createTech,
   createAccountant,
@@ -24,6 +25,7 @@ import {
   authenticate,
   requireRole,
   requireCeoOrTechSupervisor,
+  requireIctAccess,
 } from "../middleware/auth";
 
 const router = Router();
@@ -44,9 +46,15 @@ router.get("/notifications", getNotifications);
 // collaboration "invite" picker. Any authenticated role can call this.
 router.get("/teammates", getMyTeammates);
 
-// Minimal user picker for the ICT Team page — ceo/tech only, name +
-// email + department, nothing admin-y. See getDirectory's comment.
-router.get("/directory", requireRole("ceo", "tech"), getDirectory);
+// Role-workspaces the caller may enter besides their home one (a
+// supervisor's team workspaces). Any authenticated role may call it.
+router.get("/me/workspaces", getMyWorkspaces);
+
+// Minimal user picker for the ICT Team page — name + email + department,
+// nothing admin-y. ICT access only (CEO, Tech, Tech supervisors) so the
+// Team page works for a Tech supervisor in the ICT workspace. See
+// getDirectory's comment.
+router.get("/directory", requireIctAccess, getDirectory);
 
 // ─── CEO ONLY ─────────────────────────────────────────────────────
 // All account creation routes are restricted to CEO at the router

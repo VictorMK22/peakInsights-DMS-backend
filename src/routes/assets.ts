@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { authenticate, requireRole } from "../middleware/auth";
+import { authenticate, requireIctAccess } from "../middleware/auth";
 import { uploadToLocal } from "../middleware/upload";
 import {
   listAssets,
@@ -14,7 +14,7 @@ import {
 import { Asset } from "../models/Asset";
 
 const router = Router();
-router.use(authenticate, requireRole("ceo", "tech"));
+router.use(authenticate, requireIctAccess);
 
 router.get("/", listAssets);
 router.post("/", createAsset);

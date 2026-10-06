@@ -1,9 +1,14 @@
 import { Router } from "express";
-import { authenticate, requireRole } from "../middleware/auth";
-import { listInfra, createInfra, heartbeatInfra, deleteInfra } from "../controllers/infraController";
+import { authenticate, requireIctAccess } from "../middleware/auth";
+import {
+  listInfra,
+  createInfra,
+  heartbeatInfra,
+  deleteInfra,
+} from "../controllers/infraController";
 
 const router = Router();
-router.use(authenticate, requireRole("ceo", "tech"));
+router.use(authenticate, requireIctAccess);
 
 router.get("/", listInfra);
 router.post("/", createInfra);

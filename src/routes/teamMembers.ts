@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { authenticate, requireRole } from "../middleware/auth";
+import { authenticate, requireIctAccess } from "../middleware/auth";
 import {
   listTeamMembers,
   addTeamMember,
@@ -8,7 +8,7 @@ import {
 } from "../controllers/teamMemberController";
 
 const router = Router();
-router.use(authenticate, requireRole("ceo", "tech"));
+router.use(authenticate, requireIctAccess);
 
 router.get("/", listTeamMembers);
 router.post("/", addTeamMember);

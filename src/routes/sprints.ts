@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { authenticate, requireRole } from "../middleware/auth";
+import { authenticate, requireIctAccess } from "../middleware/auth";
 import {
   listSprints,
   createSprint,
@@ -9,7 +9,7 @@ import {
 } from "../controllers/sprintController";
 
 const router = Router();
-router.use(authenticate, requireRole("ceo", "tech"));
+router.use(authenticate, requireIctAccess);
 
 router.get("/", listSprints);
 router.post("/", createSprint);

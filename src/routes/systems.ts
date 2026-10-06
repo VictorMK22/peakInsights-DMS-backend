@@ -1,9 +1,14 @@
 import { Router } from "express";
-import { authenticate, requireRole } from "../middleware/auth";
-import { listSystems, createSystem, updateSystemStatus, restartSystem } from "../controllers/systemController";
+import { authenticate, requireIctAccess } from "../middleware/auth";
+import {
+  listSystems,
+  createSystem,
+  updateSystemStatus,
+  restartSystem,
+} from "../controllers/systemController";
 
 const router = Router();
-router.use(authenticate, requireRole("ceo", "tech"));
+router.use(authenticate, requireIctAccess);
 
 router.get("/", listSystems);
 router.post("/", createSystem);

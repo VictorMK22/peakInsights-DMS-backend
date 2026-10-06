@@ -1,9 +1,13 @@
 import { Router } from "express";
-import { authenticate, requireRole } from "../middleware/auth";
-import { listSecurityEvents, logSecurityEvent, getSecuritySummary } from "../controllers/securityController";
+import { authenticate, requireIctAccess } from "../middleware/auth";
+import {
+  listSecurityEvents,
+  logSecurityEvent,
+  getSecuritySummary,
+} from "../controllers/securityController";
 
 const router = Router();
-router.use(authenticate, requireRole("ceo", "tech"));
+router.use(authenticate, requireIctAccess);
 
 router.get("/events", listSecurityEvents);
 router.post("/events", logSecurityEvent);

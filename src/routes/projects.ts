@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { authenticate, requireRole } from "../middleware/auth";
+import { authenticate, requireIctAccess } from "../middleware/auth";
 import {
   listProjects,
   createProject,
@@ -15,7 +15,7 @@ import {
 } from "../controllers/projectController";
 
 const router = Router();
-router.use(authenticate, requireRole("ceo", "tech"));
+router.use(authenticate, requireIctAccess);
 
 router.get("/", listProjects);
 router.post("/", createProject);
