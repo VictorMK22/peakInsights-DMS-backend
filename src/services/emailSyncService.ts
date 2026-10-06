@@ -69,6 +69,24 @@ function computeInternalDedupeKey(
   return crypto.createHash("sha256").update(normalized).digest("hex");
 }
 
+/** Plain-text preview of an HTML email body: drops <style>/<script>/<head>,
+ *  strips tags, decodes common entities, collapses whitespace. */
+function htmlToPreview(html: string, max = 200): string {
+  return html
+    .replace(/<(style|script|head|title)[\s\S]*?<\/\1>/gi, " ")
+    .replace(/<br\s*\/?>|<\/(p|div|tr|li)>/gi, " ")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
 async function syncOneMailbox(
   integration: IEmailIntegration,
 ): Promise<{ messagesFound: number; messagesSynced: number }> {
@@ -296,9 +314,7 @@ async function syncInternalMessage(
         direction === "outbound" ? counterpart : integration.emailAddress,
       subject: msg.subject,
       body: body || "(no content)",
-      bodyPreview: (body || "(no content)")
-        .replace(/<[^>]*>/g, "")
-        .slice(0, 200),
+      bodyPreview: htmlToPreview(body || "(no content)"),
       status: "sent",
       sentAt: new Date(epochMs),
       lastMessageAt: new Date(epochMs),
