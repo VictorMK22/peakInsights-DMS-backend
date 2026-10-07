@@ -2,6 +2,19 @@ import mongoose, { Document, Schema } from "mongoose";
 
 export type EmailStatus = "pending" | "sent" | "failed";
 
+// A file attached to an email — either uploaded by the sender in the app, or
+// pulled from a synced mailbox. `fileKey` is the S3 key (never a URL; fresh
+// signed URLs are built at read time, see services/emailAttachmentService.ts).
+export interface IEmailAttachment {
+  fileKey: string;
+  filename: string;
+  mimeType?: string;
+  size?: number;
+  // Content-ID for images embedded in an HTML body via <img src="cid:...">.
+  // Synced emails use this so inline images can be resolved to a real URL.
+  contentId?: string;
+}
+
 export interface IEmailLog extends Document {
   _id: mongoose.Types.ObjectId;
 
@@ -54,9 +67,36 @@ export interface IEmailLog extends Document {
   // "I've already logged this" and skip it instead of creating a duplicate.
   dedupeKey?: string;
 
+  attachments?: IEmailAttachment[];
+  // Set when the attachment backfill has looked at this synced email (whether
+  // or not it found anything), so one that keeps failing can't starve the rest.
+  attachmentsCheckedAt?: Date;
+
+  // Announcement ("send to everyone") support. A broadcast is stored as one
+  // EmailLog per recipient (so every person has their own inbox copy, read
+  // state and reply thread), all sharing a broadcastId. Only the "lead" copy
+  // is shown in the sender's Sent list, so one announcement = one row.
+  broadcastId?: mongoose.Types.ObjectId;
+  broadcastLead?: boolean;
+  broadcastRecipientCount?: number;
+  // Set once someone replies — lets a broadcaster's inbox surface the
+  // recipient copies that actually received a reply.
+  hasReplies?: boolean;
+
   createdAt: Date;
   updatedAt: Date;
 }
+
+const EmailAttachmentSchema = new Schema<IEmailAttachment>(
+  {
+    fileKey: { type: String, required: true },
+    filename: { type: String, required: true },
+    mimeType: { type: String },
+    size: { type: Number },
+    contentId: { type: String },
+  },
+  { _id: true },
+);
 
 const EmailLogSchema = new Schema<IEmailLog>(
   {
@@ -160,6 +200,18 @@ const EmailLogSchema = new Schema<IEmailLog>(
     dedupeKey: {
       type: String,
     },
+
+    attachments: {
+      type: [EmailAttachmentSchema],
+      default: undefined,
+    },
+
+    attachmentsCheckedAt: { type: Date },
+
+    broadcastId: { type: Schema.Types.ObjectId },
+    broadcastLead: { type: Boolean },
+    broadcastRecipientCount: { type: Number },
+    hasReplies: { type: Boolean },
   },
   { timestamps: true },
 );
@@ -172,6 +224,7 @@ EmailLogSchema.index({ receiverId: 1, parentId: 1, lastMessageAt: -1 });
 EmailLogSchema.index({ senderId: 1, parentId: 1, lastMessageAt: -1 });
 EmailLogSchema.index({ parentId: 1, createdAt: 1 });
 EmailLogSchema.index({ ccIds: 1, parentId: 1, lastMessageAt: -1 });
+EmailLogSchema.index({ broadcastId: 1, status: 1 });
 // Prevents the same staff-to-staff email being logged twice when both
 // participants have their mailbox connected and synced independently.
 EmailLogSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });

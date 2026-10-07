@@ -427,7 +427,8 @@ export const sendClientEmail = async (req: AuthRequest, res: Response) => {
         fromEmail: sender?.email,
         attachments: uploadedFiles.map((f) => ({
           filename: f.originalname,
-          path: f.path,
+          // memoryStorage (Vercel) has no f.path — send the buffer
+          content: f.buffer,
           contentType: f.mimetype,
         })),
       });

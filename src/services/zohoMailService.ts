@@ -144,6 +144,7 @@ export async function listMessages(
   folderId: string,
   sinceEpochMs: number,
   limit = 50,
+  start = 1, // 1-based offset, for paging back through older mail
 ): Promise<ZohoMessageSummary[]> {
   const res = await axios.get(
     `https://${MAIL_API_DOMAIN}/api/accounts/${accountId}/messages/view`,
@@ -152,6 +153,7 @@ export async function listMessages(
       params: {
         folderId,
         limit,
+        start,
         sortBy: "date",
         sortorder: false, // newest first
       },
@@ -190,6 +192,8 @@ export interface ZohoAttachmentMeta {
   attachmentName: string;
   attachmentSize: number;
   contentType: string;
+  /** Content-ID for images embedded in the HTML body (<img src="cid:...">), when Zoho reports one. */
+  contentId?: string;
 }
 
 export async function listMessageAttachments(
@@ -202,8 +206,42 @@ export async function listMessageAttachments(
     `https://${MAIL_API_DOMAIN}/api/accounts/${accountId}/folders/${folderId}/messages/${messageId}/attachmentinfo`,
     { headers: authHeader(accessToken) },
   );
-  return res.data?.data ?? [];
+  // Zoho nests the list under data.attachments; accept a bare array too.
+  const raw = res.data?.data;
+  const list: any[] = Array.isArray(raw) ? raw : (raw?.attachments ?? []);
+  return list.map((a) => ({
+    attachmentId: String(a.attachmentId),
+    attachmentName: a.attachmentName || a.fileName || "attachment",
+    attachmentSize: Number(a.attachmentSize ?? a.size ?? 0),
+    contentType:
+      a.contentType ||
+      a.attachmentContentType ||
+      guessMimeType(a.attachmentName || a.fileName || ""),
+    contentId: (a.cid || a.contentId || a.cId || undefined) as
+      | string
+      | undefined,
+  }));
 }
+
+const MIME_BY_EXT: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  csv: "text/csv",
+  txt: "text/plain",
+  zip: "application/zip",
+};
+/** Zoho doesn't always return a content type — infer it so images still render as images. */
+const guessMimeType = (name: string) =>
+  MIME_BY_EXT[name.split(".").pop()?.toLowerCase() ?? ""] ??
+  "application/octet-stream";
 
 export async function downloadAttachment(
   accessToken: string,

@@ -21,6 +21,9 @@ import {
   ZohoMessageSummary,
 } from "./zohoMailService";
 
+const MAX_SYNCED_ATTACHMENTS = 10;
+const MAX_SYNCED_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+
 /** Refreshes the stored access token if it's expired or about to be. */
 async function ensureFreshToken(
   integration: IEmailIntegration,
@@ -189,12 +192,105 @@ async function syncOneMailbox(
     }
   }
 
+  // One-time, automatic catch-up for internal emails synced before
+  // attachments were supported. Best-effort: never fails the sync.
+  try {
+    await backfillInternalAttachments(
+      integration,
+      accessToken,
+      accountId,
+      targets,
+      staffByEmail,
+    );
+  } catch (err) {
+    console.error(
+      `Zoho sync: attachment backfill failed for ${integration.emailAddress}:`,
+      err,
+    );
+  }
+
   integration.lastSyncedAt = new Date(newestSeen);
   integration.status = "connected";
   integration.lastError = undefined;
   await integration.save();
 
   return { messagesFound, messagesSynced };
+}
+
+// ── Attachment backfill ───────────────────────────────────────────
+// Internal emails synced before attachment support have none stored, and
+// the normal incremental sync never looks at them again. This walks back
+// through recent mail once per mailbox and fills them in. It is budgeted
+// per run (serverless time limits) and resumes on the next sync until it
+// has covered everything, then records attachmentBackfilledAt and stops.
+const BACKFILL_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
+const BACKFILL_MAX_FILLED_PER_RUN = 8;
+const BACKFILL_MAX_PAGES = 6; // x50 messages per folder
+
+async function backfillInternalAttachments(
+  integration: IEmailIntegration,
+  accessToken: string,
+  accountId: string,
+  targets: { folderId: string; direction: "inbound" | "outbound" }[],
+  staffByEmail: Map<string, unknown>,
+): Promise<void> {
+  if (integration.attachmentBackfilledAt) return;
+
+  const since = Date.now() - BACKFILL_WINDOW_MS;
+  let filled = 0;
+
+  for (const target of targets) {
+    for (let page = 0; page < BACKFILL_MAX_PAGES; page++) {
+      const messages = await listMessages(
+        accessToken,
+        accountId,
+        target.folderId,
+        since,
+        50,
+        page * 50 + 1,
+      );
+
+      for (const msg of messages) {
+        if (!msg.hasAttachment) continue;
+        const counterpart = extractCounterpartEmail(
+          target.direction === "inbound" ? msg.fromAddress : msg.toAddress,
+        );
+        if (!staffByEmail.has(counterpart)) continue; // client mail is handled elsewhere
+
+        const log = await EmailLog.findOne({
+          dedupeKey: computeInternalDedupeKey(
+            [integration.emailAddress, counterpart],
+            msg.subject,
+            Number(msg.receivedTime),
+          ),
+          attachmentsCheckedAt: { $exists: false },
+        }).select("_id attachments");
+        if (!log || log.attachments?.length) continue;
+
+        if (filled >= BACKFILL_MAX_FILLED_PER_RUN) return; // resume next sync
+        filled++;
+
+        const attachments = await syncAttachments(
+          accessToken,
+          accountId,
+          target.folderId,
+          msg,
+        );
+        await EmailLog.updateOne(
+          { _id: log._id },
+          {
+            ...(attachments.length ? { attachments } : {}),
+            attachmentsCheckedAt: new Date(),
+          },
+        );
+      }
+
+      // A short page means we've reached the end of the window.
+      if (messages.length < 50) break;
+    }
+  }
+
+  integration.attachmentBackfilledAt = new Date();
 }
 
 async function syncClientMessage(
@@ -303,9 +399,13 @@ async function syncInternalMessage(
     );
   }
 
-  // Note: EmailLog has no attachments field today, so internal synced
-  // messages are logged text-only. Attachments still sync fine for the
-  // client-facing side (see syncClientMessage / ClientEmail).
+  const attachments = await syncAttachments(
+    accessToken,
+    accountId,
+    folderId,
+    msg,
+  );
+
   try {
     await EmailLog.create({
       senderId: direction === "inbound" ? otherUserId : integration.userId,
@@ -321,6 +421,7 @@ async function syncInternalMessage(
       parentId: null,
       source: "external_sync",
       dedupeKey,
+      attachments: attachments.length ? attachments : undefined,
     });
     return true;
   } catch (err: any) {
@@ -342,7 +443,13 @@ async function syncAttachments(
   folderId: string,
   msg: ZohoMessageSummary,
 ): Promise<
-  { filename: string; fileKey: string; size: number; mimeType: string }[]
+  {
+    filename: string;
+    fileKey: string;
+    size: number;
+    mimeType: string;
+    contentId?: string;
+  }[]
 > {
   if (!msg.hasAttachment) return [];
   try {
@@ -353,7 +460,9 @@ async function syncAttachments(
       msg.messageId,
     );
     const results = [];
-    for (const meta of metas) {
+    for (const meta of metas.slice(0, MAX_SYNCED_ATTACHMENTS)) {
+      // Skip oversized files rather than risk the serverless function timing out.
+      if (meta.attachmentSize > MAX_SYNCED_ATTACHMENT_BYTES) continue;
       const buffer = await downloadAttachment(
         accessToken,
         accountId,
@@ -371,6 +480,7 @@ async function syncAttachments(
         fileKey,
         size: meta.attachmentSize,
         mimeType: meta.contentType,
+        contentId: meta.contentId,
       });
     }
     return results;

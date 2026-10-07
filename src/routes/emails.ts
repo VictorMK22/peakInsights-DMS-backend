@@ -9,12 +9,23 @@ import {
   markEmailRead,
   getUnreadEmailCount,
   syncEmailsNow,
+  getBroadcastAudience,
+  sendBroadcast,
+  getAttachmentLimits,
+  presignAttachmentUploads,
+  getEmailContacts,
 } from "../controllers/emailController";
+import { emailUpload } from "../middleware/emailUpload";
 
 const router = Router();
 router.use(authenticate);
 
-router.post("/", sendEmailDirect);
+router.post("/", emailUpload, sendEmailDirect);
+router.get("/contacts", getEmailContacts);
+router.get("/attachments/limits", getAttachmentLimits);
+router.post("/attachments/presign", presignAttachmentUploads);
+router.get("/broadcast/audience", getBroadcastAudience);
+router.post("/broadcast", emailUpload, sendBroadcast);
 router.get("/sent", getSentEmails);
 router.get("/inbox", getInboxEmails);
 router.post("/sync-now", syncEmailsNow);

@@ -1,6 +1,14 @@
-import { EmailLog } from "../models/EmailLog";
+import mongoose from "mongoose";
+import { EmailLog, IEmailAttachment } from "../models/EmailLog";
 import { sendDirectUserEmail } from "./emailService";
 import { AuditLog } from "../models/AuditLog";
+import { MailAttachment } from "./emailAttachmentService";
+
+// Recipients per SMTP transaction for announcements. Providers cap
+// recipients per message (Zoho's limit is low on some plans), so a big
+// announcement is split into several BCC batches.
+const BROADCAST_BATCH_SIZE =
+  Number(process.env.EMAIL_BROADCAST_BATCH_SIZE) || 40;
 
 export async function sendTrackedEmail({
   senderId,
@@ -16,6 +24,8 @@ export async function sendTrackedEmail({
   userAgent,
   supervisorId,
   parentId,
+  attachments,
+  mailAttachments,
 }: any) {
   const now = new Date();
   const cc: { _id: string; email: string }[] = ccUsers ?? [];
@@ -63,13 +73,17 @@ export async function sendTrackedEmail({
     status: "pending",
     parentId: parentId || undefined,
     lastMessageAt: now,
+    attachments: attachments?.length ? attachments : undefined,
   });
 
   // A reply landed — bump the root thread's lastMessageAt so the
   // conversation resurfaces to the top of the inbox/sent list, same
   // as Messages does.
   if (parentId) {
-    await EmailLog.findByIdAndUpdate(parentId, { lastMessageAt: now });
+    await EmailLog.findByIdAndUpdate(parentId, {
+      lastMessageAt: now,
+      hasReplies: true,
+    });
   }
 
   try {
@@ -84,6 +98,7 @@ export async function sendTrackedEmail({
       inReplyTo,
       references,
       quoted,
+      attachments: mailAttachments,
     });
 
     log.status = "sent";
@@ -121,4 +136,109 @@ export async function sendTrackedEmail({
 
     throw err;
   }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// ANNOUNCEMENT ("send to everyone")
+// ═════════════════════════════════════════════════════════════════
+export interface BroadcastRecipient {
+  _id: string;
+  email: string;
+}
+
+export async function sendBroadcastEmail({
+  senderId,
+  senderName,
+  senderEmail,
+  recipients,
+  subject,
+  body,
+  attachments,
+  mailAttachments,
+  ipAddress,
+  userAgent,
+  supervisorId,
+}: {
+  senderId: string;
+  senderName?: string;
+  senderEmail?: string;
+  recipients: BroadcastRecipient[];
+  subject: string;
+  body: string;
+  attachments?: IEmailAttachment[];
+  mailAttachments?: MailAttachment[];
+  ipAddress?: string;
+  userAgent?: string;
+  supervisorId?: unknown;
+}) {
+  const now = new Date();
+  const broadcastId = new mongoose.Types.ObjectId();
+
+  // One log per recipient so each person gets their own inbox copy,
+  // read state and reply thread. Only the first ("lead") is listed in
+  // the sender's Sent view.
+  await EmailLog.insertMany(
+    recipients.map((r, i) => ({
+      senderId,
+      receiverId: r._id,
+      toEmail: r.email,
+      subject,
+      body,
+      bodyPreview: body.slice(0, 200),
+      status: "pending",
+      lastMessageAt: now,
+      attachments: attachments?.length ? attachments : undefined,
+      broadcastId,
+      broadcastLead: i === 0,
+      broadcastRecipientCount: recipients.length,
+    })),
+  );
+
+  let sent = 0;
+  let failed = 0;
+  let firstError: string | undefined;
+
+  // Anchor address for the visible "To:" — recipients are all BCC'd.
+  const anchor = senderEmail || process.env.SMTP_USER || "";
+
+  for (let i = 0; i < recipients.length; i += BROADCAST_BATCH_SIZE) {
+    const batch = recipients.slice(i, i + BROADCAST_BATCH_SIZE);
+    const ids = batch.map((r) => r._id);
+    try {
+      const result = await sendDirectUserEmail({
+        toEmail: anchor,
+        bccEmails: batch.map((r) => r.email),
+        fromName: senderName,
+        fromEmail: senderEmail,
+        subject,
+        body,
+        attachments: mailAttachments,
+        broadcast: true,
+      });
+      await EmailLog.updateMany(
+        { broadcastId, receiverId: { $in: ids } },
+        { status: "sent", sentAt: new Date(), messageId: result?.messageId },
+      );
+      sent += batch.length;
+    } catch (err: any) {
+      const reason = err?.message || "Unknown email error";
+      firstError ??= reason;
+      await EmailLog.updateMany(
+        { broadcastId, receiverId: { $in: ids } },
+        { status: "failed", error: reason },
+      );
+      failed += batch.length;
+    }
+  }
+
+  await AuditLog.create({
+    actorId: senderId,
+    action: "email_broadcast_sent",
+    supervisorIdAtTime: supervisorId,
+    details: { subject, recipientCount: recipients.length, sent, failed },
+    ipAddress,
+    userAgent,
+  });
+
+  return { broadcastId, total: recipients.length, sent, failed, firstError };
 }

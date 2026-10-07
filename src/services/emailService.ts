@@ -37,9 +37,24 @@ interface DirectEmailOptions {
     date: string; // pre-formatted, human readable
     body: string;
   };
-  /** Files on local disk to attach — absolute paths (see middleware/upload.ts). */
-  attachments?: { filename: string; path: string; contentType?: string }[];
+  /** Files to attach — in-memory buffers (Vercel has no persistent disk), or a path/URL. */
+  attachments?: MailAttachment[];
+  /**
+   * Blind-copy recipients. Used for announcements so one SMTP transaction
+   * reaches many people without exposing anyone's address to the others.
+   */
+  bccEmails?: string[];
+  /** Renders the "Announcement from …" layout instead of a 1:1 message. */
+  broadcast?: boolean;
 }
+
+/** An attachment as nodemailer accepts it. Prefer `content` on serverless. */
+type MailAttachment = {
+  filename: string;
+  content?: Buffer;
+  path?: string;
+  contentType?: string;
+};
 
 // ─── Transport ────────────────────────────────────────────────────
 
@@ -67,7 +82,7 @@ function getTransporter(): Transporter | null {
     // a hung SMTP handshake looks exactly like "email never arrived".
     connectionTimeout: 10_000,
     greetingTimeout: 10_000,
-    socketTimeout: 20_000,
+    socketTimeout: 45_000, // large attachments take a while to stream over SMTP
   });
 
   return transporter;
@@ -83,8 +98,8 @@ async function send(
   html: string,
   replyTo?: string,
   threading?: { inReplyTo?: string; references?: string[] },
-  attachments?: { filename: string; path: string; contentType?: string }[],
-  opts?: { cc?: string[]; throwOnError?: boolean },
+  attachments?: MailAttachment[],
+  opts?: { cc?: string[]; bcc?: string[]; throwOnError?: boolean },
 ): Promise<SentMessageInfo | null> {
   const t = getTransporter();
   if (!t) {
@@ -103,6 +118,7 @@ async function send(
       from: from, // 🔥 FIXED (ONLY AUTH USER)
       to,
       cc: opts?.cc?.length ? opts.cc : undefined,
+      bcc: opts?.bcc?.length ? opts.bcc : undefined,
       subject,
       html,
       replyTo,
@@ -439,6 +455,8 @@ export async function sendDirectUserEmail(
     references,
     quoted,
     attachments,
+    bccEmails,
+    broadcast,
   } = options;
 
   const safeSubject = subject.slice(0, 150);
@@ -477,16 +495,29 @@ export async function sendDirectUserEmail(
     timestamp: new Date().toISOString(),
   });
 
+  const attachmentNote = attachments?.length
+    ? p(
+        "<strong>Attachments:</strong> " +
+          attachments.map((a) => escapeHtml(a.filename)).join(", "),
+      )
+    : "";
+
+  const heading = broadcast
+    ? "Announcement from " + senderLine
+    : (quoted ? "Reply from " : "New message for ") +
+      (quoted ? senderLine : (toName ?? "you"));
+
   const result = await send(
     toEmail,
     safeSubject,
     wrap(
-      quoted ? "New Reply" : "New Email Message",
+      broadcast ? "Announcement" : quoted ? "New Reply" : "New Email Message",
       `
-      ${h1((quoted ? "Reply from " : "New message for ") + (quoted ? senderLine : (toName ?? "you")))}
-      ${quoted ? "" : p("<strong>From:</strong> " + senderLine)}
+      ${h1(heading)}
+      ${quoted || broadcast ? "" : p("<strong>From:</strong> " + senderLine)}
       ${ccEmails?.length ? p("<strong>Cc:</strong> " + ccEmails.map(escapeHtml).join(", ")) : ""}
       ${p(safeBody)}
+      ${attachmentNote}
       ${quoteBlock}
       ${highlight("Reply directly to respond to the sender.")}
     `,
@@ -500,7 +531,7 @@ export async function sendDirectUserEmail(
     // throwOnError so the real SMTP reason (auth failure, timeout,
     // not-configured…) lands in EmailLog.error instead of the useless
     // generic "SMTP send failed".
-    { cc: ccEmails, throwOnError: true },
+    { cc: ccEmails, bcc: bccEmails, throwOnError: true },
   );
 
   if (!result?.messageId) {

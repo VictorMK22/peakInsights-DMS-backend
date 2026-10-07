@@ -51,7 +51,23 @@ export const serveFile = async (req: Request, res: Response): Promise<void> => {
     // Short expiry is fine and intentional — the browser follows the
     // redirect within milliseconds of receiving it, this is never
     // meant to be a link a person holds onto.
-    const s3Url = await getSignedFileUrl(fileKey, { expiresInSeconds: 60 });
+    // Optional display name + forced download. These are NOT covered by the
+    // HMAC token, which is fine: they only change the Content-Disposition
+    // header on a file the token already authorises. The name is stripped
+    // of anything that could break out of the header.
+    const { name, download } = req.query as {
+      name?: string;
+      download?: string;
+    };
+    const safeName = name
+      ? name.replace(/[\u0000-\u001f"\\/]/g, "").slice(0, 150) || undefined
+      : undefined;
+
+    const s3Url = await getSignedFileUrl(fileKey, {
+      expiresInSeconds: 60,
+      filename: safeName,
+      forceAttachment: download === "1",
+    });
     res.redirect(302, s3Url);
   } catch (err) {
     console.error("serveFile error:", err);

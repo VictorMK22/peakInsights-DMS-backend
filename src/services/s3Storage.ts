@@ -1,11 +1,13 @@
 import {
   S3Client,
+  HeadObjectCommand,
   PutObjectCommand,
   DeleteObjectCommand,
   GetObjectCommand,
   CopyObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
 import { v4 as uuid } from "uuid";
 import path from "path";
 
@@ -149,7 +151,9 @@ export async function getSignedFileUrl(
   const command = new GetObjectCommand({
     Bucket: BUCKET,
     Key: fileKey,
-    ResponseContentDisposition: `${disposition}; filename="${encodeURIComponent(displayName)}"`,
+    // ASCII fallback + RFC 5987 filename* so names with spaces/accents
+    // download as "Q3 Report.pdf" rather than "Q3%20Report.pdf".
+    ResponseContentDisposition: `${disposition}; filename="${displayName.replace(/[^\x20-\x7e]/g, "_")}"; filename*=UTF-8''${encodeURIComponent(displayName)}`,
   });
 
   return getSignedUrl(s3, command, {
@@ -171,4 +175,45 @@ export async function downloadFromS3(key: string): Promise<Buffer> {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   }
   return Buffer.concat(chunks);
+}
+
+/**
+ * Creates a presigned POST so the BROWSER can upload straight to S3 —
+ * the file bytes never pass through the serverless function, which is what
+ * lifts Vercel's 4.5 MB request-body cap. S3 itself enforces the size range
+ * and content type, so a client can't upload more than it asked for.
+ * The bucket needs a CORS rule allowing POST from the frontend origin.
+ */
+export async function createDirectUploadPost(
+  key: string,
+  contentType: string,
+  maxBytes: number,
+  expiresInSeconds = 600,
+): Promise<{ url: string; fields: Record<string, string> }> {
+  return createPresignedPost(s3, {
+    Bucket: BUCKET,
+    Key: key,
+    Conditions: [
+      ["content-length-range", 1, maxBytes],
+      ["eq", "$Content-Type", contentType],
+    ],
+    Fields: { "Content-Type": contentType },
+    Expires: expiresInSeconds,
+  });
+}
+
+/** Size/type of a stored object as S3 actually has it, or null if it doesn't exist. */
+export async function headObject(
+  key: string,
+): Promise<{ size: number; contentType?: string } | null> {
+  try {
+    const res = await s3.send(
+      new HeadObjectCommand({ Bucket: BUCKET, Key: key }),
+    );
+    return { size: res.ContentLength ?? 0, contentType: res.ContentType };
+  } catch (err: any) {
+    if (err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404)
+      return null;
+    throw err;
+  }
 }

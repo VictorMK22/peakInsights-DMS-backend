@@ -31,6 +31,7 @@ const AuditLogSchema = new Schema<IAuditLog>(
         "downloaded",
         "email_sent",
         "email_failed",
+        "email_broadcast_sent",
         "trashed",
         "restored",
         "permanently_deleted",
