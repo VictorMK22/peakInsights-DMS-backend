@@ -38,7 +38,6 @@ const canViewTask = (
   role: string,
 ): boolean =>
   role === "ceo" ||
-  role === "tech" ||
   idOf(task.assignedBy) === userId ||
   idOf(task.assignedTo) === userId ||
   task.collaborators.some(
@@ -237,8 +236,13 @@ export const getTasks = async (
     if (status) filter["status"] = status;
     if (priority) filter["priority"] = priority;
 
-    if (role === "accountant") {
-      filter["$or"] = [
+    // Only the CEO sees every task. Everyone else sees what concerns them:
+    //  - accountant / sales_person: tasks assigned to them, plus tasks
+    //    they've been invited to collaborate on
+    //  - tech: the same, plus tasks they assigned (tech can create tasks)
+    //  - supervisor: tasks assigned to or by them
+    if (role === "accountant" || role === "sales_person" || role === "tech") {
+      const mine: Record<string, unknown>[] = [
         { assignedTo: userId },
         {
           collaborators: {
@@ -246,6 +250,8 @@ export const getTasks = async (
           },
         },
       ];
+      if (role === "tech") mine.push({ assignedBy: userId });
+      filter["$or"] = mine;
     } else if (role === "supervisor") {
       filter["$or"] = [{ assignedTo: userId }, { assignedBy: userId }];
     }
@@ -327,7 +333,7 @@ export const updateTask = async (
 
     const isAssigner = task.assignedBy.toString() === req.user!.userId;
     const isAssignee = task.assignedTo.toString() === req.user!.userId;
-    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
+    const isCEO = req.user!.role === "ceo";
 
     if (!isAssigner && !isAssignee && !isCEO) {
       res.status(403).json({ success: false, message: "Access denied" });
@@ -396,7 +402,7 @@ export const updateTaskStatus = async (
     const userId = req.user!.userId;
     const isAssignee = task.assignedTo.toString() === userId;
     const isAssigner = task.assignedBy.toString() === userId;
-    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
+    const isCEO = req.user!.role === "ceo";
     const isSupervisor = req.user!.role === "supervisor";
 
     const {
@@ -645,7 +651,7 @@ export const deleteTask = async (
     }
 
     const isAssigner = task.assignedBy.toString() === req.user!.userId;
-    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
+    const isCEO = req.user!.role === "ceo";
 
     if (!isAssigner && !isCEO) {
       res.status(403).json({
@@ -684,7 +690,7 @@ export const inviteTaskCollaborator = async (
     }
 
     const isAssignee = task.assignedTo.toString() === req.user!.userId;
-    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
+    const isCEO = req.user!.role === "ceo";
 
     if (!isAssignee && !isCEO) {
       res.status(403).json({
@@ -932,7 +938,7 @@ export const revokeTaskCollaborator = async (
     }
 
     const isAssignee = task.assignedTo.toString() === req.user!.userId;
-    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
+    const isCEO = req.user!.role === "ceo";
 
     if (!isAssignee && !isCEO) {
       res.status(403).json({
@@ -1176,6 +1182,31 @@ export const approveTask = async (
         message: "Only CEO, Tech, or Supervisor can approve tasks",
       });
       return;
+    }
+
+    if (role === "tech" && task.assignedBy.toString() !== userId) {
+      res.status(403).json({
+        success: false,
+        message: "You can only approve tasks you assigned",
+      });
+      return;
+    }
+
+    // A supervisor approves only their own team's work: tasks they
+    // assigned, or tasks assigned to one of their active subordinates.
+    if (role === "supervisor" && task.assignedBy.toString() !== userId) {
+      const inTeam = await SupervisorMapping.exists({
+        supervisorId: userId,
+        subordinateId: task.assignedTo,
+        status: "active",
+      });
+      if (!inTeam) {
+        res.status(403).json({
+          success: false,
+          message: "You can only approve tasks from your own team",
+        });
+        return;
+      }
     }
 
     if (task.status !== "submitted") {

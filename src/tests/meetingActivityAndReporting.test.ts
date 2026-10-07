@@ -28,7 +28,7 @@ describe("Meeting lifecycle — full automatic activity trail", () => {
   it("writes one activity entry per lifecycle event, in order, with no manual logging", async () => {
     const { token: ceoToken } = await createUserWithToken("ceo");
     const { user: attendee, token: attendeeToken } =
-      await createUserWithToken("user");
+      await createUserWithToken("accountant");
 
     const createRes = await request(app)
       .post("/api/meetings")
@@ -175,7 +175,7 @@ describe("CRM integration — client-scoped meeting data", () => {
 
   it("denies client-scoped meeting data to users without access to the client", async () => {
     const { user: ceo } = await createUserWithToken("ceo");
-    const { token: outsiderToken } = await createUserWithToken("user");
+    const { token: outsiderToken } = await createUserWithToken("accountant");
     const client = await ClientModel.create({
       name: "Private Client",
       createdBy: ceo._id,
@@ -234,7 +234,7 @@ describe("GET /api/analytics/dashboard — meeting stats & activity feed", () =>
 
   it("scopes a non-elevated user's meeting stats to only their own meetings", async () => {
     const { token: ceoToken } = await createUserWithToken("ceo");
-    const { token: uninvolvedToken } = await createUserWithToken("user");
+    const { token: uninvolvedToken } = await createUserWithToken("accountant");
 
     await request(app)
       .post("/api/meetings")

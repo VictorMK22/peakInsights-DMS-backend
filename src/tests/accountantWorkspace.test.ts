@@ -29,8 +29,8 @@ const daysFromNow = (n: number) =>
   new Date(Date.now() + n * 24 * 60 * 60 * 1000);
 
 describe("GET /api/analytics/accountant-workspace", () => {
-  it("is rejected for a role that isn't accountant or ceo", async () => {
-    const { token } = await createUserWithToken("user");
+  it("is rejected for a role that isn't accountant, ceo or supervisor", async () => {
+    const { token } = await createUserWithToken("sales_person");
 
     const res = await request(app)
       .get("/api/analytics/accountant-workspace")

@@ -102,6 +102,62 @@ export const idOf = (value: unknown): string => {
   return String(value ?? "");
 };
 
+/**
+ * THE document visibility rule — one definition, used by the list,
+ * the per-tab counts and search, so they can never disagree.
+ *
+ *   ceo          everything
+ *   supervisor   their own documents, their active team's documents,
+ *                documents that name them as supervisor, and learning
+ *                material
+ *   everyone     their own documents, documents linked to a task they
+ *   else         are actively collaborating on, and learning material
+ *   (accountant,
+ *   sales_person,
+ *   tech)
+ *
+ * Returns a Mongo filter fragment ({ $or: [...] }) to merge into a
+ * Document query, or null when there is no restriction (CEO).
+ */
+export const buildDocumentVisibilityFilter = async (
+  userId: string,
+  role: string,
+): Promise<{ $or: Record<string, unknown>[] } | null> => {
+  if (role === "ceo") return null;
+  const uid = new mongoose.Types.ObjectId(userId);
+
+  if (role === "supervisor") {
+    const maps = await SupervisorMapping.find({
+      supervisorId: uid,
+      status: "active",
+    }).select("subordinateId");
+    const subs = maps.map((m) => m.subordinateId);
+    return {
+      $or: [
+        { ownerId: uid },
+        { ownerId: { $in: subs } },
+        { supervisorId: uid },
+        { documentType: "learning" },
+      ],
+    };
+  }
+
+  // Own docs + docs linked to active tasks where the user collaborates
+  const activeTasks = await TaskModel.find({
+    status: "in_progress",
+    documentId: { $exists: true },
+    collaborators: { $elemMatch: { userId: uid, status: "active" } },
+  }).select("documentId");
+  const linkedIds = activeTasks.map((t) => t.documentId).filter(Boolean);
+  return {
+    $or: [
+      { ownerId: uid },
+      { _id: { $in: linkedIds } },
+      { documentType: "learning" },
+    ],
+  };
+};
+
 const canAccess = async (
   doc: {
     ownerId: mongoose.Types.ObjectId | string;
@@ -112,7 +168,7 @@ const canAccess = async (
   userId: string,
   role: string,
 ): Promise<boolean> => {
-  if (role === "ceo" || role === "tech") return true;
+  if (role === "ceo") return true;
 
   const ownerId = idOf(doc.ownerId);
   if (ownerId === userId) return true;
@@ -152,7 +208,7 @@ const canAccess = async (
  *
  * Allowed:
  *   - The document's owner
- *   - The CEO (always)
+ *   - The CEO (always) — Tech has no special access to others' documents
  *   - A supervisor, but only for 'learning' documents (training
  *     material is jointly maintained by supervisors even if they
  *     didn't personally upload it — matches the frontend's canEdit/
@@ -163,7 +219,7 @@ const canModify = (
   userId: string,
   role: string,
 ): boolean => {
-  if (role === "ceo" || role === "tech") return true;
+  if (role === "ceo") return true;
   if (idOf(doc.ownerId) === userId) return true;
   if (role === "supervisor" && doc.documentType === "learning") return true;
   return false;
@@ -556,31 +612,11 @@ export const getDocumentTypeCounts = async (
 
     // Same visibility rule getDocuments uses for documents.
     const docFilter: Record<string, unknown> = { isDeleted: { $ne: true } };
-    if (role === "accountant") {
-      const activeTasks = await TaskModel.find({
-        status: "in_progress",
-        documentId: { $exists: true },
-        collaborators: { $elemMatch: { userId: uid, status: "active" } },
-      }).select("documentId");
-      const linkedIds = activeTasks.map((t) => t.documentId).filter(Boolean);
-      docFilter["$or"] = [
-        { ownerId: uid },
-        { _id: { $in: linkedIds } },
-        { documentType: "learning" },
-      ];
-    } else if (role === "supervisor") {
-      const maps = await SupervisorMapping.find({
-        supervisorId: uid,
-        status: "active",
-      }).select("subordinateId");
-      const subs = maps.map((m) => m.subordinateId);
-      docFilter["$or"] = [
-        { ownerId: uid },
-        { ownerId: { $in: subs } },
-        { supervisorId: uid },
-        { documentType: "learning" },
-      ];
-    }
+    const visibility = await buildDocumentVisibilityFilter(
+      req.user!.userId,
+      role,
+    );
+    if (visibility) Object.assign(docFilter, visibility);
     // ceo: no filter — sees everything
 
     // Same visibility rule getRootContents/getFolderContents use for folders.
@@ -592,7 +628,8 @@ export const getDocumentTypeCounts = async (
       }).select("subordinateId");
       const subIds = maps.map((m) => m.subordinateId);
       folderOwnerFilter = { ownerId: { $in: [uid, ...subIds] } };
-    } else if (role === "accountant") {
+    } else if (role !== "ceo") {
+      // accountant, sales_person, tech: their own folders only
       folderOwnerFilter = { ownerId: uid };
     }
     // ceo: no filter
@@ -705,33 +742,14 @@ export const getDocuments = async (
         readStatus === "read" ? { $in: readIds } : { $nin: readIds };
     }
 
-    if (req.user!.role === "accountant") {
-      // Own docs + docs linked to active tasks where user is collaborator
-      const activeTasks = await TaskModel.find({
-        status: "in_progress",
-        documentId: { $exists: true },
-        collaborators: { $elemMatch: { userId: uid, status: "active" } },
-      }).select("documentId");
-      const linkedIds = activeTasks.map((t) => t.documentId).filter(Boolean);
-
-      filter["$or"] = [
-        { ownerId: uid },
-        { _id: { $in: linkedIds } },
-        { documentType: "learning" },
-      ];
-    } else if (req.user!.role === "supervisor") {
-      const maps = await SupervisorMapping.find({
-        supervisorId: uid,
-        status: "active",
-      }).select("subordinateId");
-      const subs = maps.map((m) => m.subordinateId);
-      filter["$or"] = [
-        { ownerId: uid },
-        { ownerId: { $in: subs } },
-        { supervisorId: uid },
-        { documentType: "learning" },
-      ];
-    } else if (req.user!.role === "ceo" || req.user!.role === "tech") {
+    const visibility = await buildDocumentVisibilityFilter(
+      req.user!.userId,
+      req.user!.role,
+    );
+    if (visibility) {
+      Object.assign(filter, visibility);
+    } else {
+      // CEO only: optional owner / supervisor drill-down filters
       if (ownerF) filter["ownerId"] = new mongoose.Types.ObjectId(ownerF);
       if (supF) filter["supervisorId"] = new mongoose.Types.ObjectId(supF);
     }
@@ -1703,7 +1721,7 @@ export const deleteComment = async (
 
     const isAuthor = comment.user.toString() === req.user!.userId;
     const isDocOwner = doc.ownerId.toString() === req.user!.userId;
-    const isCEO = req.user!.role === "ceo" || req.user!.role === "tech";
+    const isCEO = req.user!.role === "ceo";
 
     if (!isAuthor && !isDocOwner && !isCEO) {
       res.status(403).json({

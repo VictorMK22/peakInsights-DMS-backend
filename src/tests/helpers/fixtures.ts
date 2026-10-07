@@ -1,13 +1,7 @@
 import { User, IUser } from "../../models/User";
 import { generateToken } from "../../services/authService";
 
-type Role =
-  | "ceo"
-  | "supervisor"
-  | "user"
-  | "sales_person"
-  | "accountant"
-  | "tech";
+type Role = "ceo" | "supervisor" | "sales_person" | "accountant" | "tech";
 
 let counter = 0;
 

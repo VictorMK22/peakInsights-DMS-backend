@@ -218,6 +218,12 @@ export const getDashboardStats = async (
     if (role === "accountant") {
       docFilter["ownerId"] = new mongoose.Types.ObjectId(userId);
       taskFilter["assignedTo"] = new mongoose.Types.ObjectId(userId);
+    } else if (role === "sales_person" || role === "tech") {
+      // Same rule as accountants: dashboard numbers describe only their
+      // own work — documents they own, tasks assigned to them (the same
+      // tasks GET /tasks returns for the assignee).
+      docFilter["ownerId"] = new mongoose.Types.ObjectId(userId);
+      taskFilter["assignedTo"] = new mongoose.Types.ObjectId(userId);
     } else if (role === "supervisor") {
       const mappings = await SupervisorMapping.find({
         supervisorId: userId,
@@ -232,7 +238,9 @@ export const getDashboardStats = async (
     }
 
     let auditFilter: Record<string, unknown> = {};
-    if (role === "accountant") {
+    if (role === "accountant" || role === "sales_person") {
+      // sales_person previously fell through to {} — i.e. the company-wide
+      // recent-activity feed. Own activity only, like accountants.
       auditFilter = { actorId: new mongoose.Types.ObjectId(userId) };
     } else if (role === "supervisor") {
       const supId = new mongoose.Types.ObjectId(userId);

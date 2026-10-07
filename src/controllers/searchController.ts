@@ -1,9 +1,8 @@
 import { Response, NextFunction } from "express";
 import mongoose from "mongoose";
 import { DocumentModel } from "../models/Document";
-import { TaskModel } from "../models/Task";
 import { AuthRequest } from "../types/auth";
-import { SupervisorMapping } from "../models/SupervisorMapping";
+import { buildDocumentVisibilityFilter } from "./documentController";
 
 export const searchDocuments = async (
   req: AuthRequest,
@@ -22,7 +21,6 @@ export const searchDocuments = async (
       return res.json({ success: true, data: [] });
     }
 
-    const userId = new mongoose.Types.ObjectId(req.user?.userId);
     const skip = (Number(page) - 1) * Number(limit);
 
     const filter: any = {
@@ -36,36 +34,11 @@ export const searchDocuments = async (
     // document list shows, just the same set filtered by the query.
     // =========================
 
-    if (req.user?.role === "accountant") {
-      const activeTasks = await TaskModel.find({
-        status: "in_progress",
-        documentId: { $exists: true },
-        collaborators: { $elemMatch: { userId, status: "active" } },
-      }).select("documentId");
-      const linkedIds = activeTasks.map((t) => t.documentId).filter(Boolean);
-
-      filter["$or"] = [
-        { ownerId: userId },
-        { _id: { $in: linkedIds } },
-        { documentType: "learning" },
-      ];
-    }
-
-    if (req.user?.role === "supervisor") {
-      const mappings = await SupervisorMapping.find({
-        supervisorId: userId,
-        status: "active",
-      }).select("subordinateId");
-
-      const subordinateIds = mappings.map((m) => m.subordinateId);
-
-      filter["$or"] = [
-        { ownerId: userId },
-        { ownerId: { $in: subordinateIds } },
-        { supervisorId: userId },
-        { documentType: "learning" },
-      ];
-    }
+    const visibility = await buildDocumentVisibilityFilter(
+      req.user!.userId,
+      req.user!.role,
+    );
+    if (visibility) Object.assign(filter, visibility);
 
     // CEO → no restriction
 

@@ -58,7 +58,7 @@ const canAccessFolder = async (
   userId: string,
   role: string,
 ): Promise<boolean> => {
-  if (role === "ceo" || role === "tech") return true;
+  if (role === "ceo") return true;
   if (folder.ownerId.toString() === userId) return true;
   if (role === "supervisor") {
     const mapping = await SupervisorMapping.findOne({
@@ -201,7 +201,7 @@ export const getStarredFolders = async (req: AuthRequest, res: Response) => {
     const uid = new mongoose.Types.ObjectId(userId);
 
     let ownerFilter: Record<string, unknown>;
-    if (role === "ceo" || role === "tech") {
+    if (role === "ceo") {
       ownerFilter = {};
     } else if (role === "supervisor") {
       const maps = await SupervisorMapping.find({
@@ -238,7 +238,7 @@ export const getRootContents = async (req: AuthRequest, res: Response) => {
 
     let ownerFilter: Record<string, unknown>;
 
-    if (role === "ceo" || role === "tech") {
+    if (role === "ceo") {
       // CEO sees everything
       ownerFilter = {};
     } else if (role === "supervisor") {

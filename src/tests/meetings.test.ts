@@ -28,7 +28,7 @@ const inThreeHours = () => new Date(Date.now() + 3 * 60 * 60 * 1000);
 describe("POST /api/meetings — createMeeting", () => {
   it("creates a meeting, invites the attendee, and logs automatic activity", async () => {
     const { token: ceoToken } = await createUserWithToken("ceo");
-    const { user: attendee } = await createUserWithToken("user");
+    const { user: attendee } = await createUserWithToken("accountant");
 
     const res = await request(app)
       .post("/api/meetings")
@@ -117,7 +117,7 @@ describe("POST /api/meetings — createMeeting", () => {
 
   it("rejects (409) an overlapping meeting for an already-booked attendee, and force=true overrides it", async () => {
     const { token: ceoToken } = await createUserWithToken("ceo");
-    const { user: attendee } = await createUserWithToken("user");
+    const { user: attendee } = await createUserWithToken("accountant");
 
     await request(app)
       .post("/api/meetings")
@@ -169,8 +169,8 @@ describe("GET /api/meetings — visibility & client scoping", () => {
   it("only returns meetings the requester organizes or attends by default", async () => {
     const { token: ceoToken } = await createUserWithToken("ceo");
     const { user: attendee, token: attendeeToken } =
-      await createUserWithToken("user");
-    const { token: outsiderToken } = await createUserWithToken("user");
+      await createUserWithToken("accountant");
+    const { token: outsiderToken } = await createUserWithToken("accountant");
 
     await request(app)
       .post("/api/meetings")
@@ -196,7 +196,7 @@ describe("GET /api/meetings — visibility & client scoping", () => {
   it("filters by clientId, visible to ceo/tech/sales_person beyond their own meetings", async () => {
     const { user: ceo, token: ceoToken } = await createUserWithToken("ceo");
     const { token: salesToken } = await createUserWithToken("sales_person");
-    const { token: outsiderToken } = await createUserWithToken("user");
+    const { token: outsiderToken } = await createUserWithToken("accountant");
     const client = await ClientModel.create({
       name: "Globex",
       createdBy: ceo._id,
@@ -231,7 +231,7 @@ describe("PATCH /api/meetings/:id/respond — RSVP", () => {
   it("records the attendee's response and logs it automatically", async () => {
     const { token: ceoToken } = await createUserWithToken("ceo");
     const { user: attendee, token: attendeeToken } =
-      await createUserWithToken("user");
+      await createUserWithToken("accountant");
 
     const createRes = await request(app)
       .post("/api/meetings")
@@ -318,7 +318,7 @@ describe("PATCH /api/meetings/:id/cancel — cancelMeeting", () => {
 describe("GET /api/meetings/:id/activity", () => {
   it("is visible to participants and forbidden to outsiders", async () => {
     const { token: ceoToken } = await createUserWithToken("ceo");
-    const { token: outsiderToken } = await createUserWithToken("user");
+    const { token: outsiderToken } = await createUserWithToken("accountant");
     const createRes = await request(app)
       .post("/api/meetings")
       .set("Authorization", `Bearer ${ceoToken}`)
