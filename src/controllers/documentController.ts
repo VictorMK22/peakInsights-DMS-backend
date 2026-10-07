@@ -226,6 +226,22 @@ const canModify = (
 };
 
 /**
+ * Deleting is stricter than editing: accountants can never delete
+ * documents (trash, permanent or bulk) — only the CEO can. Everything
+ * else falls back to the normal owner/CEO rule in canModify.
+ */
+const ACCOUNTANT_DELETE_MESSAGE =
+  "Accountants can't delete documents — only the CEO can";
+const canDelete = (
+  doc: { ownerId: mongoose.Types.ObjectId | string; documentType?: string },
+  userId: string,
+  role: string,
+): boolean => {
+  if (role === "accountant") return false;
+  return canModify(doc, userId, role);
+};
+
+/**
  * Best-effort text extraction at upload time, so the in-browser
  * content editor (patchDocumentContent) has something real to work
  * with right away instead of starting empty. Never throws — a failed
@@ -1161,10 +1177,13 @@ export const deleteDocument = async (
       return;
     }
 
-    if (!canModify(doc, req.user!.userId, req.user!.role)) {
+    if (!canDelete(doc, req.user!.userId, req.user!.role)) {
       res.status(403).json({
         success: false,
-        message: "Only the owner or CEO can delete this document",
+        message:
+          req.user!.role === "accountant"
+            ? ACCOUNTANT_DELETE_MESSAGE
+            : "Only the owner or CEO can delete this document",
       });
       return;
     }
@@ -1270,10 +1289,13 @@ export const permanentlyDeleteDocument = async (
       res.status(404).json({ success: false, message: "Document not found" });
       return;
     }
-    if (!canModify(doc, req.user!.userId, req.user!.role)) {
+    if (!canDelete(doc, req.user!.userId, req.user!.role)) {
       res.status(403).json({
         success: false,
-        message: "Only the owner or CEO can delete this document",
+        message:
+          req.user!.role === "accountant"
+            ? ACCOUNTANT_DELETE_MESSAGE
+            : "Only the owner or CEO can delete this document",
       });
       return;
     }
@@ -1449,7 +1471,7 @@ export const bulkDeleteDocuments = async (
 
     const now = new Date();
     for (const doc of docs) {
-      if (!canModify(doc, req.user!.userId, req.user!.role)) {
+      if (!canDelete(doc, req.user!.userId, req.user!.role)) {
         failed.push({ id: String(doc._id), reason: "forbidden" });
         continue;
       }

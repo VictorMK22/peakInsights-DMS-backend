@@ -109,6 +109,11 @@ export const getTrash = async (req: AuthRequest, res: Response) => {
 // ─────────────────────────────────────────────────────────────────
 export const emptyTrash = async (req: AuthRequest, res: Response) => {
   try {
+    if (req.user!.role === "accountant")
+      return res.status(403).json({
+        success: false,
+        message: "Accountants can't permanently delete — only the CEO can",
+      });
     const userId = req.user!.userId;
 
     const docs = await DocumentModel.find({

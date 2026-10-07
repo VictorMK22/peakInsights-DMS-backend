@@ -7,6 +7,7 @@ export async function sendTrackedEmail({
   receiverId,
   receiverEmail,
   receiverName,
+  ccUsers,
   senderName,
   senderEmail,
   subject,
@@ -17,6 +18,7 @@ export async function sendTrackedEmail({
   parentId,
 }: any) {
   const now = new Date();
+  const cc: { _id: string; email: string }[] = ccUsers ?? [];
 
   // For a reply, pull the immediate parent so we can (a) build the
   // real RFC 2822 threading headers (In-Reply-To / References) and
@@ -53,6 +55,8 @@ export async function sendTrackedEmail({
     senderId,
     receiverId,
     toEmail: receiverEmail,
+    ccIds: cc.length ? cc.map((c) => c._id) : undefined,
+    ccEmails: cc.length ? cc.map((c) => c.email) : undefined,
     subject,
     body,
     bodyPreview: body.slice(0, 200),
@@ -71,6 +75,7 @@ export async function sendTrackedEmail({
   try {
     const result = await sendDirectUserEmail({
       toEmail: receiverEmail,
+      ccEmails: cc.map((c) => c.email),
       toName: receiverName,
       fromName: senderName,
       fromEmail: senderEmail,

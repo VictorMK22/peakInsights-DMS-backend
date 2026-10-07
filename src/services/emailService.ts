@@ -22,6 +22,8 @@ import nodemailer, { SentMessageInfo, Transporter } from "nodemailer";
 
 interface DirectEmailOptions {
   toEmail: string;
+  /** Carbon-copy recipients (plain email addresses). */
+  ccEmails?: string[];
   toName?: string;
   fromName?: string;
   fromEmail?: string;
@@ -61,6 +63,11 @@ function getTransporter(): Transporter | null {
     port: Number(port),
     secure: Number(port) === 465, // true for 465, false for 587/25
     auth: { user, pass },
+    // Fail fast instead of hanging until Vercel kills the function —
+    // a hung SMTP handshake looks exactly like "email never arrived".
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 20_000,
   });
 
   return transporter;
@@ -77,9 +84,17 @@ async function send(
   replyTo?: string,
   threading?: { inReplyTo?: string; references?: string[] },
   attachments?: { filename: string; path: string; contentType?: string }[],
+  opts?: { cc?: string[]; throwOnError?: boolean },
 ): Promise<SentMessageInfo | null> {
   const t = getTransporter();
-  if (!t) return null;
+  if (!t) {
+    if (opts?.throwOnError) {
+      throw new Error(
+        "SMTP is not configured on the server (SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS missing)",
+      );
+    }
+    return null;
+  }
 
   const from = `"PeakInsights Hub" <${process.env.SMTP_USER}>`;
 
@@ -87,6 +102,7 @@ async function send(
     const info = await t.sendMail({
       from: from, // 🔥 FIXED (ONLY AUTH USER)
       to,
+      cc: opts?.cc?.length ? opts.cc : undefined,
       subject,
       html,
       replyTo,
@@ -105,6 +121,7 @@ async function send(
     return info;
   } catch (err) {
     console.error(`❌ Email failed → ${to}: ${subject}`, err);
+    if (opts?.throwOnError) throw err;
     return null;
   }
 }
@@ -175,7 +192,7 @@ export async function sendAccountCreatedByCEOEmail(
   temporaryPassword: string,
   role: "supervisor" | "sales_person" | "accountant" | "tech",
   fromEmail?: string,
-): Promise<void> {
+): Promise<boolean> {
   const roleLabel =
     role === "sales_person"
       ? "Sales Person / Business Development Officer"
@@ -184,7 +201,7 @@ export async function sendAccountCreatedByCEOEmail(
         : role === "tech"
           ? "Tech / Admin"
           : role;
-  await send(
+  const sent = await send(
     to,
     "Your PeakInsights Hub account is ready",
     wrap(
@@ -203,6 +220,7 @@ export async function sendAccountCreatedByCEOEmail(
     ),
     fromEmail,
   );
+  return !!sent;
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -411,6 +429,7 @@ export async function sendDirectUserEmail(
 ): Promise<{ messageId?: string }> {
   const {
     toEmail,
+    ccEmails,
     toName,
     fromName = "A colleague",
     fromEmail,
@@ -466,6 +485,7 @@ export async function sendDirectUserEmail(
       `
       ${h1((quoted ? "Reply from " : "New message for ") + (quoted ? senderLine : (toName ?? "you")))}
       ${quoted ? "" : p("<strong>From:</strong> " + senderLine)}
+      ${ccEmails?.length ? p("<strong>Cc:</strong> " + ccEmails.map(escapeHtml).join(", ")) : ""}
       ${p(safeBody)}
       ${quoteBlock}
       ${highlight("Reply directly to respond to the sender.")}
@@ -477,6 +497,10 @@ export async function sendDirectUserEmail(
     fromEmail,
     { inReplyTo, references },
     attachments,
+    // throwOnError so the real SMTP reason (auth failure, timeout,
+    // not-configured…) lands in EmailLog.error instead of the useless
+    // generic "SMTP send failed".
+    { cc: ccEmails, throwOnError: true },
   );
 
   if (!result?.messageId) {

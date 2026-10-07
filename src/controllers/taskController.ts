@@ -825,7 +825,8 @@ export const inviteTaskCollaborator = async (
     // Same reasoning as message notifications — email is the only
     // reliable way the invitee actually finds out about this right now.
     if (invitee.email) {
-      sendTaskCollaborationInviteEmail(
+      // Awaited: fire-and-forget emails are dropped on Vercel.
+      await sendTaskCollaborationInviteEmail(
         invitee.email,
         invitee.name,
         inviter?.name ?? "A colleague",

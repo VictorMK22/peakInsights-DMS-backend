@@ -10,6 +10,12 @@ export interface IEmailLog extends Document {
 
   toEmail: string;
 
+  // Carbon-copy recipients (staff users). CC'd users can see the email
+  // in their inbox and open the thread, but replies still go to the
+  // original sender/receiver pair.
+  ccIds?: mongoose.Types.ObjectId[];
+  ccEmails?: string[];
+
   subject: string;
   body: string;
   bodyPreview: string;
@@ -73,6 +79,16 @@ const EmailLogSchema = new Schema<IEmailLog>(
       required: true,
       lowercase: true,
       trim: true,
+    },
+
+    ccIds: {
+      type: [{ type: Schema.Types.ObjectId, ref: "User" }],
+      default: undefined,
+    },
+
+    ccEmails: {
+      type: [String],
+      default: undefined,
     },
 
     subject: {
@@ -155,6 +171,7 @@ EmailLogSchema.index({ receiverId: 1, isRead: 1 });
 EmailLogSchema.index({ receiverId: 1, parentId: 1, lastMessageAt: -1 });
 EmailLogSchema.index({ senderId: 1, parentId: 1, lastMessageAt: -1 });
 EmailLogSchema.index({ parentId: 1, createdAt: 1 });
+EmailLogSchema.index({ ccIds: 1, parentId: 1, lastMessageAt: -1 });
 // Prevents the same staff-to-staff email being logged twice when both
 // participants have their mailbox connected and synced independently.
 EmailLogSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });

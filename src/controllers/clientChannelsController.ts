@@ -13,6 +13,25 @@ import {
 } from "../models/ClientInvoice";
 import { TaskModel } from "../models/Task";
 import { getLocalFileUrl } from "../middleware/upload";
+import { calculateTAT, formatTAT } from "../utils/tatCalculator";
+
+/**
+ * How long the lead has been idle waiting on this meeting: from when the
+ * meeting was first set until it was marked done (or until now if it
+ * hasn't happened yet). Rescheduling never resets this.
+ */
+const withIdleTime = (m: any) => {
+  const obj = typeof m.toObject === "function" ? m.toObject() : m;
+  const start = new Date(obj.createdAt);
+  const end = obj.completedAt ? new Date(obj.completedAt) : new Date();
+  const idleMinutes = Math.max(0, calculateTAT(start, end));
+  return {
+    ...obj,
+    idleMinutes,
+    idleFormatted: formatTAT(idleMinutes),
+    idleStopped: obj.status === "done",
+  };
+};
 
 const authorized = async (req: AuthRequest) =>
   canAccess(req.params.id, req.user!.userId, req.user!.role);
@@ -80,7 +99,10 @@ export const getClientMeetings = async (req: AuthRequest, res: Response) => {
     .populate("authorId", "name role profilePicture")
     .sort({ scheduledAt: -1 })
     .lean();
-  return res.json({ success: true, data: { meetings } });
+  return res.json({
+    success: true,
+    data: { meetings: meetings.map(withIdleTime) },
+  });
 };
 
 /**
@@ -99,7 +121,21 @@ export const getClientScheduledMeetings = async (
     .populate("attendees.userId", "name email role")
     .sort({ startTime: -1 })
     .lean();
-  return res.json({ success: true, data: { meetings } });
+  // Same idle rule as manual meetings: clock starts when the meeting was
+  // first set and stops when it's completed (cancelled meetings stop it
+  // too). Rescheduling doesn't reset it.
+  const withIdle = meetings.map((m: any) => {
+    const stopped = m.status === "completed" || m.status === "cancelled";
+    const end = stopped ? new Date(m.updatedAt) : new Date();
+    const idleMinutes = Math.max(0, calculateTAT(new Date(m.createdAt), end));
+    return {
+      ...m,
+      idleMinutes,
+      idleFormatted: formatTAT(idleMinutes),
+      idleStopped: stopped,
+    };
+  });
+  return res.json({ success: true, data: { meetings: withIdle } });
 };
 
 /**
@@ -139,6 +175,7 @@ export const createClientMeeting = async (req: AuthRequest, res: Response) => {
     authorId: req.user!.userId,
     title: title.trim(),
     scheduledAt: new Date(scheduledAt),
+    originalScheduledAt: new Date(scheduledAt),
     attendees: Array.isArray(attendees)
       ? attendees
       : attendees
@@ -155,24 +192,137 @@ export const createClientMeeting = async (req: AuthRequest, res: Response) => {
     "authorId",
     "name role profilePicture",
   );
-  return res.status(201).json({ success: true, data: { meeting: populated } });
+  return res
+    .status(201)
+    .json({ success: true, data: { meeting: withIdleTime(populated) } });
 };
+
+/**
+ * Roles allowed to edit/delete a meeting's full details. Sales people
+ * are deliberately NOT in here — see the restricted branch below.
+ */
+const SALES_ROLE = "sales_person";
 
 export const updateClientMeeting = async (req: AuthRequest, res: Response) => {
   if (!(await authorized(req)))
     return res.status(403).json({ success: false, message: "Access denied" });
+
+  const existing = await ClientMeetingModel.findOne({
+    _id: req.params.meetingId,
+    clientId: req.params.id,
+  });
+  if (!existing) return res.status(404).json({ success: false });
+
+  const userId = req.user!.userId;
+  const body = req.body as {
+    scheduledAt?: string;
+    comment?: string;
+    status?: "scheduled" | "done";
+    [k: string]: unknown;
+  };
+
+  if (req.user!.role === SALES_ROLE) {
+    // Sales: only (1) change the date, (2) comment, (3) mark done.
+    // Everything else in the body is ignored on purpose — no title,
+    // attendee, location, outcome or notes edits.
+    const comment = body.comment?.trim();
+    const newDate = body.scheduledAt ? new Date(body.scheduledAt) : undefined;
+    if (newDate && Number.isNaN(newDate.getTime()))
+      return res.status(400).json({ success: false, message: "Invalid date" });
+
+    const dateChanged =
+      !!newDate && newDate.getTime() !== existing.scheduledAt.getTime();
+
+    if (existing.status === "done" && dateChanged)
+      return res.status(400).json({
+        success: false,
+        message: "This meeting is already marked done — its date is locked",
+      });
+
+    if (dateChanged && !comment)
+      return res.status(400).json({
+        success: false,
+        message: "A comment explaining the date change is required",
+      });
+
+    if (!dateChanged && !comment && body.status !== "done")
+      return res.status(400).json({
+        success: false,
+        message:
+          "Nothing to update — change the date, add a comment or mark it done",
+      });
+
+    if (!existing.originalScheduledAt)
+      existing.originalScheduledAt = existing.scheduledAt;
+
+    if (dateChanged && newDate) {
+      existing.rescheduleHistory.push({
+        from: existing.scheduledAt,
+        to: newDate,
+        comment: comment!,
+        changedBy: new mongoose.Types.ObjectId(userId),
+        changedAt: new Date(),
+      });
+      existing.scheduledAt = newDate;
+    } else if (comment) {
+      existing.comments.push({
+        body: comment,
+        authorId: new mongoose.Types.ObjectId(userId),
+        createdAt: new Date(),
+      });
+    }
+
+    if (body.status === "done" && existing.status !== "done") {
+      existing.status = "done";
+      existing.completedAt = new Date();
+    }
+
+    await existing.save();
+    const populated = await existing.populate(
+      "authorId",
+      "name role profilePicture",
+    );
+    return res.json({
+      success: true,
+      data: { meeting: withIdleTime(populated) },
+    });
+  }
+
+  // Everyone else who can access the client keeps full edit rights,
+  // but the tracking fields can't be forged through a raw $set.
+  const {
+    rescheduleHistory: _rh,
+    comments: _c,
+    completedAt: _ca,
+    originalScheduledAt: _oa,
+    comment,
+    ...safe
+  } = body as Record<string, unknown>;
+  const update: Record<string, unknown> = { ...safe };
+  if (safe.status === "done" && existing.status !== "done")
+    update.completedAt = new Date();
+  if (safe.status === "scheduled") update.completedAt = undefined;
+
   const meeting = await ClientMeetingModel.findOneAndUpdate(
     { _id: req.params.meetingId, clientId: req.params.id },
-    { $set: req.body },
+    { $set: update },
     { new: true, runValidators: true },
   ).populate("authorId", "name role profilePicture");
   if (!meeting) return res.status(404).json({ success: false });
-  return res.json({ success: true, data: { meeting } });
+  return res.json({ success: true, data: { meeting: withIdleTime(meeting) } });
 };
 
 export const deleteClientMeeting = async (req: AuthRequest, res: Response) => {
   if (!(await authorized(req)))
     return res.status(403).json({ success: false, message: "Access denied" });
+  // Once a sales person has set a meeting they cannot remove it —
+  // otherwise the idle-time record for the lead could be wiped.
+  if (req.user!.role === SALES_ROLE)
+    return res.status(403).json({
+      success: false,
+      message:
+        "Sales can't delete meetings once set — change the date and add a comment instead",
+    });
   await ClientMeetingModel.findOneAndDelete({
     _id: req.params.meetingId,
     clientId: req.params.id,

@@ -424,3 +424,27 @@ export async function syncAllConnectedMailboxes(): Promise<{
   console.log("Zoho email sync summary:", summary);
   return summary;
 }
+
+/**
+ * On-demand sync of ONE user's connected mailbox — powers the "Sync now"
+ * button on the Emails page. The scheduled job only runs every ~10 minutes
+ * (GitHub Actions cron), which is why the inbox could look stale.
+ * Returns null if the user hasn't connected a mailbox.
+ */
+export async function syncMyMailbox(
+  userId: string,
+): Promise<{ messagesFound: number; messagesSynced: number } | null> {
+  const integration = await EmailIntegrationModel.findOne({
+    userId,
+    status: { $ne: "disconnected" },
+  });
+  if (!integration) return null;
+  try {
+    return await syncOneMailbox(integration);
+  } catch (err: any) {
+    integration.status = "error";
+    integration.lastError = err?.message || "Unknown sync error";
+    await integration.save().catch(() => undefined);
+    throw err;
+  }
+}

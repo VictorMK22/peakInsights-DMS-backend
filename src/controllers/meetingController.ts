@@ -311,9 +311,11 @@ export const createMeeting = async (
 
     // Email invitations — internal attendees (by their account email)
     // and any external, non-system-user attendees invited by address.
-    // Never blocks the response: a slow/misconfigured SMTP server
-    // shouldn't stop the meeting from being created.
-    (async () => {
+    // Awaited (not fire-and-forget): Vercel freezes the function once the
+    // response is sent, which silently dropped these invites. Failures are
+    // still caught below, so a bad SMTP server can't stop the meeting from
+    // being created — and SMTP timeouts are capped at ~10-20s.
+    await (async () => {
       const invitedUsers = await User.find({
         _id: { $in: resolvedAttendeeIds },
       })
@@ -701,7 +703,7 @@ export const updateMeeting = async (
       return;
     }
 
-    const {
+    let {
       title,
       description,
       agenda,
@@ -713,8 +715,10 @@ export const updateMeeting = async (
       googleEventId,
       attendeeIds,
       reminderMinutesBefore,
+      comment,
       force = false,
     } = req.body as {
+      comment?: string;
       title?: string;
       description?: string;
       agenda?: string;
@@ -728,6 +732,37 @@ export const updateMeeting = async (
       reminderMinutesBefore?: number;
       force?: boolean;
     };
+
+    // Sales people can't edit a lead's meeting beyond moving it: the date
+    // may change (with a mandatory comment), nothing else. Everything
+    // else in the body is ignored so the lead's history can't be rewritten.
+    const salesLeadRestricted = role === "sales_person" && !!meeting.clientId;
+    const trimmedComment = comment?.trim();
+    if (salesLeadRestricted) {
+      title = description = agenda = location = meetingLink = undefined;
+      conferenceProvider = googleEventId = undefined;
+      attendeeIds = undefined;
+      reminderMinutesBefore = undefined;
+      const wantsMove =
+        (startTime &&
+          new Date(startTime).getTime() !== meeting.startTime.getTime()) ||
+        (endTime && new Date(endTime).getTime() !== meeting.endTime.getTime());
+      if (!wantsMove) {
+        res.status(400).json({
+          success: false,
+          message:
+            "Sales can only change the date of a meeting (with a comment)",
+        });
+        return;
+      }
+      if (!trimmedComment) {
+        res.status(400).json({
+          success: false,
+          message: "A comment explaining the date change is required",
+        });
+        return;
+      }
+    }
 
     const newStart = startTime ? new Date(startTime) : meeting.startTime;
     const newEnd = endTime ? new Date(endTime) : meeting.endTime;
@@ -864,7 +899,7 @@ export const updateMeeting = async (
 
     // Email the update to everyone still on the meeting — internal
     // attendees plus any external (email-only) invitees. Fire-and-forget.
-    (async () => {
+    await (async () => {
       const invitedUsers = await User.find({ _id: { $in: notifyIds } })
         .select("name email")
         .lean();
@@ -903,8 +938,9 @@ export const updateMeeting = async (
       actorId: req.user!.userId,
       action: timeChanged ? "meeting_rescheduled" : "meeting_updated",
       message: timeChanged
-        ? `${organizerUser?.name ?? "The organizer"} rescheduled "${meeting.title}" to ${meeting.startTime.toLocaleString()}`
+        ? `${organizerUser?.name ?? "The organizer"} rescheduled "${meeting.title}" to ${meeting.startTime.toLocaleString()}${trimmedComment ? ` — "${trimmedComment}"` : ""}`
         : `${organizerUser?.name ?? "The organizer"} updated "${meeting.title}"`,
+      details: trimmedComment ? { comment: trimmedComment } : undefined,
     });
 
     const populated = await populateMeeting(MeetingModel.findById(meeting._id));
@@ -941,6 +977,17 @@ export const cancelMeeting = async (
       res.status(403).json({
         success: false,
         message: "Only the organizer can cancel this meeting",
+      });
+      return;
+    }
+    // Once a sales person has set a lead's meeting they can't remove it —
+    // they reschedule it (with a comment) instead, so the lead's idle
+    // time stays on record.
+    if (role === "sales_person" && meeting.clientId) {
+      res.status(403).json({
+        success: false,
+        message:
+          "Sales can't cancel a lead's meeting — change the date and add a comment instead",
       });
       return;
     }
@@ -1006,7 +1053,7 @@ export const cancelMeeting = async (
     );
 
     // Cancellation emails — internal + external attendees. Fire-and-forget.
-    (async () => {
+    await (async () => {
       const invitedUsers = await User.find({ _id: { $in: notifyIds } })
         .select("name email")
         .lean();

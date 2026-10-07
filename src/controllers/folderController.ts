@@ -535,6 +535,11 @@ export const deleteFolderRecursive = async (
   res: Response,
 ) => {
   try {
+    if (req.user!.role === "accountant")
+      return res.status(403).json({
+        success: false,
+        message: "Accountants can't delete folders — only the CEO can",
+      });
     const { folderId } = req.params;
     const folder = await FolderModel.findById(folderId);
     if (!folder) return res.status(404).json({ success: false });
@@ -682,6 +687,11 @@ export const permanentlyDeleteFolder = async (
   res: Response,
 ) => {
   try {
+    if (req.user!.role === "accountant")
+      return res.status(403).json({
+        success: false,
+        message: "Accountants can't delete folders — only the CEO can",
+      });
     const { folderId } = req.params;
     const folder = await FolderModel.findById(folderId);
     if (!folder) return res.status(404).json({ success: false });
@@ -886,6 +896,11 @@ export const copyFolder = async (req: AuthRequest, res: Response) => {
 // ─────────────────────────────────────────────────────────────────
 export const bulkDeleteFolders = async (req: AuthRequest, res: Response) => {
   try {
+    if (req.user!.role === "accountant")
+      return res.status(403).json({
+        success: false,
+        message: "Accountants can't delete folders — only the CEO can",
+      });
     const { folderIds } = req.body as { folderIds?: string[] };
     if (!Array.isArray(folderIds) || folderIds.length === 0) {
       res

@@ -163,21 +163,26 @@ export const createSupervisor = async (
 
     const token = generateToken(user);
 
-    sendAccountCreatedByCEOEmail(
+    // Awaited on purpose: on Vercel the function is frozen as soon as the
+    // response is sent, so a fire-and-forget send is silently dropped and
+    // the new user never receives their login invite.
+    const emailSent = await sendAccountCreatedByCEOEmail(
       user.email,
       user.name,
       password,
       "supervisor",
-    ).catch((err) =>
+    ).catch((err) => {
       console.error(
         "❌ sendAccountCreatedByCEOEmail failed (account still created):",
         err,
-      ),
-    );
+      );
+      return false;
+    });
 
     res.status(201).json({
       success: true,
       message: "Supervisor account created",
+      emailSent,
       data: { user, token },
     });
   } catch (err) {
@@ -235,21 +240,26 @@ export const createSalesPerson = async (
 
     const token = generateToken(user);
 
-    sendAccountCreatedByCEOEmail(
+    // Awaited on purpose: on Vercel the function is frozen as soon as the
+    // response is sent, so a fire-and-forget send is silently dropped and
+    // the new user never receives their login invite.
+    const emailSent = await sendAccountCreatedByCEOEmail(
       user.email,
       user.name,
       password,
       "sales_person",
-    ).catch((err) =>
+    ).catch((err) => {
       console.error(
         "❌ sendAccountCreatedByCEOEmail failed (account still created):",
         err,
-      ),
-    );
+      );
+      return false;
+    });
 
     res.status(201).json({
       success: true,
       message: "Sales person account created",
+      emailSent,
       data: { user, token },
     });
   } catch (err) {
@@ -314,21 +324,26 @@ export const createAccountant = async (
 
     const token = generateToken(user);
 
-    sendAccountCreatedByCEOEmail(
+    // Awaited on purpose: on Vercel the function is frozen as soon as the
+    // response is sent, so a fire-and-forget send is silently dropped and
+    // the new user never receives their login invite.
+    const emailSent = await sendAccountCreatedByCEOEmail(
       user.email,
       user.name,
       password,
       "accountant",
-    ).catch((err) =>
+    ).catch((err) => {
       console.error(
         "❌ sendAccountCreatedByCEOEmail failed (account still created):",
         err,
-      ),
-    );
+      );
+      return false;
+    });
 
     res.status(201).json({
       success: true,
       message: "Accountant account created",
+      emailSent,
       data: { user, token },
     });
   } catch (err) {
@@ -392,17 +407,23 @@ export const createTech = async (
 
     const token = generateToken(user);
 
-    sendAccountCreatedByCEOEmail(user.email, user.name, password, "tech").catch(
-      (err) =>
-        console.error(
-          "❌ sendAccountCreatedByCEOEmail failed (account still created):",
-          err,
-        ),
-    );
+    const emailSent = await sendAccountCreatedByCEOEmail(
+      user.email,
+      user.name,
+      password,
+      "tech",
+    ).catch((err) => {
+      console.error(
+        "❌ sendAccountCreatedByCEOEmail failed (account still created):",
+        err,
+      );
+      return false;
+    });
 
     res.status(201).json({
       success: true,
       message: "Tech/admin account created",
+      emailSent,
       data: { user, token },
     });
   } catch (err) {

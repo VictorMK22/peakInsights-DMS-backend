@@ -7,6 +7,7 @@ import { canSendTo } from "./messageController";
 import { User } from "../models/User";
 import { EmailLog } from "../models/EmailLog";
 import { sendDirectUserEmail } from "../services/emailService";
+import { syncMyMailbox } from "../services/emailSyncService";
 
 // =====================================================
 // 📧 SEND DIRECT EMAIL
@@ -30,7 +31,13 @@ export const sendEmailDirect = async (
     const senderId = req.user!.userId;
     const senderRole = req.user!.role;
 
-    const { receiverId: bodyReceiverId, subject, body, parentId } = req.body;
+    const {
+      receiverId: bodyReceiverId,
+      subject,
+      body,
+      parentId,
+      ccIds: bodyCcIds,
+    } = req.body;
 
     if (!body?.trim()) {
       return res
@@ -92,28 +99,82 @@ export const sendEmailDirect = async (
         .json({ success: false, message: "Recipient not found" });
     }
 
-    sendTrackedEmail({
-      senderId,
-      receiverId,
-      receiverEmail: receiver.email,
-      receiverName: receiver.name,
-      senderName: sender?.name,
-      senderEmail: sender?.email,
-      subject: subject?.trim() || "(No subject)",
-      body: body.trim(),
-      ipAddress: req.ip,
-      userAgent: req.headers["user-agent"],
-      supervisorId: sender?.supervisorId,
-      parentId: parentId || undefined,
-    }).catch((err) => {
-      console.error("Background email failed:", err);
-    });
+    // ── CC ────────────────────────────────────────────────────────
+    // Every CC'd person goes through the SAME canSendTo gate as the
+    // main recipient — CC must not become a way around the RBAC rules.
+    const rawCc: string[] = Array.isArray(bodyCcIds)
+      ? [...new Set(bodyCcIds.map(String))]
+      : [];
+    const ccFiltered = rawCc.filter(
+      (id) =>
+        mongoose.Types.ObjectId.isValid(id) &&
+        id !== senderId &&
+        id !== String(receiverId),
+    );
+    if (ccFiltered.length > 10) {
+      return res
+        .status(400)
+        .json({ success: false, message: "You can CC at most 10 people" });
+    }
+    for (const ccId of ccFiltered) {
+      const { allowed, message } = await canSendTo(senderId, senderRole, ccId);
+      if (!allowed) {
+        return res
+          .status(403)
+          .json({
+            success: false,
+            message: `Cannot CC this person: ${message}`,
+          });
+      }
+    }
+    const ccUsers = ccFiltered.length
+      ? (
+          await User.find({ _id: { $in: ccFiltered } })
+            .select("name email")
+            .lean()
+        )
+          .filter((u) => !!u.email)
+          .map((u) => ({ _id: String(u._id), email: u.email as string }))
+      : [];
+
+    // IMPORTANT (Vercel): this MUST be awaited. A serverless function
+    // is frozen the moment the response is sent, so the old
+    // fire-and-forget `sendTrackedEmail(...).catch(...)` was routinely
+    // killed mid-SMTP-handshake — leaving emails stuck on "Queued" or
+    // marked failed with "SMTP send failed". sendTrackedEmail already
+    // records success/failure on the EmailLog, so we just report it.
+    let delivered = true;
+    let failureReason: string | undefined;
+    try {
+      await sendTrackedEmail({
+        senderId,
+        receiverId,
+        receiverEmail: receiver.email,
+        receiverName: receiver.name,
+        ccUsers,
+        senderName: sender?.name,
+        senderEmail: sender?.email,
+        subject: subject?.trim() || "(No subject)",
+        body: body.trim(),
+        ipAddress: req.ip,
+        userAgent: req.headers["user-agent"],
+        supervisorId: sender?.supervisorId,
+        parentId: parentId || undefined,
+      });
+    } catch (err: any) {
+      delivered = false;
+      failureReason = err?.message || "Unknown email error";
+      console.error("Email send failed:", err);
+    }
 
     return res.json({
       success: true,
-      message: parentId
-        ? `Reply queued to ${receiver.name}`
-        : `Email queued to ${receiver.name}`,
+      data: { status: delivered ? "sent" : "failed", error: failureReason },
+      message: delivered
+        ? parentId
+          ? `Reply sent to ${receiver.name}`
+          : `Email sent to ${receiver.name}`
+        : `Saved, but delivery failed: ${failureReason}. Use Retry in Sent.`,
     });
   } catch (err) {
     next(err);
@@ -150,6 +211,7 @@ export const getSentEmails = async (
         // emails. getInboxEmails right below already does this correctly.
         .populate("senderId", "name email role")
         .populate("receiverId", "name email role")
+        .populate("ccIds", "name email role")
         .sort({ lastMessageAt: -1 })
         .skip(skip)
         .limit(limit),
@@ -188,6 +250,7 @@ export const getInboxEmails = async (
       $or: [
         { receiverId: userId, parentId: null },
         { senderId: userId, parentId: null },
+        { ccIds: userId, parentId: null },
       ],
     };
 
@@ -195,6 +258,7 @@ export const getInboxEmails = async (
       EmailLog.find(rootFilter)
         .populate("senderId", "name email role")
         .populate("receiverId", "name email role")
+        .populate("ccIds", "name email role")
         .sort({ lastMessageAt: -1 })
         .skip(skip)
         .limit(limit),
@@ -250,7 +314,8 @@ export const getEmailThread = async (
 
     const parent = await EmailLog.findById(id)
       .populate("senderId", "name email role")
-      .populate("receiverId", "name email role");
+      .populate("receiverId", "name email role")
+      .populate("ccIds", "name email role");
 
     if (!parent) {
       return res
@@ -260,7 +325,10 @@ export const getEmailThread = async (
 
     const isParticipant =
       (parent.senderId as any)._id.toString() === userId ||
-      (parent.receiverId as any)._id.toString() === userId;
+      (parent.receiverId as any)._id.toString() === userId ||
+      ((parent.ccIds as any[]) ?? []).some(
+        (c) => String(c?._id ?? c) === userId,
+      );
     if (!isParticipant) {
       return res
         .status(403)
@@ -271,6 +339,7 @@ export const getEmailThread = async (
       EmailLog.find({ parentId: id })
         .populate("senderId", "name email role")
         .populate("receiverId", "name email role")
+        .populate("ccIds", "name email role")
         .sort({ createdAt: 1 })
         .skip(skip)
         .limit(limit),
@@ -370,19 +439,43 @@ export const retryEmail = async (
         .json({ success: false, message: "Email not found" });
     }
 
+    // Only the original sender (or CEO) may retry — previously any
+    // logged-in user who guessed an id could re-fire someone's email.
+    const retrier = req.user!;
+    const senderOwnerId = String(
+      (email.senderId as any)?._id ?? email.senderId,
+    );
+    if (retrier.role !== "ceo" && senderOwnerId !== retrier.userId) {
+      return res
+        .status(403)
+        .json({ success: false, message: "Not your email" });
+    }
+
     if (email.status !== "failed") {
       return res
         .status(400)
         .json({ success: false, message: "Only failed emails can be retried" });
     }
 
-    const result = await sendDirectUserEmail({
-      toEmail: email.toEmail,
-      toName: (email.receiverId as any).name,
-      fromName: "PeakInsights",
-      subject: email.subject,
-      body: email.body,
-    });
+    let result: { messageId?: string };
+    try {
+      result = await sendDirectUserEmail({
+        toEmail: email.toEmail,
+        ccEmails: email.ccEmails ?? undefined,
+        toName: (email.receiverId as any).name,
+        fromName: (email.senderId as any)?.name ?? "PeakInsights",
+        fromEmail: (email.senderId as any)?.email,
+        subject: email.subject,
+        body: email.body,
+      });
+    } catch (sendErr: any) {
+      const reason = sendErr?.message || "Unknown email error";
+      await EmailLog.findByIdAndUpdate(id, { error: reason });
+      return res.status(502).json({
+        success: false,
+        message: `Retry failed: ${reason}`,
+      });
+    }
 
     await EmailLog.findByIdAndUpdate(id, {
       status: "sent",
@@ -483,5 +576,50 @@ export const getEmailAnalytics = async (
     });
   } catch (err) {
     next(err);
+  }
+};
+
+// =====================================================
+// 🔄 SYNC NOW
+// Pulls the caller's own connected mailbox immediately instead of
+// waiting for the next scheduled run. Throttled per user so the button
+// can't hammer the mail provider.
+// =====================================================
+const lastManualSync = new Map<string, number>();
+const MANUAL_SYNC_COOLDOWN_MS = 20_000;
+
+export const syncEmailsNow = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const userId = req.user!.userId;
+    const last = lastManualSync.get(userId) ?? 0;
+    if (Date.now() - last < MANUAL_SYNC_COOLDOWN_MS) {
+      return res.json({
+        success: true,
+        data: { throttled: true, connected: true },
+        message: "Just synced — try again in a few seconds",
+      });
+    }
+    lastManualSync.set(userId, Date.now());
+
+    const result = await syncMyMailbox(userId);
+    if (!result) {
+      return res.json({
+        success: true,
+        data: { connected: false },
+        message: "No mailbox connected — connect Zoho in your profile to sync",
+      });
+    }
+    return res.json({
+      success: true,
+      data: { connected: true, ...result },
+      message: `Synced — ${result.messagesSynced} new email(s)`,
+    });
+  } catch (err) {
+    next(err);
+    return;
   }
 };

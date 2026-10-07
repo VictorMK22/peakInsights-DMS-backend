@@ -8,6 +8,7 @@ import {
   sendEmailDirect,
   markEmailRead,
   getUnreadEmailCount,
+  syncEmailsNow,
 } from "../controllers/emailController";
 
 const router = Router();
@@ -16,6 +17,7 @@ router.use(authenticate);
 router.post("/", sendEmailDirect);
 router.get("/sent", getSentEmails);
 router.get("/inbox", getInboxEmails);
+router.post("/sync-now", syncEmailsNow);
 router.get("/unread-count", getUnreadEmailCount);
 router.get("/thread/:id", getEmailThread);
 router.patch("/:id/read", markEmailRead);
