@@ -1,12 +1,11 @@
 import mongoose from "mongoose";
 import { EmailLog, IEmailAttachment } from "../models/EmailLog";
-import { sendDirectUserEmail } from "./emailService";
+import { getDefaultFromAddress, sendDirectUserEmail } from "./emailService";
 import { AuditLog } from "../models/AuditLog";
 import { MailAttachment } from "./emailAttachmentService";
 
-// Recipients per SMTP transaction for announcements. Providers cap
-// recipients per message (Zoho's limit is low on some plans), so a big
-// announcement is split into several BCC batches.
+// Recipients per message for announcements. Providers cap recipients per
+// message, so a big announcement is split into several BCC batches.
 const BROADCAST_BATCH_SIZE =
   Number(process.env.EMAIL_BROADCAST_BATCH_SIZE) || 40;
 
@@ -110,6 +109,7 @@ export async function sendTrackedEmail({
     log.references = references;
     await log.save();
 
+
     await AuditLog.create({
       actorId: senderId,
       action: "email_sent",
@@ -199,7 +199,7 @@ export async function sendBroadcastEmail({
   let firstError: string | undefined;
 
   // Anchor address for the visible "To:" — recipients are all BCC'd.
-  const anchor = senderEmail || process.env.SMTP_USER || "";
+  const anchor = senderEmail || getDefaultFromAddress();
 
   for (let i = 0; i < recipients.length; i += BROADCAST_BATCH_SIZE) {
     const batch = recipients.slice(i, i + BROADCAST_BATCH_SIZE);

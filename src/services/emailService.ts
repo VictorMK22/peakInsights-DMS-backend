@@ -18,7 +18,17 @@
  *   - New message notification
  */
 
-import nodemailer, { SentMessageInfo, Transporter } from "nodemailer";
+import crypto from "crypto";
+import { Resend } from "resend";
+
+/** What a successful send hands back to callers. */
+interface SentMessageInfo {
+  /** RFC 5322 Message-ID we stamped on the message — stored on EmailLog and
+   *  used as In-Reply-To / References for the next reply in the thread. */
+  messageId: string;
+  /** Resend's own id for the email (useful when looking it up in their dashboard). */
+  resendId?: string;
+}
 
 interface DirectEmailOptions {
   toEmail: string;
@@ -48,7 +58,7 @@ interface DirectEmailOptions {
   broadcast?: boolean;
 }
 
-/** An attachment as nodemailer accepts it. Prefer `content` on serverless. */
+/** An attachment as Resend accepts it. Prefer `content` (Buffer) — `path` must be a public URL. */
 type MailAttachment = {
   filename: string;
   content?: Buffer;
@@ -56,42 +66,65 @@ type MailAttachment = {
   contentType?: string;
 };
 
-// ─── Transport ────────────────────────────────────────────────────
+// ─── Transport (Resend) ───────────────────────────────────────────
+//
+// Required env vars:
+//   RESEND_API_KEY      — from resend.com/api-keys
+//   MAIL_FROM_DOMAIN    — the domain verified in Resend, e.g. peak-insights.com
+// Optional:
+//   MAIL_FROM_ADDRESS   — the one address all mail is sent from
+//                         (defaults to peakinsights@<MAIL_FROM_DOMAIN>)
 
-let transporter: Transporter | null = null;
+const MAIL_DOMAIN = (process.env.MAIL_FROM_DOMAIN ?? "").trim().toLowerCase();
 
-function getTransporter(): Transporter | null {
-  if (transporter) return transporter;
+/** Address used for system notifications and as the fallback sender. */
+export function getDefaultFromAddress(): string {
+  return (
+    process.env.MAIL_FROM_ADDRESS?.trim() ||
+    (MAIL_DOMAIN ? `peakinsights@${MAIL_DOMAIN}` : "")
+  );
+}
 
-  const host = process.env.SMTP_HOST;
-  const port = process.env.SMTP_PORT;
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
+let resendClient: Resend | null = null;
 
-  if (!host || !port || !user || !pass) {
-    console.warn("⚠️  SMTP not configured — emails will be skipped");
+function getClient(): Resend | null {
+  if (resendClient) return resendClient;
+
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey || !getDefaultFromAddress()) {
+    console.warn(
+      "⚠️  Resend not configured (RESEND_API_KEY / MAIL_FROM_DOMAIN) — emails will be skipped",
+    );
     return null;
   }
 
-  transporter = nodemailer.createTransport({
-    host,
-    port: Number(port),
-    secure: Number(port) === 465, // true for 465, false for 587/25
-    auth: { user, pass },
-    // Fail fast instead of hanging until Vercel kills the function —
-    // a hung SMTP handshake looks exactly like "email never arrived".
-    connectionTimeout: 10_000,
-    greetingTimeout: 10_000,
-    socketTimeout: 45_000, // large attachments take a while to stream over SMTP
-  });
+  resendClient = new Resend(apiKey);
+  return resendClient;
+}
 
-  return transporter;
+const cleanDisplayName = (name: string) =>
+  name
+    .replace(/[\r\n"<>]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 60);
+
+/**
+ * Builds the visible From header. The address is always the shared one
+ * (peakinsights@<domain>); when a person composed the email, their name is
+ * shown in front of it, e.g.  Nelson Kyebei via PeakInsights Hub.
+ * Replies go to that person's real address through Reply-To.
+ */
+function buildFrom(senderName?: string): string {
+  const name = cleanDisplayName(senderName ?? "");
+  const label = name ? `${name} via PeakInsights Hub` : "PeakInsights Hub";
+  return `"${label}" <${getDefaultFromAddress()}>`;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
 const APP_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
 
-/** Send a single email. Never throws — logs on failure. */
+/** Send a single email. Never throws unless `throwOnError` — logs on failure. */
 async function send(
   to: string,
   subject: string,
@@ -99,42 +132,61 @@ async function send(
   replyTo?: string,
   threading?: { inReplyTo?: string; references?: string[] },
   attachments?: MailAttachment[],
-  opts?: { cc?: string[]; bcc?: string[]; throwOnError?: boolean },
+  opts?: {
+    cc?: string[];
+    bcc?: string[];
+    throwOnError?: boolean;
+    /** Name of the person who composed this email (shown in the From name). */
+    fromName?: string;
+  },
 ): Promise<SentMessageInfo | null> {
-  const t = getTransporter();
-  if (!t) {
+  const client = getClient();
+  if (!client) {
     if (opts?.throwOnError) {
       throw new Error(
-        "SMTP is not configured on the server (SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS missing)",
+        "Email is not configured on the server (RESEND_API_KEY / MAIL_FROM_DOMAIN missing)",
       );
     }
     return null;
   }
 
-  const from = `"PeakInsights Hub" <${process.env.SMTP_USER}>`;
+  // We choose the Message-ID ourselves so we can store it and use it for
+  // In-Reply-To / References on the next reply in the thread.
+  const messageId = `<${crypto.randomUUID()}@${MAIL_DOMAIN}>`;
+
+  // Standard RFC 5322 threading headers — these make a reply show up in the
+  // same conversation in the recipient's real inbox (Gmail, Outlook, …).
+  const headers: Record<string, string> = { "Message-ID": messageId };
+  if (threading?.inReplyTo) headers["In-Reply-To"] = threading.inReplyTo;
+  if (threading?.references?.length) {
+    headers["References"] = threading.references.join(" ");
+  }
 
   try {
-    const info = await t.sendMail({
-      from: from, // 🔥 FIXED (ONLY AUTH USER)
+    // The Resend SDK reports API failures through `error` instead of throwing.
+    const { data, error } = await client.emails.send({
+      from: buildFrom(opts?.fromName),
       to,
       cc: opts?.cc?.length ? opts.cc : undefined,
       bcc: opts?.bcc?.length ? opts.bcc : undefined,
       subject,
       html,
       replyTo,
-      // Standard RFC 2822 threading headers — this is what makes a
-      // reply show up as part of the same conversation in the
-      // recipient's real inbox (Gmail, Outlook, Apple Mail, etc.)
-      // instead of arriving as an unrelated new email.
-      inReplyTo: threading?.inReplyTo,
-      references: threading?.references?.length
-        ? threading.references.join(" ")
-        : undefined,
-      attachments,
+      headers,
+      attachments: attachments?.map((a) => ({
+        filename: a.filename,
+        content: a.content,
+        path: a.path,
+        contentType: a.contentType,
+      })),
     });
 
+    if (error) {
+      throw new Error(`${error.name}: ${error.message}`);
+    }
+
     console.log(`📧 Email sent → ${to}: ${subject}`);
-    return info;
+    return { messageId, resendId: data?.id };
   } catch (err) {
     console.error(`❌ Email failed → ${to}: ${subject}`, err);
     if (opts?.throwOnError) throw err;
@@ -487,14 +539,6 @@ export async function sendDirectUserEmail(
       </div>`
     : "";
 
-  console.log("📨 Direct Email Sent", {
-    to: toEmail,
-    from: fromEmail,
-    subject: safeSubject,
-    reply: !!inReplyTo,
-    timestamp: new Date().toISOString(),
-  });
-
   const attachmentNote = attachments?.length
     ? p(
         "<strong>Attachments:</strong> " +
@@ -522,21 +566,35 @@ export async function sendDirectUserEmail(
       ${highlight("Reply directly to respond to the sender.")}
     `,
     ),
-    // fromEmail becomes the Reply-To header — so if the recipient
-    // replies from their own real mail client, it goes straight back
-    // to the actual PeakInsights user, not the shared SMTP mailbox.
+    // Reply-To is the real PeakInsights user, so a reply from the
+    // recipient's mail client goes straight to them, not the shared address.
     fromEmail,
     { inReplyTo, references },
     attachments,
-    // throwOnError so the real SMTP reason (auth failure, timeout,
-    // not-configured…) lands in EmailLog.error instead of the useless
-    // generic "SMTP send failed".
-    { cc: ccEmails, bcc: bccEmails, throwOnError: true },
+    // throwOnError so the real provider reason (invalid domain, rate limit,
+    // not-configured…) lands in EmailLog.error instead of a generic message.
+    {
+      cc: ccEmails,
+      bcc: bccEmails,
+      throwOnError: true,
+      fromName,
+    },
   );
 
   if (!result?.messageId) {
-    throw new Error("SMTP send failed");
+    throw new Error("Email send failed");
   }
+
+  // Logged only once the provider has accepted it (it used to log before
+  // sending, which made failed sends look successful in the logs).
+  console.log("📨 Direct Email Sent", {
+    to: toEmail,
+    from: fromEmail,
+    subject: safeSubject,
+    reply: !!inReplyTo,
+    resendId: result.resendId,
+    timestamp: new Date().toISOString(),
+  });
 
   return { messageId: result.messageId };
 }

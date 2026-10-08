@@ -32,6 +32,6 @@ router.post("/sync-now", syncEmailsNow);
 router.get("/unread-count", getUnreadEmailCount);
 router.get("/thread/:id", getEmailThread);
 router.patch("/:id/read", markEmailRead);
-router.get("/:id/retry", retryEmail);
+router.post("/:id/retry", retryEmail);
 
 export default router;

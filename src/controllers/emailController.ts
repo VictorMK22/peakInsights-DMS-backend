@@ -24,7 +24,10 @@ import { canSendTo } from "./messageController";
 import { User } from "../models/User";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { EmailLog } from "../models/EmailLog";
-import { sendDirectUserEmail } from "../services/emailService";
+import {
+  getDefaultFromAddress,
+  sendDirectUserEmail,
+} from "../services/emailService";
 import { syncMyMailbox } from "../services/emailSyncService";
 
 // Roles allowed to email EVERYONE — every role by default, so anyone can
@@ -610,7 +613,7 @@ export const retryEmail = async (
       try {
         const result = await sendDirectUserEmail({
           toEmail:
-            (email.senderId as any)?.email || process.env.SMTP_USER || "",
+            (email.senderId as any)?.email || getDefaultFromAddress(),
           bccEmails: failedCopies.map((c) => c.toEmail),
           fromName: (email.senderId as any)?.name ?? "PeakInsights",
           fromEmail: (email.senderId as any)?.email,
