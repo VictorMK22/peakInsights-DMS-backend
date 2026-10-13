@@ -47,11 +47,27 @@ export const authenticate = async (
     const secret = process.env.JWT_SECRET;
     const decoded = jwt.verify(token, secret) as JwtPayload;
 
-    const user = await User.findById(decoded.userId).select("-password");
+    const user = await User.findById(decoded.userId).select(
+      "-password +passwordChangedAt",
+    );
     if (!user || !user.isActive) {
       res.status(401).json({
         success: false,
         message: "User not found or inactive",
+      });
+      return;
+    }
+
+    // A password change/reset invalidates every session issued before it
+    // (JWT `iat` is in whole seconds).
+    if (
+      user.passwordChangedAt &&
+      decoded.iat !== undefined &&
+      decoded.iat < Math.floor(user.passwordChangedAt.getTime() / 1000)
+    ) {
+      res.status(401).json({
+        success: false,
+        message: "Password was changed. Please log in again.",
       });
       return;
     }

@@ -32,6 +32,11 @@ export interface IClient extends Document {
   createdBy: mongoose.Types.ObjectId;
   assignedTo: mongoose.Types.ObjectId[];
   assignedAt?: Date;
+  // Amount brought forward when the client was added, in KES (positive =
+  // client owes us, negative = client in credit). Always present; see
+  // utils/openingBalance.ts.
+  openingBalance: number;
+  openingBalanceDate: Date;
   // Sales pipeline — set when the client was created/is being worked
   // by a sales person (BD). Undefined for clients outside the pipeline.
   // Once a client is assigned to a regular user to serve, the deal is
@@ -66,6 +71,8 @@ const ClientSchema = new Schema<IClient>(
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     assignedTo: [{ type: Schema.Types.ObjectId, ref: "User" }],
     assignedAt: { type: Date },
+    openingBalance: { type: Number, required: true, default: 0 },
+    openingBalanceDate: { type: Date, default: Date.now },
     isSalesLead: { type: Boolean, default: false },
     salesStage: { type: String, enum: SALES_STAGES },
     salesStageHistory: { type: [SalesStageEntrySchema], default: [] },

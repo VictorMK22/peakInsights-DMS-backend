@@ -21,6 +21,8 @@ export interface IUser extends Document {
   approvedAt?: Date;
   passwordResetToken?: string;
   passwordResetExpires?: Date;
+  /** Set whenever an existing user's password changes; JWTs issued earlier are rejected. */
+  passwordChangedAt?: Date;
   createdBy?: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
@@ -79,6 +81,7 @@ const UserSchema = new Schema<IUser>(
     approvedAt: { type: Date },
     passwordResetToken: { type: String, select: false },
     passwordResetExpires: { type: Date, select: false },
+    passwordChangedAt: { type: Date, select: false },
     createdBy: { type: Schema.Types.ObjectId, ref: "User" },
   },
   { timestamps: true },
@@ -87,6 +90,8 @@ const UserSchema = new Schema<IUser>(
 UserSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();
   this.password = await bcrypt.hash(this.password, 12);
+  // Not on first save (account creation) — only on real password changes.
+  if (!this.isNew) this.passwordChangedAt = new Date();
   next();
 });
 

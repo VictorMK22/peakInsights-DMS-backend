@@ -115,6 +115,46 @@ export const getMyWorkspaces = async (
 };
 
 /**
+ * Emails the new user their login details, sent from the CEO's own
+ * mailbox (account creation is CEO-only). See sendAccountCreatedByCEOEmail
+ * for the verified-domain fallback.
+ *
+ * Awaited by callers on purpose: on Vercel the function is frozen as soon
+ * as the response is sent, so a fire-and-forget send is silently dropped
+ * and the new user never receives their invite. Never throws — the
+ * account is already created; callers report the boolean as `emailSent`.
+ */
+const sendInviteEmail = async (
+  req: AuthRequest,
+  user: { email: string; name: string },
+  password: string,
+  role: "supervisor" | "sales_person" | "accountant" | "tech",
+): Promise<boolean> => {
+  try {
+    const creator = await User.findById(req.user?.userId).select(
+      "name email role",
+    );
+    return await sendAccountCreatedByCEOEmail(
+      user.email,
+      user.name,
+      password,
+      role,
+      {
+        name: creator?.name,
+        email: creator?.email,
+        role: creator?.role,
+      },
+    );
+  } catch (err) {
+    console.error(
+      "❌ sendAccountCreatedByCEOEmail failed (account still created):",
+      err,
+    );
+    return false;
+  }
+};
+
+/**
  * CEO ONLY — creates a supervisor account directly.
  * Middleware: requireCEO must be applied on the route.
  */
@@ -124,7 +164,7 @@ export const createSupervisor = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
+    if (req.user?.role !== "ceo") {
       res.status(403).json({
         success: false,
         message: "Only the CEO can create supervisor accounts",
@@ -163,21 +203,7 @@ export const createSupervisor = async (
 
     const token = generateToken(user);
 
-    // Awaited on purpose: on Vercel the function is frozen as soon as the
-    // response is sent, so a fire-and-forget send is silently dropped and
-    // the new user never receives their login invite.
-    const emailSent = await sendAccountCreatedByCEOEmail(
-      user.email,
-      user.name,
-      password,
-      "supervisor",
-    ).catch((err) => {
-      console.error(
-        "❌ sendAccountCreatedByCEOEmail failed (account still created):",
-        err,
-      );
-      return false;
-    });
+    const emailSent = await sendInviteEmail(req, user, password, "supervisor");
 
     res.status(201).json({
       success: true,
@@ -201,7 +227,7 @@ export const createSalesPerson = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    if (req.user?.role !== "ceo" && req.user?.role !== "tech") {
+    if (req.user?.role !== "ceo") {
       res.status(403).json({
         success: false,
         message: "Only the CEO can create sales person accounts",
@@ -240,21 +266,12 @@ export const createSalesPerson = async (
 
     const token = generateToken(user);
 
-    // Awaited on purpose: on Vercel the function is frozen as soon as the
-    // response is sent, so a fire-and-forget send is silently dropped and
-    // the new user never receives their login invite.
-    const emailSent = await sendAccountCreatedByCEOEmail(
-      user.email,
-      user.name,
+    const emailSent = await sendInviteEmail(
+      req,
+      user,
       password,
       "sales_person",
-    ).catch((err) => {
-      console.error(
-        "❌ sendAccountCreatedByCEOEmail failed (account still created):",
-        err,
-      );
-      return false;
-    });
+    );
 
     res.status(201).json({
       success: true,
@@ -324,21 +341,7 @@ export const createAccountant = async (
 
     const token = generateToken(user);
 
-    // Awaited on purpose: on Vercel the function is frozen as soon as the
-    // response is sent, so a fire-and-forget send is silently dropped and
-    // the new user never receives their login invite.
-    const emailSent = await sendAccountCreatedByCEOEmail(
-      user.email,
-      user.name,
-      password,
-      "accountant",
-    ).catch((err) => {
-      console.error(
-        "❌ sendAccountCreatedByCEOEmail failed (account still created):",
-        err,
-      );
-      return false;
-    });
+    const emailSent = await sendInviteEmail(req, user, password, "accountant");
 
     res.status(201).json({
       success: true,
@@ -407,18 +410,7 @@ export const createTech = async (
 
     const token = generateToken(user);
 
-    const emailSent = await sendAccountCreatedByCEOEmail(
-      user.email,
-      user.name,
-      password,
-      "tech",
-    ).catch((err) => {
-      console.error(
-        "❌ sendAccountCreatedByCEOEmail failed (account still created):",
-        err,
-      );
-      return false;
-    });
+    const emailSent = await sendInviteEmail(req, user, password, "tech");
 
     res.status(201).json({
       success: true,

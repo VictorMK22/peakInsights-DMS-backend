@@ -7,7 +7,9 @@ import {
   getMe,
   changePassword,
   forgotPassword,
+  forgotPasswordValidation,
   resetPassword,
+  resetPasswordValidation,
 } from "../controllers/authController";
 import { authenticate } from "../middleware/auth";
 
@@ -26,9 +28,35 @@ const authLimiter = rateLimit({
   skipSuccessfulRequests: true, // only count failed attempts toward the limit
 });
 
+// forgot-password ALWAYS answers 200 (so it can't leak which emails exist),
+// which means authLimiter's skipSuccessfulRequests would never count it and
+// it would be unlimited — an email-bombing vector. It gets its own limiter
+// that counts every request. (In-memory per instance: best-effort on
+// serverless; use a shared store such as Redis if you need a hard cap.)
+const forgotPasswordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: "Too many reset requests. Please try again later.",
+  },
+});
+
 router.post("/login", authLimiter, loginValidation, login);
-router.post("/forgot-password", authLimiter, forgotPassword);
-router.post("/reset-password", authLimiter, resetPassword);
+router.post(
+  "/forgot-password",
+  forgotPasswordLimiter,
+  forgotPasswordValidation,
+  forgotPassword,
+);
+router.post(
+  "/reset-password",
+  authLimiter,
+  resetPasswordValidation,
+  resetPassword,
+);
 router.post("/logout", authenticate, logout); // POST — blacklists the token
 router.get("/me", authenticate, getMe);
 router.put("/change-password", authenticate, changePassword);

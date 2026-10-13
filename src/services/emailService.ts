@@ -77,6 +77,19 @@ type MailAttachment = {
 
 const MAIL_DOMAIN = (process.env.MAIL_FROM_DOMAIN ?? "").trim().toLowerCase();
 
+/** True if Resend can send as this address (its domain is the verified one). */
+export function canSendAs(address?: string): boolean {
+  if (!address || !MAIL_DOMAIN) return false;
+  const at = address.lastIndexOf("@");
+  return (
+    at > 0 &&
+    address
+      .slice(at + 1)
+      .trim()
+      .toLowerCase() === MAIL_DOMAIN
+  );
+}
+
 /** Address used for system notifications and as the fallback sender. */
 export function getDefaultFromAddress(): string {
   return (
@@ -115,8 +128,10 @@ const cleanDisplayName = (name: string) =>
  * shown in front of it, e.g.  Nelson Kyebei via PeakInsights Hub.
  * Replies go to that person's real address through Reply-To.
  */
-function buildFrom(senderName?: string): string {
+function buildFrom(senderName?: string, fromAddress?: string): string {
   const name = cleanDisplayName(senderName ?? "");
+  // Sending as a specific person's own mailbox: show exactly that person.
+  if (fromAddress) return `"${name || fromAddress}" <${fromAddress}>`;
   const label = name ? `${name} via PeakInsights Hub` : "PeakInsights Hub";
   return `"${label}" <${getDefaultFromAddress()}>`;
 }
@@ -138,6 +153,8 @@ async function send(
     throwOnError?: boolean;
     /** Name of the person who composed this email (shown in the From name). */
     fromName?: string;
+    /** Send as this mailbox instead of the shared address. Caller must ensure its domain is verified in Resend. */
+    fromAddress?: string;
   },
 ): Promise<SentMessageInfo | null> {
   const client = getClient();
@@ -165,7 +182,7 @@ async function send(
   try {
     // The Resend SDK reports API failures through `error` instead of throwing.
     const { data, error } = await client.emails.send({
-      from: buildFrom(opts?.fromName),
+      from: buildFrom(opts?.fromName, opts?.fromAddress),
       to,
       cc: opts?.cc?.length ? opts.cc : undefined,
       bcc: opts?.bcc?.length ? opts.bcc : undefined,
@@ -239,6 +256,15 @@ const p = (t: string) =>
   `<p style="margin:0 0 16px;font-size:15px;color:#334155;line-height:1.7;">${t}</p>`;
 const btn = (text: string, href: string, color = "#0ea5e9") =>
   `<a href="${href}" style="display:inline-block;margin:8px 0 20px;padding:12px 28px;background:${color};color:#fff;font-size:14px;font-weight:600;border-radius:8px;text-decoration:none;">${text}</a>`;
+/** Escapes text interpolated into HTML (names, temp passwords, etc.). */
+const esc = (s: string) =>
+  s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
 const info = (label: string, value: string) =>
   `<p style="margin:4px 0;font-size:14px;color:#475569;"><strong style="color:#0f172a;">${label}:</strong> ${value}</p>`;
 const highlight = (text: string) =>
@@ -259,8 +285,22 @@ export async function sendAccountCreatedByCEOEmail(
   name: string,
   temporaryPassword: string,
   role: "supervisor" | "sales_person" | "accountant" | "tech",
-  fromEmail?: string,
+  sender?: { name?: string; email?: string; role?: string },
 ): Promise<boolean> {
+  // Sent FROM the CEO's own mailbox. Resend only accepts addresses on the
+  // verified domain (MAIL_FROM_DOMAIN); if the CEO's address is elsewhere
+  // (e.g. gmail.com) we fall back to the shared address, still showing the
+  // CEO's name and replying to them, rather than failing to send at all.
+  const senderName = sender?.name?.trim();
+  const fromAddress = canSendAs(sender?.email) ? sender?.email : undefined;
+  if (sender?.email && !fromAddress) {
+    console.warn(
+      `⚠️  CEO mailbox ${sender.email} is not on the verified domain (${MAIL_DOMAIN || "unset"}) — sending the invite from the shared address with Reply-To instead`,
+    );
+  }
+  const senderLabel = senderName
+    ? esc(senderName) + (sender?.role === "ceo" ? " (CEO)" : "")
+    : "The CEO";
   const roleLabel =
     role === "sales_person"
       ? "Sales Person / Business Development Officer"
@@ -275,18 +315,21 @@ export async function sendAccountCreatedByCEOEmail(
     wrap(
       "Account Created",
       `
-      ${h1("Welcome to PeakInsights Hub, " + name + "!")}
-      ${p("The CEO has created a <strong>" + roleLabel + "</strong> account for you. Your account is active immediately.")}
-      ${info("Email", to)}
+      ${h1("Welcome to PeakInsights Hub, " + esc(name) + "!")}
+      ${p(senderLabel + " has created a <strong>" + roleLabel + "</strong> account for you. Your account is active immediately.")}
+      ${info("Email", esc(to))}
       ${highlight(
         "<strong>Temporary password:</strong> " +
-          `<code style="font-size:16px;letter-spacing:2px;">${temporaryPassword}</code>` +
+          `<code style="font-size:16px;letter-spacing:2px;">${esc(temporaryPassword)}</code>` +
           "<br/><br/>Please change your password after your first login.",
       )}
       ${btn("Log in Now", `${APP_URL}/login`, "#7c3aed")}
     `,
     ),
-    fromEmail,
+    sender?.email,
+    undefined,
+    undefined,
+    { fromName: senderName, fromAddress },
   );
   return !!sent;
 }
@@ -295,28 +338,36 @@ export async function sendAccountCreatedByCEOEmail(
 // PASSWORD
 // ═════════════════════════════════════════════════════════════════
 
-/** Sent when a user requests a password reset link. */
+/** Builds the link emailed for a password reset (single source of truth). */
+export function buildPasswordResetUrl(
+  resetToken: string,
+  email: string,
+): string {
+  return `${APP_URL}/reset-password?token=${encodeURIComponent(resetToken)}&email=${encodeURIComponent(email)}`;
+}
+
+/** Sent when a user requests a password reset link. Resolves false if it could not be sent. */
 export async function sendPasswordResetEmail(
   to: string,
   name: string,
   resetToken: string,
-  fromEmail?: string,
-): Promise<void> {
-  const resetUrl = `${APP_URL}/reset-password?token=${resetToken}&email=${encodeURIComponent(to)}`;
-  await send(
+): Promise<boolean> {
+  const resetUrl = buildPasswordResetUrl(resetToken, to);
+  const sent = await send(
     to,
     "Reset your PeakInsights Hub password",
     wrap(
       "Password Reset",
       `
       ${h1("Password Reset Request")}
-      ${p("Hi " + name + ", we received a request to reset your PeakInsights Hub password.")}
+      ${p("Hi " + esc(name) + ", we received a request to reset your PeakInsights Hub password.")}
       ${btn("Reset My Password", resetUrl)}
+      ${p('If the button doesn\'t work, copy this link into your browser:<br/><span style="word-break:break-all;font-size:12px;color:#64748b;">' + esc(resetUrl) + "</span>")}
       ${highlight("This link expires in <strong>1 hour</strong>. If you didn't request this, you can safely ignore this email.")}
     `,
     ),
-    fromEmail,
   );
+  return !!sent;
 }
 
 /** Sent after a successful password change (via change-password endpoint). */
@@ -332,7 +383,7 @@ export async function sendPasswordChangedEmail(
       "Password Changed",
       `
       ${h1("Password Changed")}
-      ${p("Hi " + name + ", your password was successfully updated.")}
+      ${p("Hi " + esc(name) + ", your password was successfully updated.")}
       ${highlight("If you didn't make this change, please contact your administrator immediately.")}
       ${btn("Log in", `${APP_URL}/login`)}
     `,
