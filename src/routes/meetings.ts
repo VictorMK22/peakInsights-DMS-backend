@@ -10,6 +10,7 @@ import {
   checkAvailability,
   getMeetingActivityHistory,
   generateGoogleMeetLink,
+  discardGoogleMeetLink,
 } from "../controllers/meetingController";
 
 /**
@@ -21,6 +22,8 @@ import {
  *   POST   /google-meet-link     Mint a real Google Meet link via the organizer's connected
  *                                Google account, for use as the meeting's meetingLink
  *                                (see services/googleCalendarService.ts)
+ *   DELETE /google-meet-link/:eventId  Remove a generated-but-unsaved Meet event (form was
+ *                                abandoned / link regenerated); refuses saved meetings' events
  *   GET    /:id                  Single meeting detail
  *   PUT    /:id                  Organizer edits (re-checks conflicts if time/attendees changed)
  *   PATCH  /:id/cancel           Organizer cancels (optionally the whole recurring series)
@@ -44,6 +47,7 @@ router.get("/", getMeetings);
 router.post("/", createMeeting);
 router.post("/check-availability", checkAvailability);
 router.post("/google-meet-link", generateGoogleMeetLink);
+router.delete("/google-meet-link/:eventId", discardGoogleMeetLink);
 
 router.get("/:id", getMeeting);
 router.put("/:id", updateMeeting);

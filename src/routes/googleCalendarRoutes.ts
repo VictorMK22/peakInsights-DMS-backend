@@ -5,6 +5,7 @@ import {
   googleCalendarCallback,
   getGoogleCalendarStatus,
   disconnectGoogleCalendar,
+  getGoogleCalendarEvents,
 } from "../controllers/googleCalendarController";
 
 const router = Router();
@@ -16,6 +17,7 @@ router.get("/google-calendar/callback", googleCalendarCallback);
 // Everything else requires the user to be logged into our app.
 router.get("/google-calendar/connect", authenticate, connectGoogleCalendar);
 router.get("/google-calendar/status", authenticate, getGoogleCalendarStatus);
+router.get("/google-calendar/events", authenticate, getGoogleCalendarEvents);
 router.post(
   "/google-calendar/disconnect",
   authenticate,

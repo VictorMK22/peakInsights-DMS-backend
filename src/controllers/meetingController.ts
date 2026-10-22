@@ -21,11 +21,14 @@ import {
   logMeetingActivity,
   getMeetingActivity,
 } from "../services/meetingActivityService";
-import { getSignedFileUrl } from "../services/s3Storage";
+import {
+  pushNewMeetingsToGoogle,
+  syncUpdatedMeetingToGoogle,
+  removeMeetingsFromGoogle,
+} from "../services/meetingGoogleSyncService";
 import {
   getValidGoogleAccessToken,
   createMeetEvent,
-  updateMeetEventTime,
   deleteMeetEvent,
 } from "../services/googleCalendarService";
 
@@ -252,15 +255,11 @@ export const createMeeting = async (
         endTime: occ.endTime,
         location,
         meetingLink,
-        // A Google Meet link is only trustworthy as "google_meet" on
-        // the very first (non-recurring-expansion) occurrence — the
-        // same googleEventId/link would otherwise be duplicated
-        // across every generated occurrence, which isn't meaningful
-        // since each occurrence is its own Calendar event in reality.
-        // Recurring series should be created without a Meet link, or
-        // organizers can attach one per-occurrence via edit.
-        conferenceProvider:
-          index === 0 && meetingLink ? conferenceProvider : undefined,
+        // Every occurrence shares the same join link, so every one keeps
+        // its provider. Only the first can own the pre-generated Meet
+        // event though (googleEventId); the rest get their own plain
+        // Google event below, with the same link in the description.
+        conferenceProvider: meetingLink ? conferenceProvider : undefined,
         googleEventId: index === 0 ? googleEventId : undefined,
         status: "scheduled" as const,
         recurrence: {
@@ -281,6 +280,10 @@ export const createMeeting = async (
       }));
 
     const created = await MeetingModel.insertMany(docs);
+
+    // One Google event per occurrence on the organizer's calendar
+    // (best-effort, awaited — see services/meetingGoogleSyncService.ts).
+    await pushNewMeetingsToGoogle(created as unknown as IMeeting[], actorId);
 
     const organizerUser = await User.findById(actorId)
       .select("name email")
@@ -412,7 +415,7 @@ export const createMeeting = async (
 export const generateGoogleMeetLink = async (
   req: AuthRequest,
   res: Response,
-  next: NextFunction,
+  _next: NextFunction,
 ): Promise<void> => {
   try {
     const actorId = req.user!.userId;
@@ -491,6 +494,56 @@ export const generateGoogleMeetLink = async (
       message:
         "Couldn't create a Google Meet link right now — check your Google connection and try again",
     });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────
+// DISCARD A PENDING GOOGLE MEET LINK — generateGoogleMeetLink above
+// creates the Calendar event *before* the meeting is saved, so if the
+// organizer regenerates the link or abandons the form, that event would
+// otherwise be left behind on their Google Calendar. The form calls
+// this to clean it up. Refuses to touch an event that a saved meeting
+// is using, and never surfaces Google errors (it's cleanup only).
+// ─────────────────────────────────────────────────────────────────
+export const discardGoogleMeetLink = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const { eventId } = req.params;
+    if (!eventId) {
+      res
+        .status(400)
+        .json({ success: false, message: "eventId is required" });
+      return;
+    }
+
+    const inUse = await MeetingModel.exists({ googleEventId: eventId });
+    if (inUse) {
+      res.status(409).json({
+        success: false,
+        message: "That Meet link belongs to a saved meeting",
+      });
+      return;
+    }
+
+    let deleted = false;
+    try {
+      const accessToken = await getValidGoogleAccessToken(req.user!.userId);
+      if (accessToken) {
+        await deleteMeetEvent(accessToken, eventId);
+        deleted = true;
+      }
+    } catch (err: any) {
+      console.error(
+        "Discarding unused Google Meet event failed:",
+        err?.response?.data || err?.message || err,
+      );
+    }
+    res.json({ success: true, data: { deleted } });
+  } catch (err) {
+    next(err);
   }
 };
 
@@ -809,6 +862,13 @@ export const updateMeeting = async (
       (id) => !currentAttendeeIds.includes(id),
     );
 
+    // What the Google side looked like before this edit, so a replaced or
+    // dropped event can be cleaned up afterwards.
+    const previousGoogle = {
+      googleEventId: meeting.googleEventId,
+      conferenceProvider: meeting.conferenceProvider,
+    };
+
     if (title !== undefined) meeting.title = title;
     if (description !== undefined) meeting.description = description;
     if (agenda !== undefined) meeting.agenda = agenda;
@@ -853,30 +913,11 @@ export const updateMeeting = async (
 
     await meeting.save();
 
-    // Best-effort — keep the underlying Google Calendar event (and
-    // therefore the Meet link's event details) in sync when the time
-    // or title changes. Never blocks the response or fails the update
-    // if Google is unreachable/the organizer's token has lapsed.
-    if (
-      meeting.conferenceProvider === "google_meet" &&
-      meeting.googleEventId &&
-      (timeChanged || title !== undefined)
-    ) {
-      getValidGoogleAccessToken(idOf(meeting.organizer))
-        .then((accessToken) => {
-          if (!accessToken) return;
-          return updateMeetEventTime({
-            accessToken,
-            eventId: meeting.googleEventId!,
-            title,
-            startTime: timeChanged ? newStart : undefined,
-            endTime: timeChanged ? newEnd : undefined,
-          });
-        })
-        .catch((err) =>
-          console.error("Google Calendar event sync on update failed:", err),
-        );
-    }
+    // Keep the organizer's Google event (created for every meeting, with
+    // or without a Meet link) in step with the edit. Awaited, because on
+    // Vercel work still running after the response is cut off. Never
+    // throws: Google being down can't fail the update.
+    await syncUpdatedMeetingToGoogle(meeting, previousGoogle);
 
     const organizerUser = await User.findById(meeting.organizer)
       .select("name email")
@@ -1014,26 +1055,9 @@ export const cancelMeeting = async (
       }),
     );
 
-    // Best-effort — delete the Google Calendar event(s) backing any
-    // cancelled meeting's Meet link, so it disappears from the
-    // organizer's calendar instead of sitting there as a stale event.
-    const googleTargets = targets.filter(
-      (m) => m.conferenceProvider === "google_meet" && m.googleEventId,
-    );
-    if (googleTargets.length > 0) {
-      getValidGoogleAccessToken(idOf(meeting.organizer))
-        .then((accessToken) => {
-          if (!accessToken) return;
-          return Promise.all(
-            googleTargets.map((m) =>
-              deleteMeetEvent(accessToken, m.googleEventId!),
-            ),
-          );
-        })
-        .catch((err) =>
-          console.error("Google Calendar event cleanup on cancel failed:", err),
-        );
-    }
+    // Remove every cancelled meeting's event from the organizer's Google
+    // Calendar (Meet-backed or not). Awaited — see the update path above.
+    await removeMeetingsFromGoogle(targets, idOf(meeting.organizer));
 
     const organizerUser = await User.findById(meeting.organizer)
       .select("name email")

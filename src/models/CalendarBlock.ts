@@ -19,6 +19,9 @@ export interface ICalendarBlock extends Document {
   startTime: Date;
   endTime: Date;
   notes?: string;
+  // Set when this block was mirrored onto the user's Google Calendar
+  // (see calendarBlockController); used to remove it there on delete.
+  googleEventId?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -35,6 +38,7 @@ const CalendarBlockSchema = new Schema<ICalendarBlock>(
     startTime: { type: Date, required: true },
     endTime: { type: Date, required: true },
     notes: { type: String, trim: true },
+    googleEventId: { type: String },
   },
   { timestamps: true },
 );

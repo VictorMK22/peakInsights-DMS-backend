@@ -2,6 +2,7 @@ import mongoose from "mongoose";
 import { MeetingModel } from "../models/Meeting";
 import { CalendarBlockModel } from "../models/CalendarBlock";
 import { User } from "../models/User";
+import { getGoogleBusyWindows } from "./googleCalendarService";
 
 // ─────────────────────────────────────────────────────────────────
 // Shared shapes
@@ -10,7 +11,7 @@ import { User } from "../models/User";
 export interface BusyInterval {
   start: Date;
   end: Date;
-  source: "meeting" | "block";
+  source: "meeting" | "block" | "google";
   title: string;
   meetingId?: string;
 }
@@ -44,6 +45,8 @@ const overlaps = (
  *   - meetings where they're the organizer or an attendee who hasn't
  *     declined, on a meeting that hasn't been cancelled
  *   - personal calendar blocks (out-of-office, focus time, etc.)
+ *   - busy time on their connected Google Calendar (if any), shown only
+ *     as a generic "Busy" — event titles from Google are never exposed
  */
 export const getUserBusyIntervals = async (
   userId: string,
@@ -79,6 +82,8 @@ export const getUserBusyIntervals = async (
       .lean(),
   ]);
 
+  const googleWindows = await getGoogleBusyWindows(userId, from, to);
+
   const intervals: BusyInterval[] = [
     ...meetings.map((m) => ({
       start: m.startTime,
@@ -94,6 +99,27 @@ export const getUserBusyIntervals = async (
       title: b.title,
     })),
   ];
+
+  // An attendee's Google Calendar also holds a copy of any Meet meeting
+  // they were invited to, and an organizer's holds the event for their
+  // own meetings. Drop Google windows that coincide with something we
+  // already counted so one meeting doesn't show up as two conflicts.
+  const SAME_SLOT_TOLERANCE_MS = 60_000;
+  for (const w of googleWindows) {
+    const duplicate = intervals.some(
+      (i) =>
+        Math.abs(i.start.getTime() - w.start.getTime()) <
+          SAME_SLOT_TOLERANCE_MS &&
+        Math.abs(i.end.getTime() - w.end.getTime()) < SAME_SLOT_TOLERANCE_MS,
+    );
+    if (duplicate) continue;
+    intervals.push({
+      start: w.start,
+      end: w.end,
+      source: "google",
+      title: "Busy (Google Calendar)",
+    });
+  }
 
   return intervals.sort((a, b) => a.start.getTime() - b.start.getTime());
 };
