@@ -22,15 +22,16 @@ import {
   getMeetingActivity,
 } from "../services/meetingActivityService";
 import {
-  pushNewMeetingsToGoogle,
-  syncUpdatedMeetingToGoogle,
-  removeMeetingsFromGoogle,
-} from "../services/meetingGoogleSyncService";
+  pushNewMeetingsToZoho,
+  syncUpdatedMeetingToZoho,
+  removeMeetingsFromZoho,
+} from "../services/meetingZohoSyncService";
 import {
-  getValidGoogleAccessToken,
-  createMeetEvent,
-  deleteMeetEvent,
-} from "../services/googleCalendarService";
+  getZohoCalendarSession,
+  createZohoEvent,
+  deleteZohoEvent,
+  zohoMeetingJoinLink,
+} from "../services/zohoCalendarService";
 
 // A recurring series is capped so "invite everyone, repeat forever"
 // can't silently generate an unbounded number of documents — see
@@ -140,7 +141,7 @@ export const createMeeting = async (
       location,
       meetingLink,
       conferenceProvider,
-      googleEventId,
+      calendarEventUid,
       attendeeIds = [],
       targetDepartments = [],
       organizationWide = false,
@@ -157,8 +158,8 @@ export const createMeeting = async (
       endTime: string;
       location?: string;
       meetingLink?: string;
-      conferenceProvider?: "custom" | "google_meet";
-      googleEventId?: string;
+      conferenceProvider?: "custom" | "zoho_meeting" | "google_meet";
+      calendarEventUid?: string;
       attendeeIds?: string[];
       targetDepartments?: string[];
       organizationWide?: boolean;
@@ -256,11 +257,11 @@ export const createMeeting = async (
         location,
         meetingLink,
         // Every occurrence shares the same join link, so every one keeps
-        // its provider. Only the first can own the pre-generated Meet
-        // event though (googleEventId); the rest get their own plain
-        // Google event below, with the same link in the description.
+        // its provider. Only the first can own the pre-generated Zoho
+        // Meeting event though (calendarEventUid); the rest get their own
+        // plain Zoho event below, with the same link in the description.
         conferenceProvider: meetingLink ? conferenceProvider : undefined,
-        googleEventId: index === 0 ? googleEventId : undefined,
+        calendarEventUid: index === 0 ? calendarEventUid : undefined,
         status: "scheduled" as const,
         recurrence: {
           frequency: rule.frequency ?? "none",
@@ -281,9 +282,9 @@ export const createMeeting = async (
 
     const created = await MeetingModel.insertMany(docs);
 
-    // One Google event per occurrence on the organizer's calendar
-    // (best-effort, awaited — see services/meetingGoogleSyncService.ts).
-    await pushNewMeetingsToGoogle(created as unknown as IMeeting[], actorId);
+    // One Zoho event per occurrence on the organizer's calendar
+    // (best-effort, awaited — see services/meetingZohoSyncService.ts).
+    await pushNewMeetingsToZoho(created as unknown as IMeeting[], actorId);
 
     const organizerUser = await User.findById(actorId)
       .select("name email")
@@ -404,15 +405,15 @@ export const createMeeting = async (
 };
 
 // ─────────────────────────────────────────────────────────────────
-// GOOGLE MEET — generates a real, clickable meet.google.com link via
-// the organizer's own connected Google account (see
-// services/googleCalendarService.ts), for use as this meeting's
+// ZOHO MEETING — creates a real Zoho Meeting (a Zoho Calendar event with
+// a meeting attached) via the organizer's own connected Zoho Calendar
+// (see services/zohoCalendarService.ts), for use as this meeting's
 // meetingLink. Called from the create/edit form *before* the meeting
-// itself is saved, so the returned link + googleEventId are just
+// itself is saved, so the returned link + calendarEventUid are just
 // handed back to the client to include in the createMeeting /
 // updateMeeting payload — this endpoint does not touch MeetingModel.
 // ─────────────────────────────────────────────────────────────────
-export const generateGoogleMeetLink = async (
+export const generateZohoMeetingLink = async (
   req: AuthRequest,
   res: Response,
   _next: NextFunction,
@@ -452,13 +453,13 @@ export const generateGoogleMeetLink = async (
       return;
     }
 
-    const accessToken = await getValidGoogleAccessToken(actorId);
-    if (!accessToken) {
+    const session = await getZohoCalendarSession(actorId);
+    if (!session) {
       res.status(409).json({
         success: false,
         message:
-          "Connect your Google account first to generate a Google Meet link",
-        data: { needsGoogleConnect: true },
+          "Connect your Zoho Calendar first to generate a Zoho Meeting link",
+        data: { needsCalendarConnect: true },
       });
       return;
     }
@@ -469,75 +470,93 @@ export const generateGoogleMeetLink = async (
           .lean()
       : [];
 
-    const { eventId, hangoutLink } = await createMeetEvent({
-      accessToken,
+    const event = await createZohoEvent({
+      session,
+      withZohoMeeting: true,
       title,
       startTime: start,
       endTime: end,
       attendeeEmails: attendeeUsers
-        .map((u) => u.email)
-        .filter((e): e is string => Boolean(e)),
+        .map((u) => u.email?.toLowerCase())
+        .filter((e): e is string => !!e && e !== session.email),
     });
+
+    if (!event.meetingKey) {
+      // The event was created but Zoho didn't attach a meeting (e.g. the
+      // account has no Zoho Meeting access). Don't leave it behind.
+      await deleteZohoEvent({ session, uid: event.uid, etag: event.etag }).catch(
+        () => undefined,
+      );
+      res.status(502).json({
+        success: false,
+        message:
+          "Zoho didn't create a meeting for this event — check that Zoho Meeting is enabled for your account, then reconnect Zoho Calendar",
+      });
+      return;
+    }
 
     res.json({
       success: true,
-      message: "Google Meet link created",
-      data: { meetingLink: hangoutLink, googleEventId: eventId },
+      message: "Zoho Meeting link created",
+      data: {
+        meetingLink: zohoMeetingJoinLink(event.meetingKey),
+        calendarEventUid: event.uid,
+      },
     });
   } catch (err: any) {
     console.error(
-      "Google Meet link generation failed:",
+      "Zoho Meeting link generation failed:",
       err?.response?.data || err?.message || err,
     );
     res.status(502).json({
       success: false,
       message:
-        "Couldn't create a Google Meet link right now — check your Google connection and try again",
+        "Couldn't create a Zoho Meeting link right now — check your Zoho Calendar connection and try again",
     });
   }
 };
 
 // ─────────────────────────────────────────────────────────────────
-// DISCARD A PENDING GOOGLE MEET LINK — generateGoogleMeetLink above
-// creates the Calendar event *before* the meeting is saved, so if the
-// organizer regenerates the link or abandons the form, that event would
-// otherwise be left behind on their Google Calendar. The form calls
-// this to clean it up. Refuses to touch an event that a saved meeting
-// is using, and never surfaces Google errors (it's cleanup only).
+// DISCARD A PENDING ZOHO MEETING — generateZohoMeetingLink above creates
+// the calendar event *before* the meeting is saved, so if the organizer
+// regenerates the link or abandons the form, that event would otherwise
+// be left behind on their Zoho Calendar. The form calls this to clean it
+// up. Refuses to touch an event that a saved meeting is using, and never
+// surfaces Zoho errors (it's cleanup only).
 // ─────────────────────────────────────────────────────────────────
-export const discardGoogleMeetLink = async (
+export const discardZohoMeetingLink = async (
   req: AuthRequest,
   res: Response,
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const { eventId } = req.params;
-    if (!eventId) {
+    const { eventUid } = req.params;
+    if (!eventUid) {
       res
         .status(400)
-        .json({ success: false, message: "eventId is required" });
+        .json({ success: false, message: "eventUid is required" });
       return;
     }
 
-    const inUse = await MeetingModel.exists({ googleEventId: eventId });
+    const inUse = await MeetingModel.exists({ calendarEventUid: eventUid });
     if (inUse) {
       res.status(409).json({
         success: false,
-        message: "That Meet link belongs to a saved meeting",
+        message: "That meeting link belongs to a saved meeting",
       });
       return;
     }
 
     let deleted = false;
     try {
-      const accessToken = await getValidGoogleAccessToken(req.user!.userId);
-      if (accessToken) {
-        await deleteMeetEvent(accessToken, eventId);
+      const session = await getZohoCalendarSession(req.user!.userId);
+      if (session) {
+        await deleteZohoEvent({ session, uid: eventUid });
         deleted = true;
       }
     } catch (err: any) {
       console.error(
-        "Discarding unused Google Meet event failed:",
+        "Discarding unused Zoho Meeting event failed:",
         err?.response?.data || err?.message || err,
       );
     }
@@ -765,7 +784,7 @@ export const updateMeeting = async (
       location,
       meetingLink,
       conferenceProvider,
-      googleEventId,
+      calendarEventUid,
       attendeeIds,
       reminderMinutesBefore,
       comment,
@@ -779,8 +798,8 @@ export const updateMeeting = async (
       endTime?: string;
       location?: string;
       meetingLink?: string;
-      conferenceProvider?: "custom" | "google_meet";
-      googleEventId?: string;
+      conferenceProvider?: "custom" | "zoho_meeting" | "google_meet";
+      calendarEventUid?: string;
       attendeeIds?: string[];
       reminderMinutesBefore?: number;
       force?: boolean;
@@ -793,7 +812,7 @@ export const updateMeeting = async (
     const trimmedComment = comment?.trim();
     if (salesLeadRestricted) {
       title = description = agenda = location = meetingLink = undefined;
-      conferenceProvider = googleEventId = undefined;
+      conferenceProvider = calendarEventUid = undefined;
       attendeeIds = undefined;
       reminderMinutesBefore = undefined;
       const wantsMove =
@@ -862,10 +881,10 @@ export const updateMeeting = async (
       (id) => !currentAttendeeIds.includes(id),
     );
 
-    // What the Google side looked like before this edit, so a replaced or
+    // What the Zoho side looked like before this edit, so a replaced or
     // dropped event can be cleaned up afterwards.
-    const previousGoogle = {
-      googleEventId: meeting.googleEventId,
+    const previousCalendar = {
+      calendarEventUid: meeting.calendarEventUid,
       conferenceProvider: meeting.conferenceProvider,
     };
 
@@ -876,7 +895,7 @@ export const updateMeeting = async (
     if (meetingLink !== undefined) meeting.meetingLink = meetingLink;
     if (conferenceProvider !== undefined)
       meeting.conferenceProvider = conferenceProvider;
-    if (googleEventId !== undefined) meeting.googleEventId = googleEventId;
+    if (calendarEventUid !== undefined) meeting.calendarEventUid = calendarEventUid;
     if (reminderMinutesBefore !== undefined)
       meeting.reminderMinutesBefore = reminderMinutesBefore;
     meeting.startTime = newStart;
@@ -913,11 +932,11 @@ export const updateMeeting = async (
 
     await meeting.save();
 
-    // Keep the organizer's Google event (created for every meeting, with
-    // or without a Meet link) in step with the edit. Awaited, because on
+    // Keep the organizer's Zoho event (created for every meeting, with
+    // or without a Zoho Meeting) in step with the edit. Awaited, because on
     // Vercel work still running after the response is cut off. Never
-    // throws: Google being down can't fail the update.
-    await syncUpdatedMeetingToGoogle(meeting, previousGoogle);
+    // throws: Zoho being down can't fail the update.
+    await syncUpdatedMeetingToZoho(meeting, previousCalendar);
 
     const organizerUser = await User.findById(meeting.organizer)
       .select("name email")
@@ -1055,9 +1074,9 @@ export const cancelMeeting = async (
       }),
     );
 
-    // Remove every cancelled meeting's event from the organizer's Google
-    // Calendar (Meet-backed or not). Awaited — see the update path above.
-    await removeMeetingsFromGoogle(targets, idOf(meeting.organizer));
+    // Remove every cancelled meeting's event from the organizer's Zoho
+    // Calendar (Zoho Meeting-backed or not). Awaited — see the update path above.
+    await removeMeetingsFromZoho(targets, idOf(meeting.organizer));
 
     const organizerUser = await User.findById(meeting.organizer)
       .select("name email")

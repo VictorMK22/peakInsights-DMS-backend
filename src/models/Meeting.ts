@@ -74,17 +74,20 @@ export interface IMeeting extends Document {
   location?: string;
   meetingLink?: string;
 
-  // Set when meetingLink was auto-generated via the organizer's
-  // connected Google account (see services/googleCalendarService.ts)
-  // rather than pasted in by hand. "google_meet" links get an extra
-  // "Join Google Meet" affordance in the UI and their underlying
-  // Calendar event is kept in sync / cleaned up automatically —
-  // see meetingController's use of googleEventId below.
-  conferenceProvider?: "custom" | "google_meet";
-  // The Google Calendar event backing a google_meet meetingLink, on
-  // the organizer's own calendar — needed to patch its time on
-  // reschedule and delete it on cancellation.
-  googleEventId?: string;
+  // "zoho_meeting" = the link was auto-generated through the organizer's
+  // connected Zoho Calendar (see services/zohoCalendarService.ts) rather
+  // than pasted in by hand; those get a "Join Zoho Meeting" affordance in
+  // the UI. "google_meet" is legacy: it's no longer generated, but
+  // meetings created that way before the switch to Zoho keep it so they
+  // still load and display correctly.
+  conferenceProvider?: "custom" | "zoho_meeting" | "google_meet";
+  // The event for this meeting on the organizer's Zoho Calendar (every
+  // meeting gets one when they've connected it, with or without a Zoho
+  // Meeting) — needed to update it on reschedule and delete it on
+  // cancellation. The etag is Zoho's version tag for that event; updates
+  // and deletes must present the latest one.
+  calendarEventUid?: string;
+  calendarEventEtag?: string;
 
   status: MeetingStatus;
   cancellationReason?: string;
@@ -165,8 +168,12 @@ const MeetingSchema = new Schema<IMeeting>(
 
     location: { type: String, trim: true },
     meetingLink: { type: String, trim: true },
-    conferenceProvider: { type: String, enum: ["custom", "google_meet"] },
-    googleEventId: { type: String },
+    conferenceProvider: {
+      type: String,
+      enum: ["custom", "zoho_meeting", "google_meet"],
+    },
+    calendarEventUid: { type: String },
+    calendarEventEtag: { type: String },
 
     status: {
       type: String,

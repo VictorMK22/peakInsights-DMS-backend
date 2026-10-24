@@ -9,8 +9,8 @@ import {
   respondToMeeting,
   checkAvailability,
   getMeetingActivityHistory,
-  generateGoogleMeetLink,
-  discardGoogleMeetLink,
+  generateZohoMeetingLink,
+  discardZohoMeetingLink,
 } from "../controllers/meetingController";
 
 /**
@@ -19,10 +19,10 @@ import {
  *   GET    /                     Calendar-range view (mine + invited; ?clientId= for a client's meetings)
  *   POST   /                     Create a meeting (checks conflicts first — see 409 response)
  *   POST   /check-availability   Live conflict check while filling out the create/edit form
- *   POST   /google-meet-link     Mint a real Google Meet link via the organizer's connected
- *                                Google account, for use as the meeting's meetingLink
- *                                (see services/googleCalendarService.ts)
- *   DELETE /google-meet-link/:eventId  Remove a generated-but-unsaved Meet event (form was
+ *   POST   /zoho-meeting-link    Create a real Zoho Meeting via the organizer's connected
+ *                                Zoho Calendar, for use as the meeting's meetingLink
+ *                                (see services/zohoCalendarService.ts)
+ *   DELETE /zoho-meeting-link/:eventUid  Remove a generated-but-unsaved event (form was
  *                                abandoned / link regenerated); refuses saved meetings' events
  *   GET    /:id                  Single meeting detail
  *   PUT    /:id                  Organizer edits (re-checks conflicts if time/attendees changed)
@@ -35,7 +35,7 @@ import {
  * scheduled-reminder + auto-complete sweep.
  *
  * Video calls are external — attendees join via the meeting's
- * meetingLink (e.g. a Google Meet link generated above, or any link
+ * meetingLink (e.g. a Zoho Meeting link generated above, or any link
  * an organizer pastes in). There is no built-in call, recording,
  * attendance tracking, or breakout-room feature in this module.
  */
@@ -46,8 +46,8 @@ router.use(authenticate);
 router.get("/", getMeetings);
 router.post("/", createMeeting);
 router.post("/check-availability", checkAvailability);
-router.post("/google-meet-link", generateGoogleMeetLink);
-router.delete("/google-meet-link/:eventId", discardGoogleMeetLink);
+router.post("/zoho-meeting-link", generateZohoMeetingLink);
+router.delete("/zoho-meeting-link/:eventUid", discardZohoMeetingLink);
 
 router.get("/:id", getMeeting);
 router.put("/:id", updateMeeting);

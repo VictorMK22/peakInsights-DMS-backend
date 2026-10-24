@@ -18,7 +18,7 @@ import emailRoutes from "./routes/emails";
 import clientRoutes from "./routes/clientRoutes";
 import whatsappWebhookRoutes from "./routes/whatsappWebhook";
 import emailIntegrationRoutes from "./routes/emailIntegrationRoutes";
-import googleCalendarRoutes from "./routes/googleCalendarRoutes";
+import zohoCalendarRoutes from "./routes/zohoCalendarRoutes";
 import cronRoutes from "./routes/cron";
 import shareRoutes from "./routes/share";
 import filesRoutes from "./routes/files";
@@ -147,7 +147,7 @@ app.use("/api/messages", messageRoutes);
 app.use("/api/emails", emailRoutes);
 app.use("/api/clients", clientRoutes);
 app.use("/api/integrations", emailIntegrationRoutes);
-app.use("/api/integrations", googleCalendarRoutes);
+app.use("/api/integrations", zohoCalendarRoutes);
 // Public — Meta calls this directly, must not require our app auth.
 app.use("/webhooks/whatsapp", whatsappWebhookRoutes);
 // Secret-protected (not user auth) — called by an external scheduler,

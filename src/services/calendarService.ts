@@ -2,7 +2,7 @@ import mongoose from "mongoose";
 import { MeetingModel } from "../models/Meeting";
 import { CalendarBlockModel } from "../models/CalendarBlock";
 import { User } from "../models/User";
-import { getGoogleBusyWindows } from "./googleCalendarService";
+import { getZohoBusyWindows } from "./zohoCalendarService";
 
 // ─────────────────────────────────────────────────────────────────
 // Shared shapes
@@ -11,7 +11,7 @@ import { getGoogleBusyWindows } from "./googleCalendarService";
 export interface BusyInterval {
   start: Date;
   end: Date;
-  source: "meeting" | "block" | "google";
+  source: "meeting" | "block" | "zoho";
   title: string;
   meetingId?: string;
 }
@@ -45,8 +45,8 @@ const overlaps = (
  *   - meetings where they're the organizer or an attendee who hasn't
  *     declined, on a meeting that hasn't been cancelled
  *   - personal calendar blocks (out-of-office, focus time, etc.)
- *   - busy time on their connected Google Calendar (if any), shown only
- *     as a generic "Busy" — event titles from Google are never exposed
+ *   - busy time on their connected Zoho Calendar (if any), shown only
+ *     as a generic "Busy" — event titles from Zoho are never exposed
  */
 export const getUserBusyIntervals = async (
   userId: string,
@@ -72,17 +72,19 @@ export const getUserBusyIntervals = async (
   }
 
   const [meetings, blocks] = await Promise.all([
-    MeetingModel.find(meetingFilter).select("title startTime endTime").lean(),
+    MeetingModel.find(meetingFilter)
+      .select("title startTime endTime calendarEventUid")
+      .lean(),
     CalendarBlockModel.find({
       userId,
       startTime: { $lt: to },
       endTime: { $gt: from },
     })
-      .select("title startTime endTime")
+      .select("title startTime endTime calendarEventUid")
       .lean(),
   ]);
 
-  const googleWindows = await getGoogleBusyWindows(userId, from, to);
+  const zohoWindows = await getZohoBusyWindows(userId, from, to);
 
   const intervals: BusyInterval[] = [
     ...meetings.map((m) => ({
@@ -100,12 +102,27 @@ export const getUserBusyIntervals = async (
     })),
   ];
 
-  // An attendee's Google Calendar also holds a copy of any Meet meeting
-  // they were invited to, and an organizer's holds the event for their
-  // own meetings. Drop Google windows that coincide with something we
-  // already counted so one meeting doesn't show up as two conflicts.
+  // The organizer's Zoho Calendar holds an event for each of their own
+  // meetings and blocks, and an attendee's holds a copy of any meeting
+  // they were invited to. Drop Zoho windows that are an event this app
+  // created (by uid) or that coincide with something we already counted,
+  // so one meeting doesn't show up as two conflicts.
+  const ownUids = new Set<string>(
+    [...meetings, ...blocks]
+      .map((x: any) => x.calendarEventUid as string | undefined)
+      .filter((u): u is string => !!u),
+  );
+  // The meeting being edited is excluded from `meetings` above, but its
+  // Zoho event is still on the calendar — it must not conflict with itself.
+  if (excludeMeetingId && zohoWindows.length) {
+    const excluded = await MeetingModel.findById(excludeMeetingId)
+      .select("calendarEventUid")
+      .lean();
+    if (excluded?.calendarEventUid) ownUids.add(excluded.calendarEventUid);
+  }
   const SAME_SLOT_TOLERANCE_MS = 60_000;
-  for (const w of googleWindows) {
+  for (const w of zohoWindows) {
+    if (w.uid && ownUids.has(w.uid)) continue;
     const duplicate = intervals.some(
       (i) =>
         Math.abs(i.start.getTime() - w.start.getTime()) <
@@ -116,8 +133,8 @@ export const getUserBusyIntervals = async (
     intervals.push({
       start: w.start,
       end: w.end,
-      source: "google",
-      title: "Busy (Google Calendar)",
+      source: "zoho",
+      title: "Busy (Zoho Calendar)",
     });
   }
 

@@ -2,10 +2,10 @@ import { Response, NextFunction } from "express";
 import { AuthRequest } from "../types/auth";
 import { CalendarBlockModel } from "../models/CalendarBlock";
 import {
-  getValidGoogleAccessToken,
+  getZohoCalendarSession,
   createBusyEvent,
-  deleteMeetEvent,
-} from "../services/googleCalendarService";
+  deleteZohoEvent,
+} from "../services/zohoCalendarService";
 
 // ─────────────────────────────────────────────────────────────────
 // Personal calendar blocks — a user marking themselves unavailable
@@ -13,9 +13,9 @@ import {
 // private to the owning user; other users only ever see them
 // indirectly, as a conflict when scheduling a meeting.
 //
-// If the user has connected Google Calendar, a block is also mirrored
-// onto their Google Calendar as a private busy event (best-effort: a
-// Google failure never stops the block from being saved).
+// If the user has connected Zoho Calendar, a block is also mirrored
+// onto their Zoho Calendar as a private busy event (best-effort: a
+// Zoho failure never stops the block from being saved).
 // ─────────────────────────────────────────────────────────────────
 
 export const createCalendarBlock = async (
@@ -24,14 +24,14 @@ export const createCalendarBlock = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const { title, type, startTime, endTime, notes, syncToGoogle } =
+    const { title, type, startTime, endTime, notes, syncToZoho } =
       req.body as {
         title?: string;
         type?: "busy" | "out_of_office" | "personal";
         startTime: string;
         endTime: string;
         notes?: string;
-        syncToGoogle?: boolean; // default true when Google is connected
+        syncToZoho?: boolean; // default true when Zoho Calendar is connected
       };
 
     if (!startTime || !endTime) {
@@ -64,29 +64,28 @@ export const createCalendarBlock = async (
       notes,
     });
 
-    // Mirror to Google Calendar. Awaited (not fire-and-forget) because
+    // Mirror to Zoho Calendar. Awaited (not fire-and-forget) because
     // on a serverless host the work is cut off once the response is sent.
-    let googleSynced = false;
-    if (syncToGoogle !== false) {
+    let calendarSynced = false;
+    if (syncToZoho !== false) {
       try {
-        const accessToken = await getValidGoogleAccessToken(
-          req.user!.userId,
-        );
-        if (accessToken) {
-          const { eventId } = await createBusyEvent({
-            accessToken,
+        const session = await getZohoCalendarSession(req.user!.userId);
+        if (session) {
+          const event = await createBusyEvent({
+            session,
             title: block.title,
             description: block.notes,
             startTime: start,
             endTime: end,
           });
-          block.googleEventId = eventId;
+          block.calendarEventUid = event.uid;
+          block.calendarEventEtag = event.etag;
           await block.save();
-          googleSynced = true;
+          calendarSynced = true;
         }
       } catch (err: any) {
         console.error(
-          "Mirroring calendar block to Google failed (block kept):",
+          "Mirroring calendar block to Zoho failed (block kept):",
           err?.response?.data || err?.message || err,
         );
       }
@@ -94,10 +93,10 @@ export const createCalendarBlock = async (
 
     res.status(201).json({
       success: true,
-      message: googleSynced
-        ? "Unavailability marked and added to your Google Calendar"
+      message: calendarSynced
+        ? "Unavailability marked and added to your Zoho Calendar"
         : "Unavailability marked",
-      data: { block, googleSynced },
+      data: { block, calendarSynced },
     });
   } catch (err) {
     next(err);
@@ -144,17 +143,20 @@ export const deleteCalendarBlock = async (
       });
       return;
     }
-    // Remove the mirrored Google event first (best-effort), while we
+    // Remove the mirrored Zoho event first (best-effort), while we
     // still have its id.
-    if (block.googleEventId) {
+    if (block.calendarEventUid) {
       try {
-        const accessToken = await getValidGoogleAccessToken(
-          req.user!.userId,
-        );
-        if (accessToken) await deleteMeetEvent(accessToken, block.googleEventId);
+        const session = await getZohoCalendarSession(req.user!.userId);
+        if (session)
+          await deleteZohoEvent({
+            session,
+            uid: block.calendarEventUid,
+            etag: block.calendarEventEtag,
+          });
       } catch (err: any) {
         console.error(
-          "Removing mirrored Google event failed (block still deleted):",
+          "Removing mirrored Zoho event failed (block still deleted):",
           err?.response?.data || err?.message || err,
         );
       }
