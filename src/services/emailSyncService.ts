@@ -222,7 +222,10 @@ async function syncOneMailbox(
 // the normal incremental sync never looks at them again. This walks back
 // through recent mail once per mailbox and fills them in. It is budgeted
 // per run (serverless time limits) and resumes on the next sync until it
-// has covered everything, then records attachmentBackfilledAt and stops.
+// has covered everything, then records the version it completed and stops.
+// Bump BACKFILL_VERSION to make every mailbox and email be re-examined once
+// (e.g. after fixing a bug in this logic) — older runs don't count.
+const BACKFILL_VERSION = 2;
 const BACKFILL_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
 const BACKFILL_MAX_FILLED_PER_RUN = 25;
 const BACKFILL_TIME_BUDGET_MS = 25_000; // leave headroom under the serverless limit
@@ -236,7 +239,7 @@ async function backfillInternalAttachments(
   targets: { folderId: string; direction: "inbound" | "outbound" }[],
   staffByEmail: Map<string, unknown>,
 ): Promise<void> {
-  if (integration.attachmentBackfilledAt) return;
+  if ((integration.attachmentBackfillVersion ?? 0) >= BACKFILL_VERSION) return;
 
   const since = Date.now() - BACKFILL_WINDOW_MS;
   const deadline = Date.now() + BACKFILL_TIME_BUDGET_MS;
@@ -269,7 +272,8 @@ async function backfillInternalAttachments(
             msg.subject,
             Number(msg.receivedTime),
           ),
-          attachmentsCheckedAt: { $exists: false },
+          // $ne also matches emails that were never examined at all
+          attachmentsBackfillVersion: { $ne: BACKFILL_VERSION },
         }).select("_id attachments attachmentBackfillAttempts");
         if (!log || log.attachments?.length) continue;
         stats.matched++;
@@ -294,7 +298,7 @@ async function backfillInternalAttachments(
             { _id: log._id },
             {
               ...(attachments.length ? { attachments } : {}),
-              attachmentsCheckedAt: new Date(),
+              attachmentsBackfillVersion: BACKFILL_VERSION,
             },
           );
           attachments.length ? stats.filled++ : stats.empty++;
@@ -308,7 +312,7 @@ async function backfillInternalAttachments(
             {
               attachmentBackfillAttempts: attempts,
               ...(attempts >= BACKFILL_MAX_ATTEMPTS
-                ? { attachmentsCheckedAt: new Date() }
+                ? { attachmentsBackfillVersion: BACKFILL_VERSION }
                 : {}),
             },
           );
@@ -328,7 +332,7 @@ async function backfillInternalAttachments(
   console.log(
     `Zoho backfill ${integration.emailAddress}: ${JSON.stringify(stats)} ${finished ? "— complete" : "— will continue next sync"}`,
   );
-  if (finished) integration.attachmentBackfilledAt = new Date();
+  if (finished) integration.attachmentBackfillVersion = BACKFILL_VERSION;
 }
 
 async function syncClientMessage(

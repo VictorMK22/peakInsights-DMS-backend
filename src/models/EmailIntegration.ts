@@ -14,9 +14,10 @@ export interface IEmailIntegration extends Document {
   status: "connected" | "error" | "disconnected";
   lastError?: string;
   lastSyncedAt?: Date; // watermark — only messages newer than this are fetched
-  // Set once the one-time pass that adds attachments to previously-synced
-  // internal emails has finished (see emailSyncService.backfillInternalAttachments).
-  attachmentBackfilledAt?: Date;
+  // Version of the attachment backfill this mailbox has completed. Bumping
+  // BACKFILL_VERSION in emailSyncService.ts makes every mailbox run it again
+  // (see backfillInternalAttachments).
+  attachmentBackfillVersion?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -42,7 +43,7 @@ const EmailIntegrationSchema = new Schema<IEmailIntegration>(
     },
     lastError: { type: String },
     lastSyncedAt: { type: Date },
-    attachmentBackfilledAt: { type: Date },
+    attachmentBackfillVersion: { type: Number },
   },
   { timestamps: true },
 );

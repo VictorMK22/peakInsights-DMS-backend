@@ -68,9 +68,9 @@ export interface IEmailLog extends Document {
   dedupeKey?: string;
 
   attachments?: IEmailAttachment[];
-  // Set when the attachment backfill has looked at this synced email (whether
-  // or not it found anything), so one that keeps failing can't starve the rest.
-  attachmentsCheckedAt?: Date;
+  // Backfill version that has already handled this synced email (whether or
+  // not it found files), so one that keeps failing can't starve the rest.
+  attachmentsBackfillVersion?: number;
   // Failed download attempts by the backfill; after a few it gives up on
   // this email instead of retrying forever.
   attachmentBackfillAttempts?: number;
@@ -209,7 +209,7 @@ const EmailLogSchema = new Schema<IEmailLog>(
       default: undefined,
     },
 
-    attachmentsCheckedAt: { type: Date },
+    attachmentsBackfillVersion: { type: Number },
     attachmentBackfillAttempts: { type: Number },
 
     broadcastId: { type: Schema.Types.ObjectId },
