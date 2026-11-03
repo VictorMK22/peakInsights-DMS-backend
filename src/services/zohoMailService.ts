@@ -138,6 +138,16 @@ export interface ZohoMessageSummary {
   hasAttachment: boolean;
 }
 
+/**
+ * Zoho sends flags as the STRINGS "0"/"1", and Boolean("0") is true — which
+ * made every email look like it had attachments. If the field is missing
+ * entirely we assume it might, rather than silently skipping real ones.
+ */
+const zohoFlag = (v: unknown): boolean =>
+  v === undefined || v === null
+    ? true
+    : v === true || v === 1 || v === "1" || v === "true";
+
 export async function listMessages(
   accessToken: string,
   accountId: string,
@@ -168,7 +178,7 @@ export async function listMessages(
       fromAddress: (m.fromAddress || "").toLowerCase(),
       toAddress: (m.toAddress || "").toLowerCase(),
       receivedTime: String(m.receivedTime),
-      hasAttachment: Boolean(m.hasAttachment),
+      hasAttachment: zohoFlag(m.hasAttachment),
     }));
 }
 

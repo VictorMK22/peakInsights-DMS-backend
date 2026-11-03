@@ -224,8 +224,10 @@ async function syncOneMailbox(
 // per run (serverless time limits) and resumes on the next sync until it
 // has covered everything, then records attachmentBackfilledAt and stops.
 const BACKFILL_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
-const BACKFILL_MAX_FILLED_PER_RUN = 8;
+const BACKFILL_MAX_FILLED_PER_RUN = 25;
+const BACKFILL_TIME_BUDGET_MS = 25_000; // leave headroom under the serverless limit
 const BACKFILL_MAX_PAGES = 6; // x50 messages per folder
+const BACKFILL_MAX_ATTEMPTS = 3;
 
 async function backfillInternalAttachments(
   integration: IEmailIntegration,
@@ -237,9 +239,11 @@ async function backfillInternalAttachments(
   if (integration.attachmentBackfilledAt) return;
 
   const since = Date.now() - BACKFILL_WINDOW_MS;
-  let filled = 0;
+  const deadline = Date.now() + BACKFILL_TIME_BUDGET_MS;
+  const stats = { scanned: 0, withFiles: 0, matched: 0, filled: 0, empty: 0, failed: 0 };
+  let finished = true;
 
-  for (const target of targets) {
+  outer: for (const target of targets) {
     for (let page = 0; page < BACKFILL_MAX_PAGES; page++) {
       const messages = await listMessages(
         accessToken,
@@ -251,7 +255,9 @@ async function backfillInternalAttachments(
       );
 
       for (const msg of messages) {
+        stats.scanned++;
         if (!msg.hasAttachment) continue;
+        stats.withFiles++;
         const counterpart = extractCounterpartEmail(
           target.direction === "inbound" ? msg.fromAddress : msg.toAddress,
         );
@@ -264,25 +270,54 @@ async function backfillInternalAttachments(
             Number(msg.receivedTime),
           ),
           attachmentsCheckedAt: { $exists: false },
-        }).select("_id attachments");
+        }).select("_id attachments attachmentBackfillAttempts");
         if (!log || log.attachments?.length) continue;
+        stats.matched++;
 
-        if (filled >= BACKFILL_MAX_FILLED_PER_RUN) return; // resume next sync
-        filled++;
+        if (
+          stats.filled + stats.failed >= BACKFILL_MAX_FILLED_PER_RUN ||
+          Date.now() > deadline
+        ) {
+          finished = false; // out of budget — pick up again on the next sync
+          break outer;
+        }
 
-        const attachments = await syncAttachments(
-          accessToken,
-          accountId,
-          target.folderId,
-          msg,
-        );
-        await EmailLog.updateOne(
-          { _id: log._id },
-          {
-            ...(attachments.length ? { attachments } : {}),
-            attachmentsCheckedAt: new Date(),
-          },
-        );
+        try {
+          const attachments = await fetchAttachments(
+            accessToken,
+            accountId,
+            target.folderId,
+            msg,
+          );
+          // A clean answer — even "no files" — means we're done with this email.
+          await EmailLog.updateOne(
+            { _id: log._id },
+            {
+              ...(attachments.length ? { attachments } : {}),
+              attachmentsCheckedAt: new Date(),
+            },
+          );
+          attachments.length ? stats.filled++ : stats.empty++;
+        } catch (err: any) {
+          // Don't mark it checked on a failure — retry next sync, but give up
+          // after a few attempts so one bad email can't block the rest.
+          stats.failed++;
+          const attempts = (log.attachmentBackfillAttempts ?? 0) + 1;
+          await EmailLog.updateOne(
+            { _id: log._id },
+            {
+              attachmentBackfillAttempts: attempts,
+              ...(attempts >= BACKFILL_MAX_ATTEMPTS
+                ? { attachmentsCheckedAt: new Date() }
+                : {}),
+            },
+          );
+          console.error(
+            `Zoho backfill: attachments failed for "${msg.subject}" (attempt ${attempts}):`,
+            err?.response?.status ?? "",
+            err?.response?.data ?? err?.message ?? err,
+          );
+        }
       }
 
       // A short page means we've reached the end of the window.
@@ -290,7 +325,10 @@ async function backfillInternalAttachments(
     }
   }
 
-  integration.attachmentBackfilledAt = new Date();
+  console.log(
+    `Zoho backfill ${integration.emailAddress}: ${JSON.stringify(stats)} ${finished ? "— complete" : "— will continue next sync"}`,
+  );
+  if (finished) integration.attachmentBackfilledAt = new Date();
 }
 
 async function syncClientMessage(
@@ -437,53 +475,64 @@ async function syncInternalMessage(
   }
 }
 
+type SyncedAttachment = {
+  filename: string;
+  fileKey: string;
+  size: number;
+  mimeType: string;
+  contentId?: string;
+};
+
+/** Downloads a message's attachments into S3. THROWS on failure so callers can tell "none" from "couldn't fetch". */
+async function fetchAttachments(
+  accessToken: string,
+  accountId: string,
+  folderId: string,
+  msg: ZohoMessageSummary,
+): Promise<SyncedAttachment[]> {
+  if (!msg.hasAttachment) return [];
+  const metas = await listMessageAttachments(
+    accessToken,
+    accountId,
+    folderId,
+    msg.messageId,
+  );
+  const results: SyncedAttachment[] = [];
+  for (const meta of metas.slice(0, MAX_SYNCED_ATTACHMENTS)) {
+    // Skip oversized files rather than risk the serverless function timing out.
+    if (meta.attachmentSize > MAX_SYNCED_ATTACHMENT_BYTES) continue;
+    const buffer = await downloadAttachment(
+      accessToken,
+      accountId,
+      folderId,
+      msg.messageId,
+      meta.attachmentId,
+    );
+    const fileKey = await uploadBufferToS3(
+      buffer,
+      meta.attachmentName,
+      meta.contentType,
+    );
+    results.push({
+      filename: meta.attachmentName,
+      fileKey,
+      size: meta.attachmentSize,
+      mimeType: meta.contentType,
+      contentId: meta.contentId,
+    });
+  }
+  return results;
+}
+
+/** Best-effort wrapper used by the normal sync: a failure just means no attachments this time. */
 async function syncAttachments(
   accessToken: string,
   accountId: string,
   folderId: string,
   msg: ZohoMessageSummary,
-): Promise<
-  {
-    filename: string;
-    fileKey: string;
-    size: number;
-    mimeType: string;
-    contentId?: string;
-  }[]
-> {
-  if (!msg.hasAttachment) return [];
+): Promise<SyncedAttachment[]> {
   try {
-    const metas = await listMessageAttachments(
-      accessToken,
-      accountId,
-      folderId,
-      msg.messageId,
-    );
-    const results = [];
-    for (const meta of metas.slice(0, MAX_SYNCED_ATTACHMENTS)) {
-      // Skip oversized files rather than risk the serverless function timing out.
-      if (meta.attachmentSize > MAX_SYNCED_ATTACHMENT_BYTES) continue;
-      const buffer = await downloadAttachment(
-        accessToken,
-        accountId,
-        folderId,
-        msg.messageId,
-        meta.attachmentId,
-      );
-      const fileKey = await uploadBufferToS3(
-        buffer,
-        meta.attachmentName,
-        meta.contentType,
-      );
-      results.push({
-        filename: meta.attachmentName,
-        fileKey,
-        size: meta.attachmentSize,
-        mimeType: meta.contentType,
-        contentId: meta.contentId,
-      });
-    }
-    return results;
+    return await fetchAttachments(accessToken, accountId, folderId, msg);
   } catch (err) {
     console.error(
       `Zoho sync: failed to sync attachments for message ${msg.messageId}:`,

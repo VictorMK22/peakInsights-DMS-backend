@@ -71,6 +71,9 @@ export interface IEmailLog extends Document {
   // Set when the attachment backfill has looked at this synced email (whether
   // or not it found anything), so one that keeps failing can't starve the rest.
   attachmentsCheckedAt?: Date;
+  // Failed download attempts by the backfill; after a few it gives up on
+  // this email instead of retrying forever.
+  attachmentBackfillAttempts?: number;
 
   // Announcement ("send to everyone") support. A broadcast is stored as one
   // EmailLog per recipient (so every person has their own inbox copy, read
@@ -207,6 +210,7 @@ const EmailLogSchema = new Schema<IEmailLog>(
     },
 
     attachmentsCheckedAt: { type: Date },
+    attachmentBackfillAttempts: { type: Number },
 
     broadcastId: { type: Schema.Types.ObjectId },
     broadcastLead: { type: Boolean },
