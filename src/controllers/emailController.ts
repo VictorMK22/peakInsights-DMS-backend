@@ -24,10 +24,7 @@ import { canSendTo } from "./messageController";
 import { User } from "../models/User";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { EmailLog } from "../models/EmailLog";
-import {
-  getDefaultFromAddress,
-  sendDirectUserEmail,
-} from "../services/emailService";
+import { sendDirectUserEmail } from "../services/emailService";
 import { syncMyMailbox } from "../services/emailSyncService";
 
 // Roles allowed to email EVERYONE — every role by default, so anyone can
@@ -115,7 +112,10 @@ const parseIdList = (v: unknown): string[] => {
 
 /** One announcement = one row: hide every broadcast copy except the lead. */
 const notBroadcastDuplicate = {
-  $or: [{ broadcastId: { $exists: false } }, { broadcastLead: true }],
+  $or: [
+    { broadcastId: { $exists: false } },
+    { broadcastLead: true },
+  ],
 };
 
 /** Shapes an email for the API. Thread views get signed URLs + resolved inline images. */
@@ -127,16 +127,14 @@ const serializeEmail = (e: any, full = false) => {
     body: full ? resolveCidImages(obj.body, obj.attachments) : obj.body,
     attachments: full
       ? attachments
-      : attachments.map(
-          ({ _id, filename, mimeType, size, isImage, inline }) => ({
-            _id,
-            filename,
-            mimeType,
-            size,
-            isImage,
-            inline,
-          }),
-        ),
+      : attachments.map(({ _id, filename, mimeType, size, isImage, inline }) => ({
+          _id,
+          filename,
+          mimeType,
+          size,
+          isImage,
+          inline,
+        })),
   };
 };
 
@@ -613,7 +611,7 @@ export const retryEmail = async (
       try {
         const result = await sendDirectUserEmail({
           toEmail:
-            (email.senderId as any)?.email || getDefaultFromAddress(),
+            (email.senderId as any)?.email || process.env.SMTP_USER || "",
           bccEmails: failedCopies.map((c) => c.toEmail),
           fromName: (email.senderId as any)?.name ?? "PeakInsights",
           fromEmail: (email.senderId as any)?.email,
@@ -808,7 +806,14 @@ export const syncEmailsNow = async (
     return res.json({
       success: true,
       data: { connected: true, ...result },
-      message: `Synced — ${result.messagesSynced} new email(s)`,
+      message:
+        `Synced — ${result.messagesSynced} new email(s)` +
+        (result.attachmentsRestored
+          ? `, attachments restored on ${result.attachmentsRestored} older email(s)`
+          : "") +
+        (result.backfillPending
+          ? ". Older emails are still being checked — press refresh again"
+          : ""),
     });
   } catch (err) {
     next(err);
@@ -858,9 +863,8 @@ export const getBroadcastAudience = async (
 // =====================================================
 // Announcements per user per hour. Keeps one person from flooding everyone —
 // and from getting the shared SMTP account flagged. 0 disables the limit.
-const BROADCAST_MAX_PER_HOUR = Number(
-  process.env.EMAIL_BROADCAST_MAX_PER_HOUR ?? 10,
-);
+const BROADCAST_MAX_PER_HOUR =
+  Number(process.env.EMAIL_BROADCAST_MAX_PER_HOUR ?? 10);
 
 export const sendBroadcast = async (
   req: AuthRequest,
@@ -951,7 +955,10 @@ export const sendBroadcast = async (
 // Step 1 of 2: the browser asks for upload slots, PUTs the files straight to
 // S3, then sends the email with the returned references (`uploads`).
 // =====================================================
-export const getAttachmentLimits = (_req: AuthRequest, res: Response) => {
+export const getAttachmentLimits = (
+  _req: AuthRequest,
+  res: Response,
+) => {
   res.json({
     success: true,
     data: {

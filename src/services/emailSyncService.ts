@@ -90,9 +90,19 @@ function htmlToPreview(html: string, max = 200): string {
     .slice(0, max);
 }
 
+export interface SyncResult {
+  messagesFound: number;
+  messagesSynced: number;
+  /** Older emails that just got their attachments filled in by the backfill. */
+  attachmentsRestored?: number;
+  /** True while the backfill still has older emails left to check (sync again to continue). */
+  backfillPending?: boolean;
+}
+
 async function syncOneMailbox(
   integration: IEmailIntegration,
-): Promise<{ messagesFound: number; messagesSynced: number }> {
+  opts: { backfillUntil?: number } = {},
+): Promise<SyncResult> {
   const accessToken = await ensureFreshToken(integration);
   const accountId = integration.providerAccountId;
 
@@ -194,14 +204,19 @@ async function syncOneMailbox(
 
   // One-time, automatic catch-up for internal emails synced before
   // attachments were supported. Best-effort: never fails the sync.
+  let attachmentsRestored = 0;
+  let backfillPending = false;
   try {
-    await backfillInternalAttachments(
+    const bf = await backfillInternalAttachments(
       integration,
       accessToken,
       accountId,
       targets,
       staffByEmail,
+      opts.backfillUntil,
     );
+    attachmentsRestored = bf.restored;
+    backfillPending = bf.pending;
   } catch (err) {
     console.error(
       `Zoho sync: attachment backfill failed for ${integration.emailAddress}:`,
@@ -214,7 +229,12 @@ async function syncOneMailbox(
   integration.lastError = undefined;
   await integration.save();
 
-  return { messagesFound, messagesSynced };
+  return {
+    messagesFound,
+    messagesSynced,
+    attachmentsRestored,
+    backfillPending,
+  };
 }
 
 // ── Attachment backfill ───────────────────────────────────────────
@@ -238,11 +258,18 @@ async function backfillInternalAttachments(
   accountId: string,
   targets: { folderId: string; direction: "inbound" | "outbound" }[],
   staffByEmail: Map<string, unknown>,
-): Promise<void> {
-  if ((integration.attachmentBackfillVersion ?? 0) >= BACKFILL_VERSION) return;
+  hardDeadline?: number, // when many mailboxes sync in one run, the run-wide cutoff
+): Promise<{ restored: number; pending: boolean }> {
+  if ((integration.attachmentBackfillVersion ?? 0) >= BACKFILL_VERSION)
+    return { restored: 0, pending: false };
 
   const since = Date.now() - BACKFILL_WINDOW_MS;
-  const deadline = Date.now() + BACKFILL_TIME_BUDGET_MS;
+  const deadline = Math.min(
+    Date.now() + BACKFILL_TIME_BUDGET_MS,
+    hardDeadline ?? Infinity,
+  );
+  // No time left in this run (other mailboxes used it) — try next sync.
+  if (Date.now() >= deadline) return { restored: 0, pending: true };
   const stats = { scanned: 0, withFiles: 0, matched: 0, filled: 0, empty: 0, failed: 0 };
   let finished = true;
 
@@ -333,6 +360,7 @@ async function backfillInternalAttachments(
     `Zoho backfill ${integration.emailAddress}: ${JSON.stringify(stats)} ${finished ? "— complete" : "— will continue next sync"}`,
   );
   if (finished) integration.attachmentBackfillVersion = BACKFILL_VERSION;
+  return { restored: stats.filled, pending: !finished };
 }
 
 async function syncClientMessage(
@@ -561,9 +589,14 @@ export async function syncAllConnectedMailboxes(): Promise<{
   let messagesFound = 0;
   let messagesSynced = 0;
 
+  // The cron endpoint has a 60s serverless limit shared by ALL mailboxes.
+  // Backfill is only allowed in the first 30s of the run so it can never
+  // starve the normal "new mail" sync of mailboxes that come later.
+  const backfillUntil = Date.now() + 30_000;
+
   for (const integration of integrations) {
     try {
-      const result = await syncOneMailbox(integration);
+      const result = await syncOneMailbox(integration, { backfillUntil });
       messagesFound += result.messagesFound;
       messagesSynced += result.messagesSynced;
     } catch (err: any) {
@@ -596,7 +629,7 @@ export async function syncAllConnectedMailboxes(): Promise<{
  */
 export async function syncMyMailbox(
   userId: string,
-): Promise<{ messagesFound: number; messagesSynced: number } | null> {
+): Promise<SyncResult | null> {
   const integration = await EmailIntegrationModel.findOne({
     userId,
     status: { $ne: "disconnected" },
