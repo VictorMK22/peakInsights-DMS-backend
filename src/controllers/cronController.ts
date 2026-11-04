@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { waitUntil } from "@vercel/functions";
 import { DocumentModel } from "../models/Document";
 import { processDocumentDirectly } from "../services/documentProcessor";
 import { syncAllConnectedMailboxes } from "../services/emailSyncService";
@@ -16,8 +17,27 @@ import {
 // guide for exact setup.
 // ═════════════════════════════════════════════════════════════════
 
-/** POST /api/cron/sync-emails — call every ~5 minutes. */
-export const runEmailSync = async (_req: Request, res: Response) => {
+/**
+ * POST /api/cron/sync-emails — call every ~5 minutes.
+ *
+ * Schedulers like cron-job.org give up after 30s, but a full sync can take
+ * 45s+. Add ?async=1 to the URL and the endpoint replies 202 straight away
+ * while the sync keeps running in the background (Vercel's waitUntil keeps
+ * the function alive until it finishes, up to the function's time limit).
+ * Without ?async=1 it behaves as before and returns the full result.
+ */
+export const runEmailSync = async (req: Request, res: Response) => {
+  if (req.query.async === "1") {
+    const job = syncAllConnectedMailboxes()
+      .then((summary) =>
+        console.log("Cron email sync (async) completed:", JSON.stringify(summary)),
+      )
+      .catch((err) => console.error("Cron email sync (async) failed:", err));
+    waitUntil(job);
+    res.status(202).json({ success: true, message: "Email sync started" });
+    return;
+  }
+
   try {
     const summary = await syncAllConnectedMailboxes();
     res.json({
