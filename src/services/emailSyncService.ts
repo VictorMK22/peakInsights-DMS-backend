@@ -10,7 +10,7 @@ import { ClientModel } from "../models/Client";
 import { ClientEmailModel } from "../models/ClientEmail";
 import { User } from "../models/User";
 import { EmailLog } from "../models/EmailLog";
-import { uploadBufferToS3 } from "./s3Storage";
+import { uploadBufferToS3, isS3Configured } from "./s3Storage";
 import {
   refreshZohoAccessToken,
   listFolders,
@@ -245,7 +245,7 @@ async function syncOneMailbox(
 // has covered everything, then records the version it completed and stops.
 // Bump BACKFILL_VERSION to make every mailbox and email be re-examined once
 // (e.g. after fixing a bug in this logic) — older runs don't count.
-const BACKFILL_VERSION = 2;
+const BACKFILL_VERSION = 3; // 3: re-run after S3-credential failures marked emails as given-up
 const BACKFILL_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
 const BACKFILL_MAX_FILLED_PER_RUN = 25;
 const BACKFILL_TIME_BUDGET_MS = 25_000; // leave headroom under the serverless limit
@@ -262,6 +262,15 @@ async function backfillInternalAttachments(
 ): Promise<{ restored: number; pending: boolean }> {
   if ((integration.attachmentBackfillVersion ?? 0) >= BACKFILL_VERSION)
     return { restored: 0, pending: false };
+
+  // Without S3 every download would fail and burn the retry attempts, so
+  // wait (and say why) instead of giving up on the emails.
+  if (!isS3Configured()) {
+    console.warn(
+      "Zoho backfill skipped: S3 is not configured (need AWS_REGION, S3_ACCESS_KEY, AWS_SECRET_KEY, S3_BUCKET in this deployment's environment variables)",
+    );
+    return { restored: 0, pending: true };
+  }
 
   const since = Date.now() - BACKFILL_WINDOW_MS;
   const deadline = Math.min(
