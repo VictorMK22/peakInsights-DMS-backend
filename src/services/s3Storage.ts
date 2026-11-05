@@ -20,19 +20,18 @@ import path from "path";
 // file written to disk in one invocation may not exist by the time
 // the next request needs it.
 //
-// Required env vars: AWS_REGION, S3_ACCESS_KEY, AWS_SECRET_KEY, S3_BUCKET
+// Required env vars: AWS_REGION, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET
 // NOTE: the key is named S3_ACCESS_KEY, not AWS_ACCESS_KEY — Vercel
 // reserves any env var name starting with AWS_ACCESS_KEY (its own
 // infrastructure runs on AWS), so that name is rejected outright when
-// added in the Vercel dashboard. AWS_REGION and AWS_SECRET_KEY were
-// not on that reserved list and can keep their names.
+// added in the Vercel dashboard. AWS_REGION is not on that reserved list.
 // ═════════════════════════════════════════════════════════════════
 
 export const s3 = new S3Client({
   region: process.env.AWS_REGION!,
   credentials: {
     accessKeyId: process.env.S3_ACCESS_KEY!,
-    secretAccessKey: process.env.AWS_SECRET_KEY!,
+    secretAccessKey: process.env.S3_SECRET_KEY!,
   },
 });
 
@@ -42,7 +41,7 @@ export const isS3Configured = () =>
   Boolean(
     process.env.AWS_REGION &&
     process.env.S3_ACCESS_KEY &&
-    process.env.AWS_SECRET_KEY &&
+    process.env.S3_SECRET_KEY &&
     process.env.S3_BUCKET,
   );
 

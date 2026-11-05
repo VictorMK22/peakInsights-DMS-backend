@@ -267,7 +267,7 @@ async function backfillInternalAttachments(
   // wait (and say why) instead of giving up on the emails.
   if (!isS3Configured()) {
     console.warn(
-      "Zoho backfill skipped: S3 is not configured (need AWS_REGION, S3_ACCESS_KEY, AWS_SECRET_KEY, S3_BUCKET in this deployment's environment variables)",
+      "Zoho backfill skipped: S3 is not configured (need AWS_REGION, S3_ACCESS_KEY, S3_SECRET_KEY, S3_BUCKET in this deployment's environment variables)",
     );
     return { restored: 0, pending: true };
   }
