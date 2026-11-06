@@ -43,6 +43,9 @@ const CLIENT_SECRET =
   process.env.ZOHO_CALENDAR_CLIENT_SECRET || process.env.ZOHO_CLIENT_SECRET;
 const REDIRECT_URI = process.env.ZOHO_CALENDAR_REDIRECT_URI;
 
+const FORCE_ACCOUNT_PICKER =
+  process.env.ZOHO_CALENDAR_FORCE_ACCOUNT_PICKER === "true";
+
 const HTTP_TIMEOUT_MS = 8000;
 // Reads sit on the request path of the conflict checker, so they get a
 // tighter budget and fail open (treated as "no extra busy time").
@@ -69,7 +72,10 @@ export function buildZohoCalendarAuthUrl(state: string): string {
     redirect_uri: REDIRECT_URI || "",
     scope: SCOPES,
     access_type: "offline", // required to receive a refresh token
-    prompt: "consent", // required every time to actually get one back
+    // "consent" is required every time to actually get a refresh token.
+    // Zoho only documents consent/none, so select_account (force the account
+    // picker) is EXPERIMENTAL and opt-in: set ZOHO_CALENDAR_FORCE_ACCOUNT_PICKER=true.
+    prompt: FORCE_ACCOUNT_PICKER ? "consent select_account" : "consent",
     state,
   });
   return `https://${ACCOUNTS_DOMAIN}/oauth/v2/auth?${params.toString()}`;
