@@ -119,6 +119,15 @@ export const logout = async (
       expiresAt,
     });
 
+    // Drop off the "online" list straight away instead of lingering until
+    // the presence window expires.
+    if (req.user?.userId) {
+      await User.updateOne(
+        { _id: req.user.userId },
+        { $unset: { lastSeenAt: "" } },
+      ).catch(() => {});
+    }
+
     res.json({
       success: true,
       message: "Logged out successfully. Token has been revoked.",

@@ -4,7 +4,6 @@ import app from "../app";
 import { startTestDb, stopTestDb } from "./helpers/db";
 import { createUserWithToken } from "./helpers/fixtures";
 import { ClientModel } from "../models/Client";
-import { ClientInvoiceModel } from "../models/ClientInvoice";
 import { ClientNoteModel } from "../models/ClientNote";
 import { TaskModel } from "../models/Task";
 import { MeetingModel } from "../models/Meeting";
@@ -19,7 +18,6 @@ afterAll(async () => {
 
 afterEach(async () => {
   await ClientModel.deleteMany({});
-  await ClientInvoiceModel.deleteMany({});
   await ClientNoteModel.deleteMany({});
   await TaskModel.deleteMany({});
   await MeetingModel.deleteMany({});
@@ -50,9 +48,6 @@ describe("GET /api/analytics/accountant-workspace", () => {
     expect(res.body.success).toBe(true);
     expect(res.body.data).toEqual({
       clientCount: 0,
-      invoiceSummary: [],
-      overdueInvoices: [],
-      dueSoonInvoices: [],
       taskDeadlines: { overdue: [], dueSoon: [] },
       upcomingMeetings: [],
       recentActivity: [],
@@ -74,21 +69,15 @@ describe("GET /api/analytics/accountant-workspace", () => {
       assignedTo: [otherAccountant._id],
     });
 
-    await ClientInvoiceModel.create({
+    await ClientNoteModel.create({
       clientId: myClient._id,
       authorId: accountant._id,
-      amount: 500,
-      currency: "USD",
-      status: "unpaid",
-      dueDate: daysFromNow(-3),
+      body: "Note on my client",
     });
-    await ClientInvoiceModel.create({
+    await ClientNoteModel.create({
       clientId: otherClient._id,
       authorId: otherAccountant._id,
-      amount: 9999,
-      currency: "USD",
-      status: "unpaid",
-      dueDate: daysFromNow(-3),
+      body: "Note on someone else's client",
     });
 
     const res = await request(app)
@@ -97,103 +86,8 @@ describe("GET /api/analytics/accountant-workspace", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.data.clientCount).toBe(1);
-    expect(res.body.data.overdueInvoices).toHaveLength(1);
-    expect(res.body.data.overdueInvoices[0].amount).toBe(500);
-    expect(res.body.data.overdueInvoices[0].clientId.name).toBe("My Client");
-  });
-
-  it("buckets invoices correctly across overdue / due-soon / paid-this-month / cancelled", async () => {
-    const { user: accountant, token } = await createUserWithToken("accountant");
-    const client = await ClientModel.create({
-      name: "Acme Corp",
-      createdBy: accountant._id,
-      assignedTo: [accountant._id],
-    });
-
-    // Overdue (unpaid, past due date)
-    await ClientInvoiceModel.create({
-      clientId: client._id,
-      authorId: accountant._id,
-      invoiceNumber: "INV-001",
-      amount: 1000,
-      currency: "USD",
-      status: "unpaid",
-      dueDate: daysFromNow(-5),
-    });
-    // Overdue (explicitly marked "overdue" status)
-    await ClientInvoiceModel.create({
-      clientId: client._id,
-      authorId: accountant._id,
-      invoiceNumber: "INV-002",
-      amount: 250,
-      currency: "USD",
-      status: "overdue",
-      dueDate: daysFromNow(-1),
-    });
-    // Due soon (within the next 7 days)
-    await ClientInvoiceModel.create({
-      clientId: client._id,
-      authorId: accountant._id,
-      invoiceNumber: "INV-003",
-      amount: 400,
-      currency: "USD",
-      status: "unpaid",
-      dueDate: daysFromNow(3),
-    });
-    // Unpaid with no due date — must NOT be counted as overdue
-    // (guards against Mongo's null-comparison ordering quirk).
-    await ClientInvoiceModel.create({
-      clientId: client._id,
-      authorId: accountant._id,
-      invoiceNumber: "INV-004",
-      amount: 75,
-      currency: "USD",
-      status: "unpaid",
-    });
-    // Paid this month
-    await ClientInvoiceModel.create({
-      clientId: client._id,
-      authorId: accountant._id,
-      invoiceNumber: "INV-005",
-      amount: 600,
-      currency: "USD",
-      status: "paid",
-      paidAt: new Date(),
-    });
-    // Cancelled — should not count toward outstanding or overdue
-    await ClientInvoiceModel.create({
-      clientId: client._id,
-      authorId: accountant._id,
-      invoiceNumber: "INV-006",
-      amount: 300,
-      currency: "USD",
-      status: "cancelled",
-      dueDate: daysFromNow(-10),
-    });
-
-    const res = await request(app)
-      .get("/api/analytics/accountant-workspace")
-      .set("Authorization", `Bearer ${token}`);
-
-    expect(res.status).toBe(200);
-    const usd = res.body.data.invoiceSummary.find((s: any) => s._id === "USD");
-    expect(usd).toBeDefined();
-    // outstanding = unpaid + overdue statuses = 1000 + 250 + 400 + 75
-    expect(usd.outstandingAmount).toBe(1725);
-    expect(usd.outstandingCount).toBe(4);
-    // overdue = unpaid/overdue AND dueDate in the past AND dueDate set = 1000 + 250
-    expect(usd.overdueAmount).toBe(1250);
-    expect(usd.overdueCount).toBe(2);
-    expect(usd.paidThisMonthAmount).toBe(600);
-    expect(usd.paidThisMonthCount).toBe(1);
-
-    expect(res.body.data.overdueInvoices).toHaveLength(2);
-    expect(
-      res.body.data.overdueInvoices.map((i: any) => i.invoiceNumber),
-    ).toEqual(["INV-001", "INV-002"]); // sorted by dueDate ascending
-
-    expect(res.body.data.dueSoonInvoices).toHaveLength(1);
-    expect(res.body.data.dueSoonInvoices[0].invoiceNumber).toBe("INV-003");
+    expect(res.body.data.recentActivity).toHaveLength(1);
+    expect(res.body.data.recentActivity[0].client.name).toBe("My Client");
   });
 
   it("separates the accountant's own overdue and upcoming task deadlines", async () => {
@@ -304,7 +198,7 @@ describe("GET /api/analytics/accountant-workspace", () => {
     );
   });
 
-  it("combines recent notes and invoice updates into one activity feed, newest first", async () => {
+  it("lists recent client notes in the activity feed, newest first", async () => {
     const { user: accountant, token } = await createUserWithToken("accountant");
     const client = await ClientModel.create({
       name: "Acme Corp",
@@ -317,13 +211,10 @@ describe("GET /api/analytics/accountant-workspace", () => {
       authorId: accountant._id,
       body: "Called client about outstanding balance",
     });
-    await ClientInvoiceModel.create({
+    await ClientNoteModel.create({
       clientId: client._id,
       authorId: accountant._id,
-      invoiceNumber: "INV-100",
-      amount: 200,
-      currency: "USD",
-      status: "unpaid",
+      body: "Sent the filing checklist",
     });
 
     const res = await request(app)
@@ -332,7 +223,7 @@ describe("GET /api/analytics/accountant-workspace", () => {
 
     expect(res.status).toBe(200);
     const types = res.body.data.recentActivity.map((a: any) => a.type);
-    expect(types).toEqual(expect.arrayContaining(["note", "invoice"]));
+    expect(types).toEqual(["note", "note"]);
     expect(res.body.data.recentActivity[0].client.name).toBe("Acme Corp");
   });
 });

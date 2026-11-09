@@ -28,10 +28,6 @@ import {
   getClientCalls,
   createClientCall,
   deleteClientCall,
-  getClientInvoices,
-  createClientInvoice,
-  updateClientInvoice,
-  deleteClientInvoice,
   getClientTasks,
 } from "../controllers/clientChannelsController";
 import {
@@ -101,13 +97,6 @@ router.get("/:id/meetings/activity", getClientMeetingActivityFeed);
 router.get("/:id/calls", getClientCalls);
 router.post("/:id/calls", createClientCall);
 router.delete("/:id/calls/:callId", deleteClientCall);
-
-// Invoices — lightweight reference record, not full accounting
-// (uploadToLocal.any() accepts a single optional file, e.g. an invoice PDF)
-router.get("/:id/invoices", getClientInvoices);
-router.post("/:id/invoices", uploadToLocal.any(), createClientInvoice);
-router.put("/:id/invoices/:invoiceId", updateClientInvoice);
-router.delete("/:id/invoices/:invoiceId", deleteClientInvoice);
 
 // Tasks — read-only proxy into the existing Task system, filtered to this
 // client. Create/update tasks via the normal /tasks endpoints (pass

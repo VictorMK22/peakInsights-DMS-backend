@@ -26,6 +26,8 @@ import departmentRoutes from "./routes/departments";
 import trashRoutes from "./routes/trash";
 import learningCategoryRoutes from "./routes/learningCategories";
 import meetingRoutes from "./routes/meetings";
+import notificationRoutes from "./routes/notifications";
+import presenceRoutes from "./routes/presence";
 import calendarBlockRoutes from "./routes/calendarBlocks";
 
 // ── ICT workspace routes ────────────────────────────────────────
@@ -159,6 +161,8 @@ app.use("/api/departments", departmentRoutes);
 app.use("/api/trash", trashRoutes);
 app.use("/api/learning-categories", learningCategoryRoutes);
 app.use("/api/meetings", meetingRoutes);
+app.use("/api/notifications", notificationRoutes);
+app.use("/api/presence", presenceRoutes);
 app.use("/api/calendar-blocks", calendarBlockRoutes);
 app.use("/api/projects", projectRoutes);
 app.use("/api/tickets", ticketRoutes);
@@ -187,7 +191,7 @@ app.get("/", (_req, res) => {
 
 // ── Health check ──────────────────────────────────────────────────
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", service: "PeakInsights DMS API", version: "1.0.0" });
+  res.json({ status: "ok", service: "PeakInsights Hub API", version: "1.0.0" });
 });
 
 // ── Error handling ────────────────────────────────────────────────

@@ -11,7 +11,6 @@ import { SupervisorMapping } from "../models/SupervisorMapping";
 import { sendDirectUserEmail } from "../services/emailService";
 import { getLocalFileUrl } from "../middleware/upload";
 import mongoose from "mongoose";
-import { parseOpeningBalance } from "../utils/openingBalance";
 
 // ── helpers ───────────────────────────────────────────────────────
 
@@ -69,11 +68,6 @@ export const createClient = async (req: AuthRequest, res: Response) => {
         .status(400)
         .json({ success: false, message: "Client name is required" });
 
-    // Every client must start with an explicit opening balance (0 is fine).
-    const balance = parseOpeningBalance(req.body.openingBalance);
-    if (!balance.ok)
-      return res.status(400).json({ success: false, message: balance.message });
-
     const salesPersonCreating = isSalesPerson(req);
     const client = await ClientModel.create({
       name: name.trim(),
@@ -83,8 +77,6 @@ export const createClient = async (req: AuthRequest, res: Response) => {
       industry,
       address,
       notes,
-      openingBalance: balance.value,
-      openingBalanceDate: new Date(),
       createdBy: req.user!.userId,
       assignedTo: salesPersonCreating ? [req.user!.userId] : [],
       assignedAt: salesPersonCreating ? new Date() : undefined,
@@ -205,19 +197,6 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
   try {
     const { name, email, phone, company, industry, address, notes } = req.body;
 
-    // The opening balance is a financial figure: only CEO/tech may change
-    // it after creation. For anyone else it is ignored, so the shared edit
-    // form can keep sending it without erroring.
-    const balanceUpdate: Record<string, unknown> = {};
-    if (isCEO(req) && req.body.openingBalance !== undefined) {
-      const balance = parseOpeningBalance(req.body.openingBalance);
-      if (!balance.ok)
-        return res
-          .status(400)
-          .json({ success: false, message: balance.message });
-      balanceUpdate.openingBalance = balance.value;
-    }
-
     const client = await ClientModel.findByIdAndUpdate(
       req.params.id,
       {
@@ -229,7 +208,6 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
           industry,
           address,
           notes,
-          ...balanceUpdate,
         },
       },
       { new: true, runValidators: true },

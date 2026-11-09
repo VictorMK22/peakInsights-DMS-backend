@@ -7,6 +7,7 @@ import { SupervisorMapping } from "../models/SupervisorMapping";
 import { createNotification } from "../services/notificationService";
 import { sendNewMessageEmail } from "../services/emailService";
 import { getIO } from "../socket/socketServer";
+import { waitUntil } from "@vercel/functions";
 
 export const canSendTo = async (
   senderId: string,
@@ -43,6 +44,214 @@ export const canSendTo = async (
   return { allowed: false, message: "You can only message your supervisor" };
 };
 
+// Roles allowed to message EVERYONE. Mirrors the email setting: every role by
+// default; restrict with MESSAGE_BROADCAST_ROLES (falls back to
+// EMAIL_BROADCAST_ROLES), e.g. "ceo,tech,supervisor".
+const BROADCAST_ROLES = (
+  process.env.MESSAGE_BROADCAST_ROLES ??
+  process.env.EMAIL_BROADCAST_ROLES ??
+  "ceo,tech,supervisor,sales_person,accountant"
+)
+  .split(",")
+  .map((r) => r.trim())
+  .filter(Boolean);
+const GROUP_MAX_RECIPIENTS = Number(
+  process.env.MESSAGE_GROUP_MAX_RECIPIENTS ?? 50,
+);
+const BROADCAST_MAX_PER_HOUR = Number(
+  process.env.MESSAGE_BROADCAST_MAX_PER_HOUR ?? 10,
+);
+
+// Sender-side list filter: hide the extra per-recipient copies of a group
+// send (keep the lead), but still surface any copy somebody replied to.
+const hideBroadcastCopies = {
+  $or: [
+    { broadcastId: { $exists: false } },
+    { broadcastLead: true },
+    { hasReplies: true },
+  ],
+};
+// "Sent" shows only what I sent — one entry per group send.
+const sentOnlyOnce = {
+  $or: [{ broadcastId: { $exists: false } }, { broadcastLead: true }],
+};
+
+const parseIds = (raw: unknown): string[] => {
+  if (!Array.isArray(raw)) return [];
+  return [
+    ...new Set(
+      raw
+        .map((v) => String(v).trim())
+        .filter((v) => mongoose.Types.ObjectId.isValid(v)),
+    ),
+  ];
+};
+
+/** Group send: audience "selected" (recipientIds) or "everyone". */
+const sendGroupMessage = async (
+  req: AuthRequest,
+  res: Response,
+  audience: "selected" | "everyone",
+) => {
+  const senderId = req.user!.userId;
+  const senderRole = req.user!.role;
+  const { subject, body } = req.body;
+
+  let recipients: { _id: any; name: string; email?: string }[] = [];
+
+  if (audience === "everyone") {
+    if (!BROADCAST_ROLES.includes(senderRole)) {
+      return res
+        .status(403)
+        .json({ success: false, message: "You are not allowed to message all users" });
+    }
+    recipients = await User.find({ _id: { $ne: senderId }, isActive: true })
+      .select("name email")
+      .lean();
+  } else {
+    const ids = parseIds(req.body.recipientIds).filter((id) => id !== senderId);
+    if (ids.length < 2)
+      return res
+        .status(400)
+        .json({ success: false, message: "Select at least two people" });
+    if (GROUP_MAX_RECIPIENTS > 0 && ids.length > GROUP_MAX_RECIPIENTS)
+      return res.status(400).json({
+        success: false,
+        message: `You can message at most ${GROUP_MAX_RECIPIENTS} people at once`,
+      });
+    const users = await User.find({ _id: { $in: ids }, isActive: true })
+      .select("name email")
+      .lean();
+    if (users.length !== ids.length)
+      return res.status(400).json({
+        success: false,
+        message: "Some selected people were not found or are inactive",
+      });
+    const checks = await Promise.all(
+      users.map(async (u) => ({
+        name: u.name,
+        ...(await canSendTo(senderId, senderRole, String(u._id))),
+      })),
+    );
+    const denied = checks.filter((c) => !c.allowed).map((c) => c.name);
+    if (denied.length)
+      return res
+        .status(403)
+        .json({ success: false, message: `You can't message: ${denied.join(", ")}` });
+    recipients = users;
+  }
+
+  if (recipients.length === 0)
+    return res
+      .status(400)
+      .json({ success: false, message: "There is nobody to send this to" });
+
+  if (BROADCAST_MAX_PER_HOUR > 0) {
+    const recent = await MessageModel.countDocuments({
+      senderId,
+      broadcastLead: true,
+      createdAt: { $gte: new Date(Date.now() - 60 * 60 * 1000) },
+    });
+    if (recent >= BROADCAST_MAX_PER_HOUR)
+      return res.status(429).json({
+        success: false,
+        message: `You can send at most ${BROADCAST_MAX_PER_HOUR} group messages per hour`,
+      });
+  }
+
+  const now = new Date();
+  const broadcastId = new mongoose.Types.ObjectId();
+  const docs = await MessageModel.insertMany(
+    recipients.map((r, i) => ({
+      senderId,
+      receiverId: r._id,
+      subject,
+      body,
+      parentId: null,
+      isRead: false,
+      lastMessageAt: now,
+      broadcastId,
+      broadcastLead: i === 0,
+      broadcastRecipientCount: recipients.length,
+      broadcastAudience: audience,
+    })),
+  );
+
+  const sender = await User.findById(senderId).select("name email");
+  const senderName = sender?.name ?? "Someone";
+
+  // Notify everyone in the background so a big audience can't slow the
+  // response; waitUntil keeps it alive on Vercel after we reply.
+  const notifyAll = (async () => {
+    for (const [i, r] of recipients.entries()) {
+      try {
+        await createNotification(
+          String(r._id),
+          `New message from ${senderName}: ${subject ?? body.slice(0, 60)}`,
+          "new_message",
+          { senderName, messageSubject: subject, messageBody: body },
+        );
+        try {
+          getIO().to(`user:${r._id}`).emit("new-message", {
+            _id: docs[i]._id,
+            senderId: { _id: senderId, name: senderName, role: senderRole },
+            subject,
+            body,
+            isRead: false,
+            createdAt: now,
+            parentId: null,
+          });
+        } catch {}
+        if (r.email) {
+          await sendNewMessageEmail(
+            r.email,
+            r.name,
+            senderName,
+            subject,
+            body,
+            sender?.email,
+          );
+        }
+      } catch (err) {
+        console.error("❌ group message notify failed for", String(r._id), err);
+      }
+    }
+  })();
+  try {
+    waitUntil(notifyAll);
+  } catch {
+    notifyAll.catch(() => {});
+  }
+
+  const lead = await MessageModel.findById(docs[0]._id)
+    .select(
+      "senderId receiverId subject body isRead createdAt parentId broadcastId broadcastRecipientCount broadcastAudience",
+    )
+    .populate("senderId", "name role profilePicture")
+    .populate("receiverId", "name role");
+
+  return res.status(201).json({
+    success: true,
+    data: { message: lead, total: recipients.length },
+    message:
+      audience === "everyone"
+        ? `Message sent to ${recipients.length} people`
+        : `Message sent to ${recipients.length} people`,
+  });
+};
+
+export const getBroadcastAudience = async (req: AuthRequest, res: Response) => {
+  try {
+    const allowed = BROADCAST_ROLES.includes(req.user!.role);
+    const recipientCount = allowed
+      ? await User.countDocuments({ _id: { $ne: req.user!.userId }, isActive: true })
+      : 0;
+    res.json({ success: true, data: { allowed, recipientCount } });
+  } catch {
+    res.status(500).json({ success: false });
+  }
+};
+
 export const sendMessage = async (
   req: AuthRequest,
   res: Response,
@@ -63,6 +272,12 @@ export const sendMessage = async (
       return res
         .status(400)
         .json({ success: false, message: "body is required" });
+    }
+
+    // New top-level message to a group. Replies are always one-to-one.
+    const audience = req.body.audience;
+    if (!parentId && (audience === "selected" || audience === "everyone")) {
+      return await sendGroupMessage(req, res, audience);
     }
 
     if (parentId) {
@@ -117,7 +332,10 @@ export const sendMessage = async (
     // conversation resurfaces to the top of the inbox/sent list instead
     // of staying stuck wherever the original message's date put it.
     if (parentId) {
-      await MessageModel.findByIdAndUpdate(parentId, { lastMessageAt: now });
+      await MessageModel.findByIdAndUpdate(parentId, {
+        lastMessageAt: now,
+        hasReplies: true,
+      });
     }
 
     // Only select the fields the frontend actually needs
@@ -189,14 +407,16 @@ export const getInbox = async (req: AuthRequest, res: Response) => {
     const rootFilter = {
       $or: [
         { receiverId: userId, parentId: null }, // received top-level
-        { senderId: userId, parentId: null }, // sent top-level (so replies to them show)
+        // sent top-level (so replies to them show) — minus the duplicate
+        // per-recipient copies of group sends
+        { senderId: userId, parentId: null, ...hideBroadcastCopies },
       ],
     };
 
     const [messages, total] = await Promise.all([
       MessageModel.find(rootFilter)
         .select(
-          "senderId receiverId subject body isRead createdAt lastMessageAt",
+          "senderId receiverId subject body isRead createdAt lastMessageAt broadcastId broadcastRecipientCount broadcastAudience",
         )
         .populate("senderId", "name role profilePicture")
         .populate("receiverId", "name role")
@@ -248,9 +468,13 @@ export const getSent = async (req: AuthRequest, res: Response) => {
     const skip = (page - 1) * limit;
 
     const [messages, total] = await Promise.all([
-      MessageModel.find({ senderId: req.user!.userId, parentId: null })
+      MessageModel.find({
+        senderId: req.user!.userId,
+        parentId: null,
+        ...sentOnlyOnce,
+      })
         .select(
-          "senderId receiverId subject body isRead createdAt lastMessageAt",
+          "senderId receiverId subject body isRead createdAt lastMessageAt broadcastId broadcastRecipientCount broadcastAudience",
         )
         .populate("senderId", "name role profilePicture")
         .populate("receiverId", "name role")
@@ -261,6 +485,7 @@ export const getSent = async (req: AuthRequest, res: Response) => {
       MessageModel.countDocuments({
         senderId: req.user!.userId,
         parentId: null,
+        ...sentOnlyOnce,
       }),
     ]);
 

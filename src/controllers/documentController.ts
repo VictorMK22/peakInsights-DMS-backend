@@ -58,7 +58,11 @@ import {
   getSignedFileUrl,
 } from "../services/s3Storage";
 import path from "path";
-import { resolveFolderType, cloneDocumentRecord } from "./folderController";
+import {
+  resolveFolderType,
+  cloneDocumentRecord,
+  canAccessFolder,
+} from "./folderController";
 
 // ─────────────────────────────────────────────────────────────────
 // Internal helpers
@@ -475,6 +479,39 @@ export const createDocument = async (
       documentType = rawDocumentType === "storage" ? "storage" : "working";
     }
 
+    // Optional: upload straight into an existing folder. Anything in
+    // webkitRelativePaths (a dropped/selected folder) is rebuilt UNDER it.
+    let basePath = "";
+    let baseFolderId: any = null;
+    let folderOwnerId: string = req.user!.userId;
+    const targetFolderId = (req.body.targetFolderId ||
+      req.query.targetFolderId) as string | undefined;
+    if (targetFolderId) {
+      if (!mongoose.Types.ObjectId.isValid(targetFolderId)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid target folder" });
+      }
+      const target = await FolderModel.findById(targetFolderId);
+      if (!target || target.isDeleted) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Target folder not found" });
+      }
+      if (!(await canAccessFolder(target, req.user!.userId, uploaderRole))) {
+        return res.status(403).json({
+          success: false,
+          message: "You don't have access to that folder",
+        });
+      }
+      // A folder never mixes content from two tabs, so files take the
+      // folder's type rather than the role default above.
+      documentType = await resolveFolderType(target);
+      basePath = target.path;
+      baseFolderId = target._id;
+      folderOwnerId = target.ownerId.toString();
+    }
+
     let relativePaths: string[] = [];
     const rawPaths =
       (req.query.webkitRelativePaths as string | undefined) ??
@@ -521,18 +558,19 @@ export const createDocument = async (
         // two files may both try to create the same parent folder at the same time.
         // findOneAndUpdate with upsert:true is atomic — whichever wins creates the
         // folder; the loser gets back the existing one instead of a duplicate key error.
-        let parentFolderId = null;
-        let currentPath = "";
+        let parentFolderId = baseFolderId;
+        let currentPath = basePath;
         for (const segment of parts) {
           currentPath += `/${segment}`;
           const folder = (await FolderModel.findOneAndUpdate(
-            { path: currentPath, ownerId: req.user!.userId },
+            { path: currentPath, ownerId: folderOwnerId },
             {
               $setOnInsert: {
                 name: segment,
                 path: currentPath,
                 parentFolderId,
-                ownerId: req.user!.userId,
+                ownerId: folderOwnerId,
+                documentType,
               },
             },
             { upsert: true, new: true, setDefaultsOnInsert: true },

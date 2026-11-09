@@ -81,6 +81,8 @@ export interface IEmailLog extends Document {
   // is shown in the sender's Sent list, so one announcement = one row.
   broadcastId?: mongoose.Types.ObjectId;
   broadcastLead?: boolean;
+  // "everyone" = company-wide announcement; "selected" = hand-picked group.
+  broadcastAudience?: "everyone" | "selected";
   broadcastRecipientCount?: number;
   // Set once someone replies — lets a broadcaster's inbox surface the
   // recipient copies that actually received a reply.
@@ -214,6 +216,7 @@ const EmailLogSchema = new Schema<IEmailLog>(
 
     broadcastId: { type: Schema.Types.ObjectId },
     broadcastLead: { type: Boolean },
+    broadcastAudience: { type: String, enum: ["everyone", "selected"] },
     broadcastRecipientCount: { type: Number },
     hasReplies: { type: Boolean },
   },

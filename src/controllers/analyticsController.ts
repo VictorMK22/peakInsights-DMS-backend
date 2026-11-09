@@ -10,7 +10,6 @@ import { EmailLog } from "../models/EmailLog";
 import { MeetingModel } from "../models/Meeting";
 import { getRecentMeetingActivity } from "../services/meetingActivityService";
 import { ClientModel } from "../models/Client";
-import { ClientInvoiceModel } from "../models/ClientInvoice";
 import { ClientNoteModel } from "../models/ClientNote";
 
 // ─── Design note ─────────────────────────────────────────────────
@@ -714,12 +713,11 @@ export const getEmailAnalytics = async (
 
 // ─────────────────────────────────────────────────────────────────
 // ACCOUNTANT WORKSPACE SUMMARY — a book-of-clients rollup purpose-
-// built for accountants' daily workflow: receivables that need
-// chasing, task/filing deadlines, today's client meetings, and a
-// combined recent-activity feed across every client they serve.
-// This intentionally does NOT replace PeakBooks — it's a lightweight
-// reference view over the CRM-side invoice/task/meeting records that
-// already live on the Client model, scoped to this accountant's book.
+// built for accountants' daily workflow: task/filing deadlines,
+// upcoming client meetings, and a recent-activity feed across every
+// client they serve. This intentionally does NOT replace PeakBooks —
+// it's a lightweight reference view over the CRM-side task/meeting/
+// note records, scoped to this accountant's book.
 // ─────────────────────────────────────────────────────────────────
 export const getAccountantWorkspace = async (
   req: AuthRequest,
@@ -730,7 +728,6 @@ export const getAccountantWorkspace = async (
     const uid = new mongoose.Types.ObjectId(req.user!.userId);
     const now = new Date();
     const weekAhead = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
     const clients = await ClientModel.find({ assignedTo: uid })
       .select("name company email")
@@ -742,9 +739,6 @@ export const getAccountantWorkspace = async (
         success: true,
         data: {
           clientCount: 0,
-          invoiceSummary: [],
-          overdueInvoices: [],
-          dueSoonInvoices: [],
           taskDeadlines: { overdue: [], dueSoon: [] },
           upcomingMeetings: [],
           recentActivity: [],
@@ -753,71 +747,12 @@ export const getAccountantWorkspace = async (
       return;
     }
 
-    const overdueCond = {
-      $and: [
-        { $in: ["$status", ["unpaid", "overdue"]] },
-        { $ne: ["$dueDate", null] },
-        { $lt: ["$dueDate", now] },
-      ],
-    };
-    const outstandingCond = { $in: ["$status", ["unpaid", "overdue"]] };
-    const paidThisMonthCond = {
-      $and: [
-        { $eq: ["$status", "paid"] },
-        { $ne: ["$paidAt", null] },
-        { $gte: ["$paidAt", startOfMonth] },
-      ],
-    };
-
     const [
-      invoiceSummary,
-      overdueInvoices,
-      dueSoonInvoices,
       overdueTasks,
       dueSoonTasks,
       upcomingMeetings,
       recentNotes,
-      recentInvoiceActivity,
     ] = await Promise.all([
-      ClientInvoiceModel.aggregate([
-        { $match: { clientId: { $in: clientIds } } },
-        {
-          $group: {
-            _id: "$currency",
-            outstandingAmount: {
-              $sum: { $cond: [outstandingCond, "$amount", 0] },
-            },
-            outstandingCount: { $sum: { $cond: [outstandingCond, 1, 0] } },
-            overdueAmount: { $sum: { $cond: [overdueCond, "$amount", 0] } },
-            overdueCount: { $sum: { $cond: [overdueCond, 1, 0] } },
-            paidThisMonthAmount: {
-              $sum: { $cond: [paidThisMonthCond, "$amount", 0] },
-            },
-            paidThisMonthCount: {
-              $sum: { $cond: [paidThisMonthCond, 1, 0] },
-            },
-          },
-        },
-        { $sort: { _id: 1 } },
-      ]),
-      ClientInvoiceModel.find({
-        clientId: { $in: clientIds },
-        status: { $in: ["unpaid", "overdue"] },
-        dueDate: { $ne: null, $lt: now },
-      })
-        .populate("clientId", "name company")
-        .sort({ dueDate: 1 })
-        .limit(8)
-        .lean(),
-      ClientInvoiceModel.find({
-        clientId: { $in: clientIds },
-        status: { $in: ["unpaid", "overdue"] },
-        dueDate: { $ne: null, $gte: now, $lte: weekAhead },
-      })
-        .populate("clientId", "name company")
-        .sort({ dueDate: 1 })
-        .limit(8)
-        .lean(),
       TaskModel.find({
         assignedTo: uid,
         status: { $nin: ["completed", "cancelled"] },
@@ -851,11 +786,6 @@ export const getAccountantWorkspace = async (
         .sort({ createdAt: -1 })
         .limit(5)
         .lean(),
-      ClientInvoiceModel.find({ clientId: { $in: clientIds } })
-        .populate("clientId", "name company")
-        .sort({ updatedAt: -1 })
-        .limit(5)
-        .lean(),
     ]);
 
     const recentActivity = [
@@ -866,12 +796,6 @@ export const getAccountantWorkspace = async (
         summary: n.body,
         by: n.authorId?.name,
       })),
-      ...recentInvoiceActivity.map((inv: any) => ({
-        type: "invoice" as const,
-        at: inv.updatedAt,
-        client: inv.clientId,
-        summary: `${inv.invoiceNumber ? `#${inv.invoiceNumber} — ` : ""}${inv.status} · ${inv.currency} ${inv.amount}`,
-      })),
     ]
       .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
       .slice(0, 8);
@@ -880,9 +804,6 @@ export const getAccountantWorkspace = async (
       success: true,
       data: {
         clientCount: clients.length,
-        invoiceSummary,
-        overdueInvoices,
-        dueSoonInvoices,
         taskDeadlines: { overdue: overdueTasks, dueSoon: dueSoonTasks },
         upcomingMeetings,
         recentActivity,

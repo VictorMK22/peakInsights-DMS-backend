@@ -8,12 +8,14 @@ import {
   markRead,
   getUnreadCount,
   getContacts,
+  getBroadcastAudience,
 } from '../controllers/messageController';
 
 const router = Router();
 router.use(authenticate);
 
 router.get('/contacts',      getContacts);
+router.get('/broadcast/audience', getBroadcastAudience);
 router.get('/unread-count',  getUnreadCount);
 router.get('/inbox',         getInbox);
 router.get('/sent',          getSent);

@@ -53,7 +53,7 @@ const isSameOrDescendantPath = (path: string, base: string): boolean =>
   path === base || path.startsWith(`${base}/`);
 
 /** Owner, the owner's supervisor, or CEO. Same rule used for documents. */
-const canAccessFolder = async (
+export const canAccessFolder = async (
   folder: { ownerId: mongoose.Types.ObjectId | string },
   userId: string,
   role: string,
@@ -122,6 +122,11 @@ export const createFolder = async (req: AuthRequest, res: Response) => {
     }
 
     let parentPath = "";
+    // Subfolders live in the same namespace as their parent: when you add one
+    // inside a folder you may access but don't own (e.g. a supervisor in a
+    // team member's folder), it belongs to the parent's owner so its path
+    // stays unique and consistent.
+    let folderOwnerId: string = req.user!.userId;
     // A folder's type is a structural property of its location, not a
     // free choice per-folder — a subfolder always belongs to the same
     // tab as its parent (you can't put a "Stored" folder inside a
@@ -131,12 +136,22 @@ export const createFolder = async (req: AuthRequest, res: Response) => {
 
     if (parentFolderId) {
       const parent = await FolderModel.findById(parentFolderId);
-      if (!parent) {
+      if (!parent || parent.isDeleted) {
         res
           .status(404)
           .json({ success: false, message: "Parent folder not found" });
         return;
       }
+      // Without this, anyone who knew a folder id could create folders
+      // inside someone else's folder.
+      if (!(await canAccessFolder(parent, req.user!.userId, req.user!.role))) {
+        res.status(403).json({
+          success: false,
+          message: "You don't have access to that folder",
+        });
+        return;
+      }
+      folderOwnerId = parent.ownerId.toString();
       parentPath = parent.path;
       resolvedType = await resolveFolderType(parent);
     } else {
@@ -150,7 +165,7 @@ export const createFolder = async (req: AuthRequest, res: Response) => {
     const folder = await FolderModel.create({
       name: name.trim(),
       parentFolderId: parentFolderId ?? null,
-      ownerId: req.user!.userId,
+      ownerId: folderOwnerId,
       path,
       documentType: resolvedType,
     });

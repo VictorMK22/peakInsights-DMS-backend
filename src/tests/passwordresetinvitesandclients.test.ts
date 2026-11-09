@@ -228,72 +228,50 @@ describe("account creation is CEO-only", () => {
   });
 });
 
-describe("client opening balance", () => {
+describe("clients no longer carry an opening balance", () => {
   const post = (token: string, body: object) =>
     request(app)
       .post("/api/clients")
       .set("Authorization", `Bearer ${token}`)
       .send({ name: "Acme", ...body });
 
-  it("requires an explicit, numeric opening balance", async () => {
+  it("creates a client without any opening balance", async () => {
     const { token } = await createUserWithToken("ceo");
-    expect((await post(token, {})).status).toBe(400);
-    expect((await post(token, { openingBalance: "" })).status).toBe(400);
-    expect((await post(token, { openingBalance: "abc" })).status).toBe(400);
-  });
-
-  it("stores the balance (KES only — any currency sent is ignored) and as-at date", async () => {
-    const { token } = await createUserWithToken("ceo");
-    const res = await post(token, {
-      openingBalance: "1500.50",
-      openingBalanceCurrency: "USD",
-    });
+    const res = await post(token, {});
     expect(res.status).toBe(201);
-    const c = res.body.data.client;
-    expect(c.openingBalance).toBe(1500.5);
-    expect(c.openingBalanceCurrency).toBeUndefined();
-    expect(c.openingBalanceDate).toBeDefined();
+    expect(res.body.data.client.openingBalance).toBeUndefined();
+    expect(res.body.data.client.openingBalanceDate).toBeUndefined();
   });
 
-  it("accepts an explicit zero", async () => {
+  it("ignores an opening balance sent by an older client app", async () => {
     const { token } = await createUserWithToken("ceo");
-    const res = await post(token, { openingBalance: 0 });
+    const res = await post(token, { openingBalance: "1500.50" });
     expect(res.status).toBe(201);
-    expect(res.body.data.client.openingBalance).toBe(0);
+    const stored = await ClientModel.findById(res.body.data.client._id).lean();
+    expect((stored as any).openingBalance).toBeUndefined();
   });
 
-  it("applies to sales-person leads too; only CEO/tech can change it later", async () => {
-    const { token: salesToken } = await createUserWithToken("sales_person");
-    const { token: ceoToken } = await createUserWithToken("ceo");
-    expect((await post(salesToken, {})).status).toBe(400);
-
-    const created = await post(salesToken, { openingBalance: 100 });
-    expect(created.status).toBe(201);
+  it("does not let a client update write an opening balance", async () => {
+    const { token } = await createUserWithToken("ceo");
+    const created = await post(token, {});
     const id = created.body.data.client._id;
-
-    await request(app)
+    const res = await request(app)
       .put(`/api/clients/${id}`)
-      .set("Authorization", `Bearer ${salesToken}`)
-      .send({ name: "Acme 2", openingBalance: 999 });
-    expect((await ClientModel.findById(id))?.openingBalance).toBe(100);
-
-    const byCeo = await request(app)
-      .put(`/api/clients/${id}`)
-      .set("Authorization", `Bearer ${ceoToken}`)
-      .send({ openingBalance: 250 });
-    expect(byCeo.status).toBe(200);
-    expect((await ClientModel.findById(id))?.openingBalance).toBe(250);
-
-    const bad = await request(app)
-      .put(`/api/clients/${id}`)
-      .set("Authorization", `Bearer ${ceoToken}`)
-      .send({ openingBalance: "nope" });
-    expect(bad.status).toBe(400);
+      .set("Authorization", `Bearer ${token}`)
+      .send({ name: "Acme 2", openingBalance: 250 });
+    expect(res.status).toBe(200);
+    const stored = await ClientModel.findById(id).lean();
+    expect(stored?.name).toBe("Acme 2");
+    expect((stored as any).openingBalance).toBeUndefined();
   });
 
-  it("defaults to 0 for clients created outside the API", async () => {
-    const { user } = await createUserWithToken("ceo");
-    const c = await ClientModel.create({ name: "Legacy", createdBy: user._id });
-    expect(c.openingBalance).toBe(0);
+  it("no longer exposes an invoices endpoint for clients", async () => {
+    const { token } = await createUserWithToken("ceo");
+    const created = await post(token, {});
+    const id = created.body.data.client._id;
+    const res = await request(app)
+      .get(`/api/clients/${id}/invoices`)
+      .set("Authorization", `Bearer ${token}`);
+    expect(res.status).toBe(404);
   });
 });

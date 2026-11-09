@@ -11,6 +11,7 @@ import {
   syncEmailsNow,
   getBroadcastAudience,
   sendBroadcast,
+  sendToSelected,
   getAttachmentLimits,
   presignAttachmentUploads,
   getEmailContacts,
@@ -26,6 +27,7 @@ router.get("/attachments/limits", getAttachmentLimits);
 router.post("/attachments/presign", presignAttachmentUploads);
 router.get("/broadcast/audience", getBroadcastAudience);
 router.post("/broadcast", emailUpload, sendBroadcast);
+router.post("/group", emailUpload, sendToSelected);
 router.get("/sent", getSentEmails);
 router.get("/inbox", getInboxEmails);
 router.post("/sync-now", syncEmailsNow);

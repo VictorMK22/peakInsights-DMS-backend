@@ -158,10 +158,12 @@ export async function sendBroadcastEmail({
   ipAddress,
   userAgent,
   supervisorId,
+  audience = "everyone",
 }: {
   senderId: string;
   senderName?: string;
   senderEmail?: string;
+  audience?: "everyone" | "selected";
   recipients: BroadcastRecipient[];
   subject: string;
   body: string;
@@ -190,6 +192,7 @@ export async function sendBroadcastEmail({
       attachments: attachments?.length ? attachments : undefined,
       broadcastId,
       broadcastLead: i === 0,
+      broadcastAudience: audience,
       broadcastRecipientCount: recipients.length,
     })),
   );
@@ -213,7 +216,9 @@ export async function sendBroadcastEmail({
         subject,
         body,
         attachments: mailAttachments,
-        broadcast: true,
+        // Only company-wide sends read as an "Announcement"; a hand-picked
+        // group gets a normal email that shows who it is from.
+        broadcast: audience === "everyone",
       });
       await EmailLog.updateMany(
         { broadcastId, receiverId: { $in: ids } },
@@ -235,7 +240,13 @@ export async function sendBroadcastEmail({
     actorId: senderId,
     action: "email_broadcast_sent",
     supervisorIdAtTime: supervisorId,
-    details: { subject, recipientCount: recipients.length, sent, failed },
+    details: {
+      subject,
+      audience,
+      recipientCount: recipients.length,
+      sent,
+      failed,
+    },
     ipAddress,
     userAgent,
   });

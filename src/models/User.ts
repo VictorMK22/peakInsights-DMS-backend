@@ -13,6 +13,9 @@ export interface IUser extends Document {
   phone?: string;
   profilePicture?: string;
   isActive: boolean;
+  // Last time the app pinged the server while open (see /api/presence).
+  // "Online" = seen within the last couple of minutes.
+  lastSeenAt?: Date;
   mfaEnabled: boolean;
   supervisorId?: mongoose.Types.ObjectId;
   accountStatus: "pending" | "active" | "rejected" | "disabled";
@@ -62,6 +65,7 @@ const UserSchema = new Schema<IUser>(
       type: String,
     },
     isActive: { type: Boolean, default: false }, // false until CEO approves
+    lastSeenAt: { type: Date, index: true },
     // Surfaced on the ICT Security Center as real MFA coverage. There is
     // no MFA *enforcement* wired up yet (no second factor is actually
     // checked at login) — this flag is a record of enrollment status,

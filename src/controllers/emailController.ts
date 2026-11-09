@@ -951,6 +951,156 @@ export const sendBroadcast = async (
 };
 
 // =====================================================
+// 👥 SEND TO SELECTED PEOPLE
+// One email to a hand-picked group (2+ people). Same delivery model as
+// "everyone" — each person gets their own inbox copy and can reply
+// privately — but every recipient is checked with the same canEmail rule
+// as a one-to-one email, so nobody can be reached through this that
+// couldn't be emailed directly.
+// =====================================================
+const GROUP_MAX_RECIPIENTS =
+  Number(process.env.EMAIL_GROUP_MAX_RECIPIENTS ?? 50);
+
+/** recipientIds arrives as a JSON array, a repeated field, or CSV (multipart). */
+const parseRecipientIds = (raw: unknown): string[] => {
+  let list: unknown = raw;
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    if (s.startsWith("[")) {
+      try {
+        list = JSON.parse(s);
+      } catch {
+        list = [];
+      }
+    } else {
+      list = s.split(",");
+    }
+  }
+  if (!Array.isArray(list)) return [];
+  const ids = list
+    .map((v) => String(v).trim())
+    .filter((v) => mongoose.Types.ObjectId.isValid(v));
+  return [...new Set(ids)];
+};
+
+export const sendToSelected = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  try {
+    const senderId = req.user!.userId;
+    const uploadRefs = parseUploadRefs(req.body?.uploads);
+    const bail = async (status: number, message: string) => {
+      await discardDirectUploads(senderId, uploadRefs);
+      return res.status(status).json({ success: false, message });
+    };
+
+    const { subject, body } = req.body;
+    if (!subject?.trim() || !body?.trim()) {
+      return bail(400, "Subject and message are required");
+    }
+
+    const recipientIds = parseRecipientIds(
+      req.body?.recipientIds ?? req.body?.["recipientIds[]"],
+    ).filter((id) => id !== senderId);
+    if (recipientIds.length < 2) {
+      return bail(400, "Select at least two people");
+    }
+    if (GROUP_MAX_RECIPIENTS > 0 && recipientIds.length > GROUP_MAX_RECIPIENTS) {
+      return bail(
+        400,
+        `You can email at most ${GROUP_MAX_RECIPIENTS} people at once`,
+      );
+    }
+
+    // Shares the announcement hourly cap so groups can't be used to flood.
+    if (BROADCAST_MAX_PER_HOUR > 0) {
+      const recent = await EmailLog.countDocuments({
+        senderId,
+        broadcastLead: true,
+        createdAt: { $gte: new Date(Date.now() - 60 * 60 * 1000) },
+      });
+      if (recent >= BROADCAST_MAX_PER_HOUR) {
+        return bail(
+          429,
+          `You can send at most ${BROADCAST_MAX_PER_HOUR} group emails per hour`,
+        );
+      }
+    }
+
+    const users = await User.find({
+      _id: { $in: recipientIds },
+      isActive: true,
+      email: { $exists: true, $ne: "" },
+    })
+      .select("name email")
+      .lean();
+    if (users.length !== recipientIds.length) {
+      return bail(
+        400,
+        "Some selected people were not found, are inactive, or have no email address",
+      );
+    }
+
+    // Every recipient must pass the one-to-one rule.
+    const checks = await Promise.all(
+      users.map(async (u) => ({
+        name: u.name,
+        ...(await canEmail(senderId, req.user!.role, String(u._id))),
+      })),
+    );
+    const denied = checks.filter((c) => !c.allowed).map((c) => c.name);
+    if (denied.length) {
+      return bail(403, `You can't email: ${denied.join(", ")}`);
+    }
+
+    const sender = await User.findById(senderId)
+      .select("name email supervisorId")
+      .lean();
+    const { attachments, mailAttachments } = await collectAttachments(req);
+
+    const result = await sendBroadcastEmail({
+      senderId,
+      senderName: sender?.name,
+      senderEmail: sender?.email,
+      audience: "selected",
+      recipients: users.map((u) => ({
+        _id: String(u._id),
+        email: u.email as string,
+      })),
+      subject: subject.trim(),
+      body: body.trim(),
+      attachments,
+      mailAttachments,
+      ipAddress: req.ip,
+      userAgent: req.headers["user-agent"],
+      supervisorId: sender?.supervisorId,
+    });
+
+    const allFailed = result.sent === 0;
+    return res.json({
+      success: true,
+      data: {
+        status: allFailed ? "failed" : result.failed ? "partial" : "sent",
+        total: result.total,
+        sent: result.sent,
+        failed: result.failed,
+        error: result.firstError,
+      },
+      message: allFailed
+        ? `Saved, but delivery failed: ${result.firstError}. Use Retry in Sent.`
+        : result.failed
+          ? `Sent to ${result.sent} of ${result.total} people — ${result.failed} failed. Use Retry in Sent.`
+          : `Email sent to ${result.total} people`,
+    });
+  } catch (err) {
+    next(err);
+    return;
+  }
+};
+
+// =====================================================
 // 📎 DIRECT-TO-S3 ATTACHMENT UPLOADS
 // Step 1 of 2: the browser asks for upload slots, PUTs the files straight to
 // S3, then sends the email with the returned references (`uploads`).
