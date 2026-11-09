@@ -22,21 +22,12 @@ import {
 } from "../services/emailAttachmentService";
 import { canSendTo } from "./messageController";
 import { User } from "../models/User";
-import { SupervisorMapping } from "../models/SupervisorMapping";
 import { EmailLog } from "../models/EmailLog";
 import { sendDirectUserEmail } from "../services/emailService";
 import { syncMyMailbox } from "../services/emailSyncService";
 
-// Roles allowed to email EVERYONE — every role by default, so anyone can
-// share general information with the whole company. To restrict it, set
-// EMAIL_BROADCAST_ROLES (comma-separated), e.g. "ceo,tech,supervisor".
-const BROADCAST_ROLES = (
-  process.env.EMAIL_BROADCAST_ROLES ??
-  "ceo,tech,supervisor,sales_person,accountant"
-)
-  .split(",")
-  .map((r) => r.trim())
-  .filter(Boolean);
+// Anyone can send to everyone (the hourly cap below still applies).
+const canBroadcast = (_role: string) => true;
 
 const uploadedFiles = (req: AuthRequest) =>
   (req.files as Express.Multer.File[] | undefined) ?? [];
@@ -50,13 +41,7 @@ const canEmail = async (
   senderId: string,
   senderRole: string,
   receiverId: string,
-) => {
-  const base = await canSendTo(senderId, senderRole, receiverId);
-  if (base.allowed) return base;
-  const receiver = await User.findById(receiverId).select("role isActive");
-  if (receiver?.isActive && receiver.role === "ceo") return { allowed: true };
-  return base;
-};
+) => canSendTo(senderId, senderRole, receiverId);
 
 /**
  * Gathers everything attached to this request: files uploaded in-body
@@ -146,9 +131,7 @@ const serializeEmail = (e: any, full = false) => {
 // as the notification emails but the sender controls the
 // subject and body.
 //
-// RBAC: follows the same rules as sendMessage — a user
-// can only email their supervisor; a supervisor can email
-// their team + CEO; CEO can email anyone.
+// Anyone can email any other active user (same rule as sendMessage).
 // =====================================================
 
 export const sendEmailDirect = async (
@@ -841,7 +824,7 @@ export const getBroadcastAudience = async (
   next: NextFunction,
 ) => {
   try {
-    const allowed = BROADCAST_ROLES.includes(req.user!.role);
+    const allowed = canBroadcast(req.user!.role);
     const recipientCount = allowed
       ? await User.countDocuments({
           _id: { $ne: req.user!.userId },
@@ -878,7 +861,7 @@ export const sendBroadcast = async (
       await discardDirectUploads(senderId, uploadRefs);
       return res.status(status).json({ success: false, message });
     };
-    if (!BROADCAST_ROLES.includes(req.user!.role)) {
+    if (!canBroadcast(req.user!.role)) {
       return bail(403, "You are not allowed to email all users");
     }
 
@@ -1153,49 +1136,17 @@ export const getEmailContacts = async (
   next: NextFunction,
 ) => {
   try {
-    const userId = req.user!.userId;
-    const role = req.user!.role;
-    const fields = "_id name email role profilePicture department";
-    let contacts: any[] = [];
+    // Anyone can email anyone: every other active user with an email address.
+    const contacts = await User.find({
+      _id: { $ne: req.user!.userId },
+      isActive: true,
+      email: { $exists: true, $ne: "" },
+    })
+      .select("_id name email role profilePicture department")
+      .sort({ name: 1 })
+      .lean();
 
-    if (role === "ceo" || role === "tech") {
-      contacts = await User.find({ _id: { $ne: userId }, isActive: true })
-        .select(fields)
-        .lean();
-    } else if (role === "supervisor") {
-      const [mappings, admins] = await Promise.all([
-        SupervisorMapping.find({ supervisorId: userId, status: "active" })
-          .populate("subordinateId", fields)
-          .lean(),
-        User.find({ role: { $in: ["ceo", "tech"] }, isActive: true })
-          .select(fields)
-          .lean(),
-      ]);
-      contacts = [...admins, ...mappings.map((m: any) => m.subordinateId)];
-    } else {
-      const [mapping, ceos] = await Promise.all([
-        SupervisorMapping.findOne({ subordinateId: userId, status: "active" })
-          .populate("supervisorId", fields)
-          .lean(),
-        User.find({ role: "ceo", isActive: true }).select(fields).lean(),
-      ]);
-      contacts = [
-        ...(mapping?.supervisorId ? [mapping.supervisorId] : []),
-        ...ceos,
-      ];
-    }
-
-    // De-duplicate (a supervisor can also be the CEO's report, etc.) and drop self.
-    const seen = new Set<string>();
-    const unique = contacts.filter((c) => {
-      if (!c?._id) return false;
-      const id = String(c._id);
-      if (id === userId || seen.has(id)) return false;
-      seen.add(id);
-      return true;
-    });
-
-    res.json({ success: true, data: { contacts: unique } });
+    res.json({ success: true, data: { contacts } });
   } catch (err) {
     next(err);
   }

@@ -40,6 +40,14 @@ export interface IClient extends Document {
   isSalesLead: boolean;
   salesStage?: SalesStage;
   salesStageHistory: ISalesStageEntry[];
+  // When a lead is won it goes to the CEO, who allocates an accountant to
+  // serve the client. The accountant is also added to assignedTo (so every
+  // existing access rule just works); these fields record who/when and let
+  // the CEO re-allocate later.
+  wonAt?: Date;
+  allocatedAccountant?: mongoose.Types.ObjectId;
+  allocatedAt?: Date;
+  allocatedBy?: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -69,6 +77,10 @@ const ClientSchema = new Schema<IClient>(
     isSalesLead: { type: Boolean, default: false },
     salesStage: { type: String, enum: SALES_STAGES },
     salesStageHistory: { type: [SalesStageEntrySchema], default: [] },
+    wonAt: { type: Date },
+    allocatedAccountant: { type: Schema.Types.ObjectId, ref: "User" },
+    allocatedAt: { type: Date },
+    allocatedBy: { type: Schema.Types.ObjectId, ref: "User" },
   },
   { timestamps: true },
 );
@@ -76,6 +88,7 @@ const ClientSchema = new Schema<IClient>(
 ClientSchema.index({ createdBy: 1 });
 ClientSchema.index({ assignedTo: 1 });
 ClientSchema.index({ isSalesLead: 1, salesStage: 1 });
+ClientSchema.index({ salesStage: 1, allocatedAccountant: 1 });
 ClientSchema.index({ name: "text", company: "text", email: "text" });
 
 export const ClientModel = mongoose.model<IClient>("Client", ClientSchema);

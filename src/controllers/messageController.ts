@@ -3,7 +3,6 @@ import mongoose from "mongoose";
 import { AuthRequest } from "../types/auth";
 import { MessageModel } from "../models/Message";
 import { User } from "../models/User";
-import { SupervisorMapping } from "../models/SupervisorMapping";
 import { createNotification } from "../services/notificationService";
 import { sendNewMessageEmail } from "../services/emailService";
 import { getIO } from "../socket/socketServer";
@@ -11,50 +10,22 @@ import { waitUntil } from "@vercel/functions";
 
 export const canSendTo = async (
   senderId: string,
-  senderRole: string,
+  _senderRole: string,
   receiverId: string,
 ) => {
-  const receiver = await User.findById(receiverId).select("role isActive");
+  // Anyone can message anyone, regardless of role, department or reporting
+  // line. The only checks are that the recipient exists, is active, and is
+  // not the sender.
+  if (String(receiverId) === String(senderId))
+    return { allowed: false, message: "You can't message yourself" };
+  const receiver = await User.findById(receiverId).select("isActive");
   if (!receiver || !receiver.isActive)
     return { allowed: false, message: "Recipient not found or inactive" };
-  if (senderRole === "ceo" || senderRole === "tech") return { allowed: true };
-  if (senderRole === "supervisor") {
-    if (receiver.role === "ceo" || receiver.role === "tech")
-      return { allowed: true };
-    // Any staff role (sales_person, accountant, or a tech/accountant
-    // assigned under this supervisor) can be a subordinate — there's
-    // no single "normal user" role anymore, so the mapping itself
-    // (not the receiver's specific role) is what decides this.
-    const mapping = await SupervisorMapping.findOne({
-      supervisorId: senderId,
-      subordinateId: receiverId,
-      status: "active",
-    });
-    if (mapping) return { allowed: true };
-    return { allowed: false, message: "You can only message your team or CEO" };
-  }
-  // Every other staff role (sales_person, accountant — tech already
-  // bypassed above) can only message the supervisor they're mapped to.
-  const mapping = await SupervisorMapping.findOne({
-    subordinateId: senderId,
-    supervisorId: receiverId,
-    status: "active",
-  });
-  if (mapping) return { allowed: true };
-  return { allowed: false, message: "You can only message your supervisor" };
+  return { allowed: true };
 };
 
-// Roles allowed to message EVERYONE. Mirrors the email setting: every role by
-// default; restrict with MESSAGE_BROADCAST_ROLES (falls back to
-// EMAIL_BROADCAST_ROLES), e.g. "ceo,tech,supervisor".
-const BROADCAST_ROLES = (
-  process.env.MESSAGE_BROADCAST_ROLES ??
-  process.env.EMAIL_BROADCAST_ROLES ??
-  "ceo,tech,supervisor,sales_person,accountant"
-)
-  .split(",")
-  .map((r) => r.trim())
-  .filter(Boolean);
+// Anyone can message everyone (the hourly cap below still applies).
+const canBroadcast = (_role: string) => true;
 const GROUP_MAX_RECIPIENTS = Number(
   process.env.MESSAGE_GROUP_MAX_RECIPIENTS ?? 50,
 );
@@ -100,7 +71,7 @@ const sendGroupMessage = async (
   let recipients: { _id: any; name: string; email?: string }[] = [];
 
   if (audience === "everyone") {
-    if (!BROADCAST_ROLES.includes(senderRole)) {
+    if (!canBroadcast(senderRole)) {
       return res
         .status(403)
         .json({ success: false, message: "You are not allowed to message all users" });
@@ -242,7 +213,7 @@ const sendGroupMessage = async (
 
 export const getBroadcastAudience = async (req: AuthRequest, res: Response) => {
   try {
-    const allowed = BROADCAST_ROLES.includes(req.user!.role);
+    const allowed = canBroadcast(req.user!.role);
     const recipientCount = allowed
       ? await User.countDocuments({ _id: { $ne: req.user!.userId }, isActive: true })
       : 0;
@@ -599,41 +570,15 @@ export const getUnreadCount = async (req: AuthRequest, res: Response) => {
 
 export const getContacts = async (req: AuthRequest, res: Response) => {
   try {
-    const userId = req.user!.userId;
-    const role = req.user!.role;
-    let contacts: any[] = [];
-
-    if (role === "ceo" || role === "tech") {
-      contacts = await User.find({ _id: { $ne: userId }, isActive: true })
-        .select("_id name email role profilePicture department")
-        .lean();
-    }
-    if (role === "supervisor") {
-      const mappings = await SupervisorMapping.find({
-        supervisorId: userId,
-        status: "active",
-      }).populate(
-        "subordinateId",
-        "_id name email role profilePicture department",
-      );
-      const admins = await User.find({ role: { $in: ["ceo", "tech"] } })
-        .select("_id name email role profilePicture department")
-        .lean();
-      contacts = [...admins, ...mappings.map((m: any) => m.subordinateId)];
-    }
-    // Any non-admin, non-supervisor staff role (sales_person,
-    // accountant — tech is covered by the ceo/tech branch above)
-    // only has their own supervisor as a contact.
-    if (role === "sales_person" || role === "accountant") {
-      const mapping = await SupervisorMapping.findOne({
-        subordinateId: userId,
-        status: "active",
-      }).populate(
-        "supervisorId",
-        "_id name email role profilePicture department",
-      );
-      if (mapping?.supervisorId) contacts = [mapping.supervisorId];
-    }
+    // Everyone can message everyone, so the contact list is every other
+    // active user.
+    const contacts = await User.find({
+      _id: { $ne: req.user!.userId },
+      isActive: true,
+    })
+      .select("_id name email role profilePicture department")
+      .sort({ name: 1 })
+      .lean();
 
     res.json({ success: true, data: { contacts } });
   } catch (err) {

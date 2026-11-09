@@ -62,27 +62,17 @@ const isParticipant = (
 /**
  * Resolves the final, deduplicated set of attendee user IDs an
  * organizer is allowed to invite, expanding any department/org-wide
- * targeting requested (CEO/tech only) and enforcing the
- * supervisor-can-only-invite-their-team rule.
+ * targeting requested. Everything is open: anyone can invite any active
+ * user, a whole department, or the whole organization.
  */
 const resolveAttendeeIds = async (
-  role: string,
+  _role: string,
   actorId: string,
   requestedAttendeeIds: string[],
   targetDepartments: string[],
   organizationWide: boolean,
 ): Promise<{ ids: string[]; error?: string }> => {
   const ids = new Set<string>(requestedAttendeeIds.filter(Boolean));
-
-  const isElevated = role === "ceo" || role === "tech";
-
-  if ((targetDepartments.length > 0 || organizationWide) && !isElevated) {
-    return {
-      ids: [],
-      error:
-        "Only the CEO or an administrator can schedule department-wide or organization-wide meetings",
-    };
-  }
 
   if (organizationWide) {
     const everyone = await User.find({ isActive: true, _id: { $ne: actorId } })
@@ -98,22 +88,6 @@ const resolveAttendeeIds = async (
       .select("_id")
       .lean();
     members.forEach((u) => ids.add(String(u._id)));
-  }
-
-  if (role === "supervisor" && ids.size > 0) {
-    const mappings = await SupervisorMapping.find({
-      supervisorId: actorId,
-      status: "active",
-    }).select("subordinateId");
-    const teamIds = new Set(mappings.map((m) => String(m.subordinateId)));
-    const disallowed = [...ids].filter((id) => !teamIds.has(id));
-    if (disallowed.length > 0) {
-      return {
-        ids: [],
-        error:
-          "As a supervisor you can only invite members of your own team to meetings",
-      };
-    }
   }
 
   ids.delete(actorId); // organizer is implicit, not a listed attendee

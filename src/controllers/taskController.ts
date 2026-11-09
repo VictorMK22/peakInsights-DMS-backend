@@ -96,10 +96,13 @@ export const createTask = async (
     const role = req.user!.role;
     const actorId = req.user!.userId;
 
-    if (role === "accountant") {
-      res
-        .status(403)
-        .json({ success: false, message: "Accountants cannot assign tasks" });
+    // Only the CEO and team supervisors create and assign tasks. A
+    // supervisor can only assign to their own team members (checked below).
+    if (role !== "ceo" && role !== "supervisor") {
+      res.status(403).json({
+        success: false,
+        message: "Only the CEO or a team supervisor can create and assign tasks",
+      });
       return;
     }
 

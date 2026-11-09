@@ -26,6 +26,10 @@ export interface IDocument extends Document {
   folderId: mongoose.Types.ObjectId;
   departmentId?: string;
   supervisorId?: mongoose.Types.ObjectId;
+  // Set when the document was uploaded against a client. Anyone with access
+  // to that client (CEO, assigned sales person/accountant, their supervisor)
+  // can open it — see canAccess in documentController.
+  clientId?: mongoose.Types.ObjectId;
   targetCompletionTime?: Date;
   startTime?: Date;
   endTime?: Date;
@@ -101,6 +105,7 @@ const DocumentSchema = new Schema<IDocument>(
     folderId: { type: Schema.Types.ObjectId, ref: "Folder", index: true },
     departmentId: { type: String },
     supervisorId: { type: Schema.Types.ObjectId, ref: "User" },
+    clientId: { type: Schema.Types.ObjectId, ref: "Client", index: true },
 
     targetCompletionTime: { type: Date },
     startTime: { type: Date },

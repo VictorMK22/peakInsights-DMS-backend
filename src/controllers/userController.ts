@@ -1030,6 +1030,26 @@ export const getNotifications = async (req: AuthRequest, res: Response) => {
  * teammate" picker uses, since a regular 'user' has no other way to
  * discover who's on their team.
  */
+// GET /users/invitable — every active user, for "pick a person" lists that
+// every role needs (e.g. meeting invitations). Separate from getAllUsers
+// (admin list) and getDirectory (ICT-only). Minimal fields only.
+export const getInvitableUsers = async (
+  _req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    const users = await User.find({ isActive: true })
+      .select("_id name email role department")
+      .sort({ name: 1 })
+      .limit(1000)
+      .lean();
+    res.json({ success: true, data: { users } });
+  } catch (err) {
+    console.error("getInvitableUsers error:", err);
+    res.status(500).json({ success: false });
+  }
+};
+
 export const getMyTeammates = async (
   req: AuthRequest,
   res: Response,

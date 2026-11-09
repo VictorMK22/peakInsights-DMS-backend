@@ -8,6 +8,8 @@ import {
   updateClient,
   deleteClient,
   assignClient,
+  getAwaitingAllocation,
+  allocateAccountant,
   updateClientStage,
   getClientEmails,
   sendClientEmail,
@@ -43,6 +45,7 @@ router.use(authenticate);
 
 // Static routes BEFORE /:id
 router.get("/employees", getAssignableEmployees);
+router.get("/awaiting-allocation", getAwaitingAllocation);
 
 // Client CRUD — CEO can create/manage any client; sales persons (BD)
 // can create their own leads (see controller for the exact rule).
@@ -54,6 +57,7 @@ router.delete("/:id", deleteClient);
 
 // Assignment
 router.post("/:id/assign", assignClient);
+router.post("/:id/allocate-accountant", allocateAccountant);
 
 // Sales pipeline — In discussion / Proposal Sent / Awaiting Client
 // Decision / Agreement Sent / Won / Lost, with a note per change.

@@ -16,6 +16,7 @@ import {
   getUserProfile,
   getNotifications,
   getMyTeammates,
+  getInvitableUsers,
   getMyWorkspaces,
   getDirectory,
   createTech,
@@ -45,6 +46,9 @@ router.get("/notifications", getNotifications);
 // Teammates (peers under the same supervisor) — used by the task
 // collaboration "invite" picker. Any authenticated role can call this.
 router.get("/teammates", getMyTeammates);
+
+// Everyone-picker (meeting invitations). Any authenticated role.
+router.get("/invitable", getInvitableUsers);
 
 // Role-workspaces the caller may enter besides their home one (a
 // supervisor's team workspaces). Any authenticated role may call it.

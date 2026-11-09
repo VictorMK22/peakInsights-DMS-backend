@@ -10,6 +10,7 @@ import { User } from "../models/User";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { sendDirectUserEmail } from "../services/emailService";
 import { getLocalFileUrl } from "../middleware/upload";
+import { createNotification } from "../services/notificationService";
 import mongoose from "mongoose";
 
 // ── helpers ───────────────────────────────────────────────────────
@@ -142,6 +143,7 @@ export const getClients = async (req: AuthRequest, res: Response) => {
     const [clients, total] = await Promise.all([
       ClientModel.find(filter)
         .populate("assignedTo", "name email role profilePicture")
+        .populate("allocatedAccountant", "name email")
         .populate("createdBy", "name")
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -174,6 +176,7 @@ export const getClient = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ success: false, message: "Access denied" });
     const client = await ClientModel.findById(req.params.id)
       .populate("assignedTo", "name email role profilePicture department")
+      .populate("allocatedAccountant", "name email")
       .populate("createdBy", "name");
     if (!client) return res.status(404).json({ success: false });
     res.json({ success: true, data: { client } });
@@ -272,6 +275,128 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
+// WON CLIENTS → CEO ALLOCATES AN ACCOUNTANT
+// ═══════════════════════════════════════════════════════════════
+
+// GET /clients/awaiting-allocation — won leads that have no accountant yet.
+// CEO only. (A won client that already has an accountant among its
+// assignees — e.g. assigned by hand before this flow existed — is not
+// listed, so old data doesn't show up as pending.)
+export const getAwaitingAllocation = async (
+  req: AuthRequest,
+  res: Response,
+) => {
+  if (!isCEO(req))
+    return res
+      .status(403)
+      .json({ success: false, message: "Only the CEO can allocate accountants" });
+  try {
+    const clients = await ClientModel.find({
+      isSalesLead: true,
+      salesStage: "won",
+      allocatedAccountant: { $exists: false },
+    })
+      .populate("assignedTo", "name email role")
+      .populate("createdBy", "name")
+      .sort({ wonAt: -1, updatedAt: -1 })
+      .limit(100)
+      .lean();
+
+    const pending = clients.filter(
+      (c: any) =>
+        !(c.assignedTo ?? []).some((u: any) => u?.role === "accountant"),
+    );
+    res.json({ success: true, data: { clients: pending } });
+    return;
+  } catch (err) {
+    res.status(500).json({ success: false });
+    return;
+  }
+};
+
+// POST /clients/:id/allocate-accountant  { accountantId }
+// CEO only. Adds the accountant to the client's assignees (keeping the sales
+// person who won it) and records the allocation. Calling it again with a
+// different accountant re-allocates: the previous allocated accountant is
+// removed.
+export const allocateAccountant = async (req: AuthRequest, res: Response) => {
+  if (!isCEO(req))
+    return res
+      .status(403)
+      .json({ success: false, message: "Only the CEO can allocate accountants" });
+  try {
+    const { accountantId } = req.body as { accountantId?: string };
+    if (!accountantId || !mongoose.Types.ObjectId.isValid(accountantId))
+      return res
+        .status(400)
+        .json({ success: false, message: "accountantId is required" });
+
+    const [client, accountant] = await Promise.all([
+      ClientModel.findById(req.params.id),
+      User.findById(accountantId).select("name email role isActive"),
+    ]);
+    if (!client)
+      return res.status(404).json({ success: false, message: "Client not found" });
+    if (client.salesStage !== "won")
+      return res.status(400).json({
+        success: false,
+        message: "An accountant can only be allocated to a client that has been won",
+      });
+    if (!accountant || !accountant.isActive || accountant.role !== "accountant")
+      return res
+        .status(400)
+        .json({ success: false, message: "Choose an active accountant" });
+
+    const previous = client.allocatedAccountant?.toString();
+    const next = accountant._id.toString();
+    const assignees = client.assignedTo
+      .map((id) => id.toString())
+      .filter((id) => id !== previous);
+    if (!assignees.includes(next)) assignees.push(next);
+
+    client.assignedTo = assignees.map((id) => new mongoose.Types.ObjectId(id));
+    client.assignedAt = new Date();
+    client.allocatedAccountant = accountant._id as mongoose.Types.ObjectId;
+    client.allocatedAt = new Date();
+    client.allocatedBy = new mongoose.Types.ObjectId(req.user!.userId);
+    await client.save();
+
+    // Tell the accountant, and the sales person who won the client.
+    if (previous !== next) {
+      try {
+        await createNotification(
+          next,
+          `You have been allocated a new client: ${client.name}`,
+          "client_allocated",
+          { clientId: String(client._id) },
+        );
+        const salesId = client.createdBy?.toString();
+        if (salesId && salesId !== req.user!.userId && salesId !== next) {
+          await createNotification(
+            salesId,
+            `${client.name} has been allocated to ${accountant.name}`,
+            "client_allocated",
+            { clientId: String(client._id) },
+          );
+        }
+      } catch (err) {
+        console.error("❌ client_allocated notify failed:", err);
+      }
+    }
+
+    const populated = await client.populate([
+      { path: "assignedTo", select: "name email role profilePicture" },
+      { path: "allocatedAccountant", select: "name email" },
+    ]);
+    res.json({ success: true, data: { client: populated } });
+    return;
+  } catch (err) {
+    res.status(500).json({ success: false });
+    return;
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
 // SALES PIPELINE — PATCH /clients/:id/stage  { stage, note? }
 // Moves a client through: In discussion → Proposal Sent →
 // Awaiting Client Decision → Agreement Sent → Won / Lost.
@@ -295,8 +420,10 @@ export const updateClientStage = async (req: AuthRequest, res: Response) => {
     const client = await ClientModel.findById(req.params.id);
     if (!client) return res.status(404).json({ success: false });
 
+    const justWon = stage === "won" && client.salesStage !== "won";
     client.isSalesLead = true;
     client.salesStage = stage;
+    if (justWon) client.wonAt = new Date();
     client.salesStageHistory.push({
       stage,
       note: note?.trim() || undefined,
@@ -305,8 +432,34 @@ export const updateClientStage = async (req: AuthRequest, res: Response) => {
     });
 
     await client.save();
+
+    // A won lead moves to the CEO, who allocates an accountant to serve it.
+    if (justWon && !client.allocatedAccountant) {
+      try {
+        const [ceos, actor] = await Promise.all([
+          User.find({ role: "ceo", isActive: true }).select("_id").lean(),
+          User.findById(req.user!.userId).select("name").lean(),
+        ]);
+        await Promise.all(
+          ceos
+            .filter((u) => String(u._id) !== req.user!.userId)
+            .map((u) =>
+              createNotification(
+                String(u._id),
+                `${client.name} was won${actor?.name ? ` by ${actor.name}` : ""} — allocate an accountant to serve them`,
+                "client_won",
+                { clientId: String(client._id) },
+              ),
+            ),
+        );
+      } catch (err) {
+        console.error("❌ client_won notify failed:", err);
+      }
+    }
+
     const populated = await client.populate([
       { path: "assignedTo", select: "name email role profilePicture" },
+      { path: "allocatedAccountant", select: "name email" },
       { path: "createdBy", select: "name" },
       { path: "salesStageHistory.changedBy", select: "name role" },
     ]);
@@ -497,36 +650,20 @@ export const getClientDocuments = async (req: AuthRequest, res: Response) => {
     if (!ok)
       return res.status(403).json({ success: false, message: "Access denied" });
 
-    const client = await ClientModel.findById(req.params.id).select(
-      "assignedTo",
-    );
-    if (!client) return res.status(404).json({ success: false });
-
     const { page = "1", limit = "20" } = req.query as Record<string, string>;
     const skip = (Number(page) - 1) * Number(limit);
 
-    let ownerIds: mongoose.Types.ObjectId[];
-    if (isCEO(req)) {
-      ownerIds = client.assignedTo;
-    } else if (req.user!.role === "supervisor") {
-      const maps = await SupervisorMapping.find({
-        supervisorId: req.user!.userId,
-        status: "active",
-      }).select("subordinateId");
-      const subIds = maps.map((m) => m.subordinateId);
-      ownerIds = client.assignedTo.filter((id) =>
-        subIds.some((s) => s.toString() === id.toString()),
-      );
-    } else {
-      ownerIds = [new mongoose.Types.ObjectId(req.user!.userId)];
-    }
-
-    const filter = { ownerId: { $in: ownerIds }, documentType: "working" };
+    // Documents uploaded against this client (POST /documents with
+    // clientId). Everyone with access to the client sees the same list.
+    const filter = {
+      clientId: new mongoose.Types.ObjectId(req.params.id),
+      isDeleted: { $ne: true },
+    };
     const [documents, total] = await Promise.all([
       DocumentModel.find(filter)
         .populate("ownerId", "name email role")
         .select(
-          "title fileType documentType createdAt description folderId ownerId",
+          "title fileType fileName fileSize documentType createdAt description folderId ownerId",
         )
         .sort({ createdAt: -1 })
         .skip(skip)

@@ -39,6 +39,8 @@ import { Response, NextFunction } from "express";
 import { AuthRequest } from "../types/auth";
 import { DocumentModel } from "../models/Document";
 import { SupervisorMapping } from "../models/SupervisorMapping";
+import { ClientModel } from "../models/Client";
+import { canAccess as canAccessClient } from "./clientController";
 import { TaskModel } from "../models/Task";
 import { createAuditLog } from "../utils/auditLogger";
 import mongoose from "mongoose";
@@ -166,6 +168,7 @@ const canAccess = async (
   doc: {
     ownerId: mongoose.Types.ObjectId | string;
     supervisorId?: mongoose.Types.ObjectId | string;
+    clientId?: mongoose.Types.ObjectId | string;
     documentType?: string;
     _id: mongoose.Types.ObjectId | string;
   },
@@ -176,6 +179,11 @@ const canAccess = async (
 
   const ownerId = idOf(doc.ownerId);
   if (ownerId === userId) return true;
+
+  // A document uploaded against a client is shared with everyone who can
+  // access that client (e.g. the accountant allocated after a sales win).
+  if (doc.clientId && (await canAccessClient(idOf(doc.clientId), userId, role)))
+    return true;
 
   if (doc.documentType === "learning") return true;
 
@@ -479,6 +487,34 @@ export const createDocument = async (
       documentType = rawDocumentType === "storage" ? "storage" : "working";
     }
 
+    // Optional: attach the uploads to a client. Requires access to that
+    // client, so a sales person can only file documents on their own leads.
+    const clientIdRaw = req.body.clientId as string | undefined;
+    let clientObjectId: mongoose.Types.ObjectId | undefined;
+    if (clientIdRaw) {
+      if (!mongoose.Types.ObjectId.isValid(clientIdRaw)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid client" });
+      }
+      const clientExists = await ClientModel.exists({ _id: clientIdRaw });
+      if (!clientExists) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Client not found" });
+      }
+      if (!(await canAccessClient(clientIdRaw, req.user!.userId, uploaderRole))) {
+        return res.status(403).json({
+          success: false,
+          message: "You don't have access to that client",
+        });
+      }
+      clientObjectId = new mongoose.Types.ObjectId(clientIdRaw);
+      // "learning" documents are readable by every user; client documents
+      // must never default into that (management roles' upload default).
+      if (documentType === "learning") documentType = "storage";
+    }
+
     // Optional: upload straight into an existing folder. Anything in
     // webkitRelativePaths (a dropped/selected folder) is rebuilt UNDER it.
     let basePath = "";
@@ -604,6 +640,7 @@ export const createDocument = async (
             documentType !== "working" ? (rawPriority ?? "medium") : undefined,
           ownerId: req.user!.userId,
           supervisorId: mapping?.supervisorId,
+          clientId: clientObjectId,
           departmentId: department ?? mapping?.departmentName,
           tags: tags ? (Array.isArray(tags) ? tags : [tags]) : [],
           documentType: documentType ?? "working",
