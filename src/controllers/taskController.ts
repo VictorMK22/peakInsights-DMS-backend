@@ -7,6 +7,7 @@ import { DocumentModel } from "../models/Document";
 import { createNotification } from "../services/notificationService";
 import { sendTaskCollaborationInviteEmail } from "../services/emailService";
 import { getLocalFileUrl } from "../middleware/upload";
+import { signTaskFiles } from "../utils/taskFileUrls";
 import {
   attachSignedUrls,
   attachSignedUrlsToMany,
@@ -74,6 +75,8 @@ const populateTaskDetail = async (taskId: mongoose.Types.ObjectId | string) => {
     documentId?: { fileKey?: string; fileUrl?: string } | null;
     submissionDocuments?: { fileKey?: string; fileUrl?: string }[];
   };
+  // Brief files: fresh links (view + download) — the stored one has expired.
+  plain.taskFiles = signTaskFiles(plain.taskFiles);
   if (plain.documentId) plain.documentId = attachSignedUrls(plain.documentId);
   if (plain.submissionDocuments?.length)
     plain.submissionDocuments = attachSignedUrlsToMany(

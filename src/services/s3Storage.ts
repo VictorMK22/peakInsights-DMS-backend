@@ -115,14 +115,32 @@ export async function copyObjectInS3(
 // origin. S3presigned URLs support this via ResponseContentDisposition,
 // so the security property carries over even without our own proxy
 // route in front of the file.
-const INLINE_SAFE_EXTENSIONS = new Set([
-  ".png",
-  ".jpg",
-  ".jpeg",
-  ".gif",
-  ".webp",
-  ".pdf",
-]);
+// Extension → the Content-Type we force when serving the file inline. We pin
+// it ourselves (S3 ResponseContentType) rather than trusting the MIME type the
+// uploader declared, so e.g. a ".txt" can never be rendered as HTML. Anything
+// not listed here (Office files, HTML, SVG, archives…) is always a download.
+const INLINE_CONTENT_TYPES: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".pdf": "application/pdf",
+  // Plain-text formats are shown as text/plain so browsers display them
+  // instead of downloading (csv/json/md would otherwise download).
+  ".txt": "text/plain; charset=utf-8",
+  ".csv": "text/plain; charset=utf-8",
+  ".json": "text/plain; charset=utf-8",
+  ".md": "text/plain; charset=utf-8",
+  ".log": "text/plain; charset=utf-8",
+  ".mp4": "video/mp4",
+  ".webm": "video/webm",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".ogg": "audio/ogg",
+  ".m4a": "audio/mp4",
+};
+const INLINE_SAFE_EXTENSIONS = new Set(Object.keys(INLINE_CONTENT_TYPES));
 
 /**
  * Generates a short-lived presigned GET URL for a stored file. This is
@@ -146,6 +164,7 @@ export async function getSignedFileUrl(
       ? "inline"
       : "attachment";
   const displayName = opts.filename ?? fileKey;
+  const inline = disposition === "inline";
 
   const command = new GetObjectCommand({
     Bucket: BUCKET,
@@ -153,6 +172,7 @@ export async function getSignedFileUrl(
     // ASCII fallback + RFC 5987 filename* so names with spaces/accents
     // download as "Q3 Report.pdf" rather than "Q3%20Report.pdf".
     ResponseContentDisposition: `${disposition}; filename="${displayName.replace(/[^\x20-\x7e]/g, "_")}"; filename*=UTF-8''${encodeURIComponent(displayName)}`,
+    ...(inline ? { ResponseContentType: INLINE_CONTENT_TYPES[ext] } : {}),
   });
 
   return getSignedUrl(s3, command, {

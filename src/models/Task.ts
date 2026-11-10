@@ -1,4 +1,5 @@
 import mongoose, { Document, Schema } from "mongoose";
+import { signTaskFiles } from "../utils/taskFileUrls";
 
 export type TaskStatus =
   | "pending"
@@ -204,6 +205,16 @@ const TaskSchema = new Schema<ITask>(
   },
   { timestamps: true },
 );
+
+// Brief-file links are signed and short-lived, so never serve the copy that
+// was stored at upload time: rebuild them from the file key on every
+// serialisation (covers every endpoint that returns a task document).
+TaskSchema.set("toJSON", {
+  transform: (_doc, ret: Record<string, any>) => {
+    if (Array.isArray(ret.taskFiles)) ret.taskFiles = signTaskFiles(ret.taskFiles);
+    return ret;
+  },
+});
 
 TaskSchema.index({ assignedTo: 1, status: 1 });
 TaskSchema.index({ assignedBy: 1, createdAt: -1 });
