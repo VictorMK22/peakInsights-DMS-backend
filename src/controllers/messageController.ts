@@ -7,6 +7,7 @@ import { createNotification } from "../services/notificationService";
 import { sendNewMessageEmail } from "../services/emailService";
 import { getIO } from "../socket/socketServer";
 import { waitUntil } from "@vercel/functions";
+import { getTeamMembers } from "../utils/team";
 
 export const canSendTo = async (
   senderId: string,
@@ -62,7 +63,7 @@ const parseIds = (raw: unknown): string[] => {
 const sendGroupMessage = async (
   req: AuthRequest,
   res: Response,
-  audience: "selected" | "everyone",
+  audience: "selected" | "team" | "everyone",
 ) => {
   const senderId = req.user!.userId;
   const senderRole = req.user!.role;
@@ -70,7 +71,14 @@ const sendGroupMessage = async (
 
   let recipients: { _id: any; name: string; email?: string }[] = [];
 
-  if (audience === "everyone") {
+  if (audience === "team") {
+    recipients = await getTeamMembers(senderId);
+    if (recipients.length === 0)
+      return res.status(400).json({
+        success: false,
+        message: "You don't have any team members to message yet",
+      });
+  } else if (audience === "everyone") {
     if (!canBroadcast(senderRole)) {
       return res
         .status(403)
@@ -82,9 +90,10 @@ const sendGroupMessage = async (
   } else {
     const ids = parseIds(req.body.recipientIds).filter((id) => id !== senderId);
     if (ids.length < 2)
-      return res
-        .status(400)
-        .json({ success: false, message: "Select at least two people" });
+      return res.status(400).json({
+        success: false,
+        message: "Select at least two people (use a normal message for one)",
+      });
     if (GROUP_MAX_RECIPIENTS > 0 && ids.length > GROUP_MAX_RECIPIENTS)
       return res.status(400).json({
         success: false,
@@ -247,7 +256,10 @@ export const sendMessage = async (
 
     // New top-level message to a group. Replies are always one-to-one.
     const audience = req.body.audience;
-    if (!parentId && (audience === "selected" || audience === "everyone")) {
+    if (
+      !parentId &&
+      (audience === "selected" || audience === "team" || audience === "everyone")
+    ) {
       return await sendGroupMessage(req, res, audience);
     }
 

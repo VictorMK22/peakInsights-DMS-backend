@@ -19,7 +19,7 @@ export interface IMessage extends Document {
   broadcastId?: mongoose.Types.ObjectId;
   broadcastLead?: boolean;
   broadcastRecipientCount?: number;
-  broadcastAudience?: "selected" | "everyone";
+  broadcastAudience?: "selected" | "team" | "everyone";
   // Set on a root once someone replies, so a broadcaster's inbox surfaces
   // replies that land on non-lead copies.
   hasReplies?: boolean;
@@ -40,7 +40,7 @@ const MessageSchema = new Schema<IMessage>(
     broadcastId: { type: Schema.Types.ObjectId },
     broadcastLead: { type: Boolean },
     broadcastRecipientCount: { type: Number },
-    broadcastAudience: { type: String, enum: ["selected", "everyone"] },
+    broadcastAudience: { type: String, enum: ["selected", "team", "everyone"] },
     hasReplies: { type: Boolean },
   },
   { timestamps: true },

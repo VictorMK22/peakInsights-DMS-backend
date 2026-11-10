@@ -25,6 +25,7 @@ import { User } from "../models/User";
 import { EmailLog } from "../models/EmailLog";
 import { sendDirectUserEmail } from "../services/emailService";
 import { syncMyMailbox } from "../services/emailSyncService";
+import { getTeamMembers } from "../utils/team";
 
 // Anyone can send to everyone (the hourly cap below still applies).
 const canBroadcast = (_role: string) => true;
@@ -984,11 +985,19 @@ export const sendToSelected = async (
       return bail(400, "Subject and message are required");
     }
 
-    const recipientIds = parseRecipientIds(
-      req.body?.recipientIds ?? req.body?.["recipientIds[]"],
-    ).filter((id) => id !== senderId);
-    if (recipientIds.length < 2) {
-      return bail(400, "Select at least two people");
+    const audience: "selected" | "team" =
+      (req as any)._groupAudience === "team" ? "team" : "selected";
+    const recipientIds =
+      audience === "team"
+        ? (await getTeamMembers(senderId)).map((u) => String(u._id))
+        : parseRecipientIds(
+            req.body?.recipientIds ?? req.body?.["recipientIds[]"],
+          ).filter((id) => id !== senderId);
+    if (audience === "team" && recipientIds.length === 0) {
+      return bail(400, "You don't have any team members to email yet");
+    }
+    if (audience === "selected" && recipientIds.length < 2) {
+      return bail(400, "Select at least two people (use a normal email for one)");
     }
     if (GROUP_MAX_RECIPIENTS > 0 && recipientIds.length > GROUP_MAX_RECIPIENTS) {
       return bail(
@@ -1047,7 +1056,7 @@ export const sendToSelected = async (
       senderId,
       senderName: sender?.name,
       senderEmail: sender?.email,
-      audience: "selected",
+      audience,
       recipients: users.map((u) => ({
         _id: String(u._id),
         email: u.email as string,
@@ -1081,6 +1090,17 @@ export const sendToSelected = async (
     next(err);
     return;
   }
+};
+
+/** Email to my team members — same flow as a selected group, with the
+ *  recipients worked out on the server. */
+export const sendToTeam = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+) => {
+  (req as any)._groupAudience = "team";
+  return sendToSelected(req, res, next);
 };
 
 // =====================================================

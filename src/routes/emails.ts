@@ -12,6 +12,7 @@ import {
   getBroadcastAudience,
   sendBroadcast,
   sendToSelected,
+  sendToTeam,
   getAttachmentLimits,
   presignAttachmentUploads,
   getEmailContacts,
@@ -28,6 +29,7 @@ router.post("/attachments/presign", presignAttachmentUploads);
 router.get("/broadcast/audience", getBroadcastAudience);
 router.post("/broadcast", emailUpload, sendBroadcast);
 router.post("/group", emailUpload, sendToSelected);
+router.post("/team", emailUpload, sendToTeam);
 router.get("/sent", getSentEmails);
 router.get("/inbox", getInboxEmails);
 router.post("/sync-now", syncEmailsNow);

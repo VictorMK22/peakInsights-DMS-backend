@@ -1,5 +1,6 @@
 import { Response, NextFunction } from "express";
 import { User } from "../models/User";
+import { getTeamMembers as getTeamMembersFor } from "../utils/team";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { DocumentModel } from "../models/Document";
 import { FolderModel } from "../models/Folder";
@@ -1046,6 +1047,23 @@ export const getInvitableUsers = async (
     res.json({ success: true, data: { users } });
   } catch (err) {
     console.error("getInvitableUsers error:", err);
+    res.status(500).json({ success: false });
+  }
+};
+
+// GET /users/team-members — my team (people I supervise, my supervisor and
+// peers). Used by "invite my team" style pickers.
+export const getTeamMembers = async (
+  req: AuthRequest,
+  res: Response,
+): Promise<void> => {
+  try {
+    res.json({
+      success: true,
+      data: { users: await getTeamMembersFor(req.user!.userId) },
+    });
+  } catch (err) {
+    console.error("getTeamMembers error:", err);
     res.status(500).json({ success: false });
   }
 };

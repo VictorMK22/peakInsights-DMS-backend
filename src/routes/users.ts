@@ -17,6 +17,7 @@ import {
   getNotifications,
   getMyTeammates,
   getInvitableUsers,
+  getTeamMembers,
   getMyWorkspaces,
   getDirectory,
   createTech,
@@ -49,6 +50,7 @@ router.get("/teammates", getMyTeammates);
 
 // Everyone-picker (meeting invitations). Any authenticated role.
 router.get("/invitable", getInvitableUsers);
+router.get("/team-members", getTeamMembers);
 
 // Role-workspaces the caller may enter besides their home one (a
 // supervisor's team workspaces). Any authenticated role may call it.

@@ -383,3 +383,69 @@ describe("restrictions removed for everyone", () => {
     expect(ok.status).toBe(201);
   });
 });
+
+describe("team members audience", () => {
+  const setup = async () => {
+    const sup = await createUserWithToken("supervisor");
+    const a = await createUserWithToken("sales_person");
+    const b = await createUserWithToken("accountant");
+    const outsider = await createUserWithToken("sales_person");
+    await User.updateMany({ _id: { $in: [a.user._id, b.user._id] } }, { supervisorId: sup.user._id });
+    return { sup, a, b, outsider };
+  };
+
+  it("lists a supervisor's reports, and a member's supervisor and peers", async () => {
+    const { sup, a, b, outsider } = await setup();
+    const asSup = await request(app).get("/api/users/team-members").set(auth(sup.token));
+    const supIds = asSup.body.data.users.map((u: any) => String(u._id));
+    expect(supIds).toEqual(expect.arrayContaining([String(a.user._id), String(b.user._id)]));
+    expect(supIds).not.toContain(String(outsider.user._id));
+
+    const asA = await request(app).get("/api/users/team-members").set(auth(a.token));
+    const aIds = asA.body.data.users.map((u: any) => String(u._id));
+    expect(aIds).toEqual(expect.arrayContaining([String(sup.user._id), String(b.user._id)]));
+    expect(aIds).not.toContain(String(a.user._id));
+  });
+
+  it("messages the whole team in one go", async () => {
+    const { sup, a, b } = await setup();
+    const res = await request(app)
+      .post("/api/messages")
+      .set(auth(sup.token))
+      .send({ audience: "team", subject: "Team note", body: "Hi team" });
+    expect(res.status).toBe(201);
+    expect(res.body.data.total).toBe(2);
+    expect(
+      await MessageModel.countDocuments({ subject: "Team note", receiverId: { $in: [a.user._id, b.user._id] } }),
+    ).toBe(2);
+    expect((await MessageModel.findOne({ subject: "Team note", broadcastLead: true }))?.broadcastAudience).toBe("team");
+  });
+
+  it("refuses a team message when the sender has no team", async () => {
+    const loner = await createUserWithToken("sales_person");
+    const res = await request(app)
+      .post("/api/messages")
+      .set(auth(loner.token))
+      .send({ audience: "team", body: "anyone?" });
+    expect(res.status).toBe(400);
+  });
+
+  it("emails the whole team, and refuses when there is no team", async () => {
+    const { sup } = await setup();
+    const ok = await request(app)
+      .post("/api/emails/team")
+      .set(auth(sup.token))
+      .field("subject", "Team email")
+      .field("body", "Hello team");
+    expect(ok.status).toBe(200);
+    expect(ok.body.data.total).toBe(2);
+
+    const loner = await createUserWithToken("accountant");
+    const none = await request(app)
+      .post("/api/emails/team")
+      .set(auth(loner.token))
+      .field("subject", "s")
+      .field("body", "b");
+    expect(none.status).toBe(400);
+  });
+});

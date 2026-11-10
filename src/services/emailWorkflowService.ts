@@ -163,7 +163,7 @@ export async function sendBroadcastEmail({
   senderId: string;
   senderName?: string;
   senderEmail?: string;
-  audience?: "everyone" | "selected";
+  audience?: "everyone" | "selected" | "team";
   recipients: BroadcastRecipient[];
   subject: string;
   body: string;
