@@ -1,8 +1,11 @@
-import { Router } from "express";
+import { Router, Request, Response, NextFunction } from "express";
+import multer from "multer";
 import { authenticate } from "../middleware/auth";
 import { uploadToLocal } from "../middleware/upload";
 import {
   createClient,
+  importClients,
+  downloadClientImportTemplate,
   getClients,
   getClient,
   updateClient,
@@ -41,11 +44,40 @@ import {
 } from "../controllers/clientWhatsappController";
 
 const router = Router();
+
+// Spreadsheet imports are parsed in memory and never stored, so this uses
+// its own small multer instance instead of uploadToLocal (which pushes
+// every file to S3).
+const importUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 }, // 5 MB, single file
+  fileFilter: (_req, file, cb) => {
+    const ok = /\.(xlsx|xls|csv)$/i.test(file.originalname);
+    if (ok) cb(null, true);
+    else cb(new Error("Only .xlsx, .xls or .csv files are allowed"));
+  },
+});
+const handleImportUpload = (req: Request, res: Response, next: NextFunction) =>
+  importUpload.single("file")(req, res, (err: unknown) => {
+    if (err) {
+      res.status(400).json({
+        success: false,
+        message:
+          (err as any).code === "LIMIT_FILE_SIZE"
+            ? "File is too large (max 5 MB)"
+            : (err as Error).message,
+      });
+      return;
+    }
+    next();
+  });
 router.use(authenticate);
 
 // Static routes BEFORE /:id
 router.get("/employees", getAssignableEmployees);
 router.get("/awaiting-allocation", getAwaitingAllocation);
+router.get("/import/template", downloadClientImportTemplate);
+router.post("/import", handleImportUpload, importClients);
 
 // Client CRUD — CEO can create/manage any client; sales persons (BD)
 // can create their own leads (see controller for the exact rule).

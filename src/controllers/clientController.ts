@@ -12,6 +12,7 @@ import { sendDirectUserEmail } from "../services/emailService";
 import { getLocalFileUrl } from "../middleware/upload";
 import { createNotification } from "../services/notificationService";
 import mongoose from "mongoose";
+import * as XLSX from "xlsx";
 
 // ── helpers ───────────────────────────────────────────────────────
 
@@ -97,6 +98,215 @@ export const createClient = async (req: AuthRequest, res: Response) => {
     return;
   } catch (err) {
     res.status(500).json({ success: false });
+    return;
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
+// BULK IMPORT  POST /clients/import  (multipart, field "file")
+// Accepts .xlsx / .xls / .csv. Every valid row becomes a client using
+// exactly the same rules as createClient (sales persons' rows enter the
+// pipeline as "in_discussion" and are auto-assigned to them).
+// ═══════════════════════════════════════════════════════════════
+
+const IMPORT_MAX_ROWS = 1000;
+
+// Header → field. Headers are normalised (lowercase, letters/digits only)
+// so "Client Name", "client_name" and "CLIENT NAME" all match.
+const IMPORT_HEADER_ALIASES: Record<string, string[]> = {
+  name: ["name", "clientname", "contactname", "fullname", "client", "contact"],
+  email: ["email", "emailaddress", "mail"],
+  phone: ["phone", "phonenumber", "mobile", "mobilenumber", "tel", "telephone"],
+  company: ["company", "companyname", "organization", "organisation"],
+  industry: ["industry", "sector"],
+  address: ["address", "location"],
+  notes: ["notes", "note", "comments", "remarks"],
+};
+
+const normaliseHeader = (h: string) => h.toLowerCase().replace(/[^a-z0-9]/g, "");
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export const downloadClientImportTemplate = async (
+  _req: AuthRequest,
+  res: Response,
+) => {
+  try {
+    const rows = [
+      {
+        Name: "Jane Wanjiku",
+        Email: "jane@acme.co.ke",
+        Phone: "+254 700 000 000",
+        Company: "Acme Ltd.",
+        Industry: "Finance",
+        Address: "123 Main Street, Nairobi",
+        Notes: "Referred by an existing client",
+      },
+    ];
+    const ws = XLSX.utils.json_to_sheet(rows);
+    ws["!cols"] = [28, 28, 20, 24, 20, 34, 40].map((wch) => ({ wch }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Clients");
+    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    );
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="client-import-template.xlsx"',
+    );
+    res.send(buf);
+    return;
+  } catch (err) {
+    res.status(500).json({ success: false });
+    return;
+  }
+};
+
+export const importClients = async (req: AuthRequest, res: Response) => {
+  if (!isCEO(req) && !isSalesPerson(req))
+    return res.status(403).json({
+      success: false,
+      message: "Only CEO or a sales person can create clients",
+    });
+  try {
+    const file = (req as any).file as Express.Multer.File | undefined;
+    if (!file)
+      return res
+        .status(400)
+        .json({ success: false, message: "Please choose an Excel or CSV file" });
+
+    let records: Record<string, unknown>[];
+    try {
+      const wb = XLSX.read(file.buffer, { type: "buffer" });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      if (!sheet) throw new Error("empty");
+      // raw:false → cells come back as the text Excel displays, so phone
+      // numbers keep their leading zeros / "+" and dates stay readable.
+      records = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, {
+        defval: "",
+        raw: false,
+      });
+    } catch {
+      return res.status(400).json({
+        success: false,
+        message: "Could not read that file. Upload a valid .xlsx, .xls or .csv",
+      });
+    }
+
+    if (records.length === 0)
+      return res
+        .status(400)
+        .json({ success: false, message: "The file has no data rows" });
+    if (records.length > IMPORT_MAX_ROWS)
+      return res.status(400).json({
+        success: false,
+        message: `Too many rows (${records.length}). Maximum is ${IMPORT_MAX_ROWS} per upload`,
+      });
+
+    // Map the sheet's actual headers onto our fields.
+    const headerToField: Record<string, string> = {};
+    Object.keys(records[0]).forEach((h) => {
+      const n = normaliseHeader(h);
+      for (const [field, aliases] of Object.entries(IMPORT_HEADER_ALIASES)) {
+        if (aliases.includes(n) && !Object.values(headerToField).includes(field)) {
+          headerToField[h] = field;
+          break;
+        }
+      }
+    });
+    if (!Object.values(headerToField).includes("name"))
+      return res.status(400).json({
+        success: false,
+        message:
+          'No "Name" column found. Download the template to see the expected columns',
+      });
+
+    const str = (v: unknown) => (v == null ? "" : String(v).trim());
+
+    // Existing clients, for duplicate detection. A sales person is only
+    // compared against leads they created; the CEO against everyone.
+    const dupScope = isSalesPerson(req)
+      ? { createdBy: req.user!.userId }
+      : {};
+    const existing = await ClientModel.find(dupScope)
+      .select("name company email")
+      .lean();
+    const keyOf = (name: string, company: string, email: string) =>
+      email
+        ? `e:${email.toLowerCase()}`
+        : `n:${name.toLowerCase()}|${company.toLowerCase()}`;
+    const seen = new Set(
+      existing.map((c) => keyOf(c.name ?? "", c.company ?? "", c.email ?? "")),
+    );
+
+    const salesPersonCreating = isSalesPerson(req);
+    const now = new Date();
+    const docs: Record<string, unknown>[] = [];
+    const skipped: { row: number; name: string; reason: string }[] = [];
+
+    records.forEach((rec, i) => {
+      const row = i + 2; // +1 for the header row, +1 for 1-based numbering
+      const v: Record<string, string> = {};
+      for (const [h, field] of Object.entries(headerToField))
+        v[field] = str(rec[h]);
+
+      // Skip fully blank rows silently
+      if (Object.values(v).every((x) => !x)) return;
+
+      if (!v.name) {
+        skipped.push({ row, name: "", reason: "Name is missing" });
+        return;
+      }
+      if (v.email && !EMAIL_RE.test(v.email)) {
+        skipped.push({ row, name: v.name, reason: `Invalid email "${v.email}"` });
+        return;
+      }
+      const key = keyOf(v.name, v.company ?? "", v.email ?? "");
+      if (seen.has(key)) {
+        skipped.push({
+          row,
+          name: v.name,
+          reason: "Duplicate (already exists or repeated in file)",
+        });
+        return;
+      }
+      seen.add(key);
+
+      docs.push({
+        name: v.name,
+        email: v.email || undefined,
+        phone: v.phone || undefined,
+        company: v.company || undefined,
+        industry: v.industry || undefined,
+        address: v.address || undefined,
+        notes: v.notes || undefined,
+        createdBy: req.user!.userId,
+        assignedTo: salesPersonCreating ? [req.user!.userId] : [],
+        assignedAt: salesPersonCreating ? now : undefined,
+        isSalesLead: salesPersonCreating,
+        salesStage: salesPersonCreating ? "in_discussion" : undefined,
+        salesStageHistory: salesPersonCreating
+          ? [
+              {
+                stage: "in_discussion",
+                changedBy: req.user!.userId,
+                changedAt: now,
+              },
+            ]
+          : [],
+      });
+    });
+
+    if (docs.length > 0) await ClientModel.insertMany(docs);
+
+    res.status(201).json({
+      success: true,
+      data: { imported: docs.length, skipped },
+    });
+    return;
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Import failed" });
     return;
   }
 };
