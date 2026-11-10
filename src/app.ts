@@ -29,6 +29,7 @@ import meetingRoutes from "./routes/meetings";
 import notificationRoutes from "./routes/notifications";
 import presenceRoutes from "./routes/presence";
 import calendarBlockRoutes from "./routes/calendarBlocks";
+import todoRoutes from "./routes/todos";
 
 // ── ICT workspace routes ────────────────────────────────────────
 import projectRoutes from "./routes/projects";
@@ -164,6 +165,7 @@ app.use("/api/meetings", meetingRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/presence", presenceRoutes);
 app.use("/api/calendar-blocks", calendarBlockRoutes);
+app.use("/api/todos", todoRoutes);
 app.use("/api/projects", projectRoutes);
 app.use("/api/tickets", ticketRoutes);
 app.use("/api/assets", assetRoutes);
