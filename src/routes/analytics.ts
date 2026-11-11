@@ -10,6 +10,7 @@ import {
   getEmailAnalytics,
   getAccountantWorkspace,
 } from "../controllers/analyticsController";
+import { getSalesActivityReport } from "../controllers/salesReportController";
 
 const router = Router();
 router.use(authenticate);
@@ -23,6 +24,8 @@ router.get(
   getAccountantWorkspace,
 );
 router.get("/leaderboard", authorize("ceo", "supervisor"), getLeaderboard);
+// Per-rep sales activity (leads, meetings, calls/emails/WhatsApp, stage moves).
+router.get("/sales-activity", authorize("ceo"), getSalesActivityReport);
 router.get(
   "/bottlenecks",
   authorize("ceo", "supervisor"),

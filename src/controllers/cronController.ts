@@ -9,6 +9,13 @@ import {
 } from "./meetingController";
 import { runTaskReminderSweep } from "./taskReminderController";
 import { runTodoReminderSweep } from "./todoReminderController";
+import { User } from "../models/User";
+import {
+  buildSalesActivityReport,
+  lastCompletedWeek,
+  formatPeriodLabel,
+} from "../services/salesReportService";
+import { sendSalesWeeklyReportEmail } from "../services/emailService";
 
 // ═════════════════════════════════════════════════════════════════
 // These two endpoints replace the BullMQ-queued background jobs used
@@ -145,5 +152,45 @@ export const runTaskReminders = async (_req: Request, res: Response) => {
     res
       .status(500)
       .json({ success: false, message: "Task reminder sweep failed" });
+  }
+};
+
+/**
+ * POST /api/cron/sales-weekly-report — call once a week (Monday morning).
+ * Emails every active CEO a summary of the sales team's activity for the last
+ * completed Monday–Sunday week (Nairobi time): leads added, meetings, client
+ * discussions and pipeline movement, per sales person.
+ */
+export const runSalesWeeklyReport = async (_req: Request, res: Response) => {
+  try {
+    const { from, to } = lastCompletedWeek();
+    const [report, ceos] = await Promise.all([
+      buildSalesActivityReport(from, to),
+      User.find({ role: "ceo", isActive: true }).select("name email").lean(),
+    ]);
+    const periodLabel = formatPeriodLabel(from, to);
+
+    await Promise.all(
+      ceos.map((ceo) =>
+        sendSalesWeeklyReportEmail(ceo.email, {
+          recipientName: ceo.name,
+          periodLabel,
+          from: from.toISOString().slice(0, 10),
+          totals: report.totals,
+          reps: report.reps,
+          pipeline: report.pipeline,
+        }),
+      ),
+    );
+
+    res.json({
+      success: true,
+      message: `Sales weekly report (${periodLabel}) sent to ${ceos.length} CEO(s)`,
+    });
+  } catch (err) {
+    console.error("Cron sales weekly report failed:", err);
+    res
+      .status(500)
+      .json({ success: false, message: "Sales weekly report failed" });
   }
 };

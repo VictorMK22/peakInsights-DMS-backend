@@ -20,6 +20,19 @@ const isCEO = (r: AuthRequest) =>
   r.user!.role === "ceo" || r.user!.role === "tech";
 const isSalesPerson = (r: AuthRequest) => r.user!.role === "sales_person";
 
+/**
+ * True when this request adds a PROSPECT — a lead that enters the sales
+ * pipeline and goes through the stages before it is won:
+ *   - a sales person always adds prospects;
+ *   - the CEO adds a prospect only from the Sales workspace (`asLead: true`).
+ * Anything else the CEO adds is an EXISTING client — one that was already
+ * won before this system — so it skips the pipeline entirely.
+ * (`asLead` arrives as a boolean in JSON and as "true" in the multipart import.)
+ */
+const addsProspect = (r: AuthRequest) =>
+  isSalesPerson(r) ||
+  (isCEO(r) && (r.body?.asLead === true || r.body?.asLead === "true"));
+
 /** Attach fresh short-lived signed URLs to a set of stored attachments. */
 const withSignedAttachmentUrls = (attachments: IClientEmailAttachment[] = []) =>
   attachments.map((a) => ({
@@ -50,14 +63,40 @@ export const canAccess = async (
   return false;
 };
 
+const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * True when ANY client (whoever owns it) already has this email, or the same
+ * name + company. Used to stop a sales person re-adding a client the CEO or
+ * another rep already has — the caller must not reveal who owns the match.
+ */
+const clientAlreadyExists = async (
+  name: string,
+  company?: string,
+  email?: string,
+): Promise<boolean> => {
+  const or: Record<string, unknown>[] = [];
+  if (email?.trim()) or.push({ email: email.trim().toLowerCase() });
+  or.push({
+    name: new RegExp(`^${escapeRegex(name.trim())}$`, "i"),
+    company: company?.trim()
+      ? new RegExp(`^${escapeRegex(company.trim())}$`, "i")
+      : { $in: [null, ""] },
+  });
+  return !!(await ClientModel.exists({ $or: or }));
+};
+
 // ═══════════════════════════════════════════════════════════════
 // CLIENTS CRUD
 // ═══════════════════════════════════════════════════════════════
 
 export const createClient = async (req: AuthRequest, res: Response) => {
-  // CEO can create any client. Sales persons (BD officers) can create
-  // their own leads directly — these enter the sales pipeline and are
-  // auto-assigned to the sales person who created them.
+  // Two kinds of client can be added here (see addsProspect):
+  //   - PROSPECTS — sales persons' leads, and the CEO's own leads from the
+  //     Sales workspace (asLead: true). They enter the pipeline at "In
+  //     Discussion" and are auto-assigned to whoever added them.
+  //   - EXISTING clients — added by the CEO for clients won before this system
+  //     existed. They skip the pipeline.
   if (!isCEO(req) && !isSalesPerson(req))
     return res.status(403).json({
       success: false,
@@ -70,7 +109,16 @@ export const createClient = async (req: AuthRequest, res: Response) => {
         .status(400)
         .json({ success: false, message: "Client name is required" });
 
-    const salesPersonCreating = isSalesPerson(req);
+    const salesPersonCreating = addsProspect(req);
+    if (
+      salesPersonCreating &&
+      (await clientAlreadyExists(name, company, email))
+    )
+      return res.status(409).json({
+        success: false,
+        message:
+          "A client with these details already exists. Ask the CEO if you need access to them.",
+      });
     const client = await ClientModel.create({
       name: name.trim(),
       email,
@@ -224,12 +272,11 @@ export const importClients = async (req: AuthRequest, res: Response) => {
 
     const str = (v: unknown) => (v == null ? "" : String(v).trim());
 
-    // Existing clients, for duplicate detection. A sales person is only
-    // compared against leads they created; the CEO against everyone.
-    const dupScope = isSalesPerson(req)
-      ? { createdBy: req.user!.userId }
-      : {};
-    const existing = await ClientModel.find(dupScope)
+    // Existing clients, for duplicate detection. Everyone is compared against
+    // ALL clients, so a sales person can't re-add a client the CEO (or another
+    // rep) already has. The skip reason stays generic on purpose — it must not
+    // reveal who owns the existing record.
+    const existing = await ClientModel.find({})
       .select("name company email")
       .lean();
     const keyOf = (name: string, company: string, email: string) =>
@@ -240,7 +287,7 @@ export const importClients = async (req: AuthRequest, res: Response) => {
       existing.map((c) => keyOf(c.name ?? "", c.company ?? "", c.email ?? "")),
     );
 
-    const salesPersonCreating = isSalesPerson(req);
+    const salesPersonCreating = addsProspect(req);
     const now = new Date();
     const docs: Record<string, unknown>[] = [];
     const skipped: { row: number; name: string; reason: string }[] = [];
@@ -319,6 +366,8 @@ export const getClients = async (req: AuthRequest, res: Response) => {
       search,
       salesStage,
       salesOnly,
+      tab,
+      mine,
     } = req.query as Record<string, string>;
     const skip = (Number(page) - 1) * Number(limit);
     const uid = new mongoose.Types.ObjectId(req.user!.userId);
@@ -340,21 +389,38 @@ export const getClients = async (req: AuthRequest, res: Response) => {
       filter.assignedTo = uid;
     }
 
+    // GET /clients?mine=true — only clients assigned to the caller. Lets the
+    // CEO, working in the Sales or Accountant workspace, see just their own
+    // book instead of every client in the company.
+    if (mine === "true") filter.assignedTo = uid;
+
     // Sales pipeline filters — e.g. GET /clients?salesOnly=true&salesStage=won
     if (salesOnly === "true") filter.isSalesLead = true;
     if (salesStage) filter.salesStage = salesStage;
+
+    const and: Record<string, unknown>[] = [];
+    // GET /clients?tab=prospects|won — the CEO's two client lists:
+    //   prospects → leads still in the pipeline (any stage but won, lost included)
+    //   won       → won clients plus existing clients added before the pipeline
+    if (tab === "prospects")
+      and.push({ isSalesLead: true, salesStage: { $ne: "won" } });
+    else if (tab === "won")
+      and.push({ $or: [{ isSalesLead: { $ne: true } }, { salesStage: "won" }] });
     if (search)
-      filter.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { company: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } },
-      ];
+      and.push({
+        $or: [
+          { name: { $regex: search, $options: "i" } },
+          { company: { $regex: search, $options: "i" } },
+          { email: { $regex: search, $options: "i" } },
+        ],
+      });
+    if (and.length) filter.$and = and;
 
     const [clients, total] = await Promise.all([
       ClientModel.find(filter)
         .populate("assignedTo", "name email role profilePicture")
         .populate("allocatedAccountant", "name email")
-        .populate("createdBy", "name")
+        .populate("createdBy", "name role")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(Number(limit))
@@ -490,6 +556,43 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
       return res
         .status(400)
         .json({ success: false, message: "userIds must be an array" });
+    if (userIds.some((id) => !mongoose.Types.ObjectId.isValid(id)))
+      return res
+        .status(400)
+        .json({ success: false, message: "userIds contains an invalid id" });
+
+    const current = await ClientModel.findById(req.params.id).select(
+      "assignedTo isSalesLead salesStage",
+    );
+    if (!current) return res.status(404).json({ success: false });
+
+    // Who may be newly assigned depends on what the client is:
+    //   prospect (still in the pipeline)  → sales people
+    //   existing / won client             → accountants
+    // and in both cases the CEO may assign THEMSELF. People already on the
+    // client (e.g. the sales person who won it) are kept as they are.
+    const prospect = current.isSalesLead && current.salesStage !== "won";
+    const allowedRole = prospect ? "sales_person" : "accountant";
+    const already = new Set(current.assignedTo.map((id) => id.toString()));
+    const newIds = [...new Set(userIds.map(String))].filter(
+      (id) => !already.has(id),
+    );
+    const found = await User.find({ _id: { $in: newIds } })
+      .select("role isActive")
+      .lean();
+    const invalid = newIds.some((id) => {
+      const u = found.find((f) => String(f._id) === id);
+      const isSelf = id === req.user!.userId && u?.role === "ceo";
+      return !u || !u.isActive || (u.role !== allowedRole && !isSelf);
+    });
+    if (invalid)
+      return res.status(400).json({
+        success: false,
+        message: prospect
+          ? "A prospect can only be assigned to sales people (or yourself)"
+          : "A client can only be assigned to accountants (or yourself)",
+      });
+
     const client = await ClientModel.findByIdAndUpdate(
       req.params.id,
       {
@@ -577,10 +680,21 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
         success: false,
         message: "An accountant can only be allocated to a client that has been won",
       });
-    if (!accountant || !accountant.isActive || accountant.role !== "accountant")
-      return res
-        .status(400)
-        .json({ success: false, message: "Choose an active accountant" });
+    // The CEO may keep a won client and serve it personally, so they are a
+    // valid choice alongside the accountants.
+    const allocatingToSelf =
+      !!accountant &&
+      accountant.role === "ceo" &&
+      accountant._id.toString() === req.user!.userId;
+    if (
+      !accountant ||
+      !accountant.isActive ||
+      (accountant.role !== "accountant" && !allocatingToSelf)
+    )
+      return res.status(400).json({
+        success: false,
+        message: "Choose an active accountant (or yourself)",
+      });
 
     const previous = client.allocatedAccountant?.toString();
     const next = accountant._id.toString();
@@ -599,12 +713,13 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
     // Tell the accountant, and the sales person who won the client.
     if (previous !== next) {
       try {
-        await createNotification(
-          next,
-          `You have been allocated a new client: ${client.name}`,
-          "client_allocated",
-          { clientId: String(client._id) },
-        );
+        if (next !== req.user!.userId)
+          await createNotification(
+            next,
+            `You have been allocated a new client: ${client.name}`,
+            "client_allocated",
+            { clientId: String(client._id) },
+          );
         const salesId = client.createdBy?.toString();
         if (salesId && salesId !== req.user!.userId && salesId !== next) {
           await createNotification(
@@ -655,8 +770,15 @@ export const updateClientStage = async (req: AuthRequest, res: Response) => {
     const client = await ClientModel.findById(req.params.id);
     if (!client) return res.status(404).json({ success: false });
 
+    // Existing clients (won before the pipeline existed) never enter it —
+    // only prospects, added through the Sales workspace, have stages.
+    if (!client.isSalesLead)
+      return res.status(400).json({
+        success: false,
+        message: "Existing clients are not part of the sales pipeline",
+      });
+
     const justWon = stage === "won" && client.salesStage !== "won";
-    client.isSalesLead = true;
     client.salesStage = stage;
     if (justWon) client.wonAt = new Date();
     client.salesStageHistory.push({

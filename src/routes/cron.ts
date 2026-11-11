@@ -5,6 +5,7 @@ import {
   runDocumentRetrySweep,
   runMeetingReminders,
   runTaskReminders,
+  runSalesWeeklyReport,
 } from "../controllers/cronController";
 
 const router = Router();
@@ -14,5 +15,6 @@ router.post("/sync-emails", runEmailSync);
 router.post("/process-documents", runDocumentRetrySweep);
 router.post("/meeting-reminders", runMeetingReminders);
 router.post("/task-reminders", runTaskReminders);
+router.post("/sales-weekly-report", runSalesWeeklyReport);
 
 export default router;

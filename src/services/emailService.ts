@@ -754,3 +754,88 @@ export async function sendMeetingCancelledEmail(
     fromEmail,
   );
 }
+
+
+// ═════════════════════════════════════════════════════════════════
+// SALES — weekly activity report (sent to the CEO by the weekly cron)
+// ═════════════════════════════════════════════════════════════════
+
+export interface SalesWeeklyReportEmailData {
+  recipientName: string;
+  periodLabel: string;
+  /** Monday of the reported week, YYYY-MM-DD — used to deep-link the report page. */
+  from: string;
+  totals: SalesReportRow;
+  reps: (SalesReportRow & { name: string })[];
+  pipeline: Record<string, number>;
+}
+
+interface SalesReportRow {
+  leadsAdded: number;
+  meetingsSet: number;
+  meetingsDone: number;
+  discussions: number;
+  proposalsSent: number;
+  won: number;
+}
+
+const STAGE_LABELS: Record<string, string> = {
+  in_discussion: "In discussion",
+  proposal_sent: "Proposal sent",
+  awaiting_decision: "Awaiting decision",
+  agreement_sent: "Agreement sent",
+  won: "Won",
+  lost: "Lost",
+};
+
+/** Weekly summary of the sales team's activity, sent to the CEO. */
+export async function sendSalesWeeklyReportEmail(
+  to: string,
+  data: SalesWeeklyReportEmailData,
+): Promise<void> {
+  const th =
+    'style="padding:8px 6px;text-align:right;font-size:12px;color:#64748b;border-bottom:2px solid #e2e8f0;"';
+  const td = (bold = false) =>
+    `style="padding:8px 6px;text-align:right;font-size:14px;color:#0f172a;border-bottom:1px solid #f1f5f9;${bold ? "font-weight:700;" : ""}"`;
+  const row = (label: string, r: SalesReportRow, bold = false) => `
+    <tr>
+      <td style="padding:8px 6px;font-size:14px;color:#0f172a;border-bottom:1px solid #f1f5f9;${bold ? "font-weight:700;" : ""}">${esc(label)}</td>
+      <td ${td(bold)}>${r.leadsAdded}</td>
+      <td ${td(bold)}>${r.meetingsSet}</td>
+      <td ${td(bold)}>${r.meetingsDone}</td>
+      <td ${td(bold)}>${r.discussions}</td>
+      <td ${td(bold)}>${r.proposalsSent}</td>
+      <td ${td(bold)}>${r.won}</td>
+    </tr>`;
+
+  const table = `
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin:16px 0;">
+      <tr>
+        <th style="padding:8px 6px;text-align:left;font-size:12px;color:#64748b;border-bottom:2px solid #e2e8f0;">Sales person</th>
+        <th ${th}>Leads</th><th ${th}>Mtgs set</th><th ${th}>Mtgs done</th>
+        <th ${th}>Talks</th><th ${th}>Proposals</th><th ${th}>Won</th>
+      </tr>
+      ${data.reps.map((r) => row(r.name, r)).join("")}
+      ${data.reps.length ? row("Team total", data.totals, true) : ""}
+    </table>`;
+
+  const pipeline = Object.entries(data.pipeline)
+    .map(([k, v]) => `${esc(STAGE_LABELS[k] ?? k)}: <strong>${v}</strong>`)
+    .join(" &nbsp;·&nbsp; ");
+
+  await send(
+    to,
+    `📈 Sales team weekly report — ${data.periodLabel}`,
+    wrap(
+      "Sales Weekly Report",
+      `
+      ${h1("Sales team weekly report")}
+      ${p("Hi " + esc(data.recipientName) + ", here is what the sales team did during <strong>" + esc(data.periodLabel) + "</strong>.")}
+      ${data.reps.length ? table : p("No active sales people to report on.")}
+      <p style="margin:0 0 16px;font-size:12px;color:#94a3b8;">Talks = calls + emails and WhatsApp messages sent to clients.</p>
+      ${pipeline ? highlight("<strong>Pipeline right now</strong><br />" + pipeline) : ""}
+      ${btn("Open full report", `${APP_URL}/ceo/sales-activity?from=${encodeURIComponent(data.from)}`)}
+    `,
+    ),
+  );
+}

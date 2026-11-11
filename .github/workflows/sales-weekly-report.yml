@@ -1,25 +1,24 @@
-name: Task reminders cron
+name: Sales weekly report cron
 
-# Calls POST /api/cron/task-reminders so personal task reminders are delivered
-# when their time arrives. Uses the same secrets as the email-sync workflow:
+# Calls POST /api/cron/sales-weekly-report every Monday at 08:00 Nairobi time
+# (05:00 UTC). It emails the CEO the sales team's activity for the week that
+# just ended. Uses the same secrets as the other cron workflows:
 #   CRON_SECRET, API_BASE_URL  (Repo Settings → Secrets and variables → Actions)
-#
-# GitHub's scheduled workflows have a 5-minute floor and can run a few minutes
-# late under load, so a reminder may arrive up to ~10 minutes after its time.
+# Copy this file to .github/workflows/ to enable it.
 
 on:
   schedule:
-    - cron: "*/5 * * * *" # every 5 minutes
+    - cron: "0 5 * * 1" # Mondays 05:00 UTC = 08:00 EAT
   workflow_dispatch: {}
 
 jobs:
-  task-reminders:
+  sales-weekly-report:
     runs-on: ubuntu-latest
     steps:
-      - name: Call /api/cron/task-reminders
+      - name: Call /api/cron/sales-weekly-report
         run: |
           http_status=$(curl -s -o /tmp/response.json -w "%{http_code}" \
-            -X POST "${API_BASE_URL}/api/cron/task-reminders" \
+            -X POST "${API_BASE_URL}/api/cron/sales-weekly-report" \
             -H "Authorization: Bearer ${CRON_SECRET}" \
             -H "Content-Type: application/json")
 
@@ -28,7 +27,7 @@ jobs:
           echo ""
 
           if [ "$http_status" -ge 400 ]; then
-            echo "::error::Task reminder cron call failed with status $http_status"
+            echo "::error::Sales weekly report cron call failed with status $http_status"
             exit 1
           fi
         env:
