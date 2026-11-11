@@ -7,6 +7,8 @@ import {
   runMeetingReminderSweep,
   runMeetingAutoCompleteSweep,
 } from "./meetingController";
+import { runTaskReminderSweep } from "./taskReminderController";
+import { runTodoReminderSweep } from "./todoReminderController";
 
 // ═════════════════════════════════════════════════════════════════
 // These two endpoints replace the BullMQ-queued background jobs used
@@ -122,5 +124,26 @@ export const runMeetingReminders = async (_req: Request, res: Response) => {
     res
       .status(500)
       .json({ success: false, message: "Meeting reminder sweep failed" });
+  }
+};
+
+/**
+ * POST /api/cron/task-reminders — call every ~5 minutes.
+ * Delivers personal task and to-do item reminders whose time has arrived
+ * (see taskReminderController / todoReminderController sweeps).
+ */
+export const runTaskReminders = async (_req: Request, res: Response) => {
+  try {
+    const { sent } = await runTaskReminderSweep();
+    const { sent: todoSent } = await runTodoReminderSweep();
+    res.json({
+      success: true,
+      message: `Reminders: sent ${sent} task, ${todoSent} to-do`,
+    });
+  } catch (err) {
+    console.error("Cron task reminder sweep failed:", err);
+    res
+      .status(500)
+      .json({ success: false, message: "Task reminder sweep failed" });
   }
 };

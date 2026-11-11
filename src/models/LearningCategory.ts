@@ -11,6 +11,13 @@ export interface ILearningCategory extends Document {
   color: string;
   order: number;
   isActive: boolean;
+  // Which kind of document this category files: "working", "storage" or
+  // "learning". Rows created before categories were extended to every
+  // document type have no value and are treated as "learning".
+  documentType: "working" | "storage" | "learning";
+  // Set for a personal category (a user's own working/storage filing);
+  // absent for a shared one created by the CEO / a supervisor.
+  ownerId?: mongoose.Types.ObjectId;
   createdBy: mongoose.Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
@@ -24,16 +31,22 @@ const LearningCategorySchema = new Schema<ILearningCategory>(
     color: { type: String, trim: true, default: "violet" },
     order: { type: Number, default: 0 },
     isActive: { type: Boolean, default: true },
+    documentType: {
+      type: String,
+      enum: ["working", "storage", "learning"],
+      default: "learning",
+    },
+    ownerId: { type: Schema.Types.ObjectId, ref: "User" },
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   },
   { timestamps: true },
 );
 
-LearningCategorySchema.index(
-  { name: 1 },
-  { unique: true, collation: { locale: "en", strength: 2 } },
-);
-LearningCategorySchema.index({ order: 1, name: 1 });
+// Name uniqueness is enforced per (type, owner) in the controller rather than
+// by a unique index: shared and personal categories of different types may
+// legitimately share a name (e.g. "General"). The old global unique index on
+// `name` must be dropped — see scripts/migrateDocumentCategories.ts.
+LearningCategorySchema.index({ documentType: 1, ownerId: 1, order: 1, name: 1 });
 
 export const LearningCategoryModel = mongoose.model<ILearningCategory>(
   "LearningCategory",

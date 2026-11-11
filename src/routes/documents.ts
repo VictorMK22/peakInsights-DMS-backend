@@ -24,6 +24,7 @@ import {
   getDocumentReaders,
   previewDocument,
   downloadDocument,
+  getDownloadStatus,
   moveDocument,
   getDocumentActivity,
 } from "../controllers/documentController";
@@ -68,6 +69,7 @@ router.get("/:id/reads", getDocumentReaders);
 // ── Utility ───────────────────────────────────────────────────────
 router.get("/:id/preview", previewDocument);
 router.get("/:id/download", downloadDocument);
+router.get("/:id/download-status", getDownloadStatus);
 router.put("/:id/move", moveDocument);
 router.get("/:id/activity", getDocumentActivity);
 

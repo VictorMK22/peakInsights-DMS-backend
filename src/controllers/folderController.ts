@@ -338,8 +338,9 @@ export const getFolderContents = async (req: AuthRequest, res: Response) => {
       }),
       DocumentModel.find({ folderId, isDeleted: { $ne: true } })
         .select(
-          "title fileType documentType createdAt folderId description isStarred",
+          "title fileType documentType createdAt folderId description isStarred categoryId",
         )
+        .populate("categoryId", "name color icon")
         .sort({ createdAt: -1 })
         .lean(),
     ]);

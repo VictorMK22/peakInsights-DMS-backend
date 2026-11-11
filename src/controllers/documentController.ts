@@ -47,6 +47,7 @@ import mongoose from "mongoose";
 import { DocumentPriority } from "../types";
 import { AuditLog } from "../models/AuditLog";
 import { FolderModel } from "../models/Folder";
+import { validateCategoryForDocument } from "./learningCategoryController";
 import { CommentModel } from "../models/Comment";
 import { DocumentReadModel } from "../models/DocumentRead";
 import { redis } from "../config/redis";
@@ -515,6 +516,19 @@ export const createDocument = async (
       if (documentType === "learning") documentType = "storage";
     }
 
+    // Optional category — available for every document type. It must be a
+    // category of the same type that this user can see (shared, or their own).
+    if (categoryId) {
+      const check = await validateCategoryForDocument(
+        String(categoryId),
+        documentType as "working" | "storage" | "learning",
+        req.user!.userId,
+      );
+      if (!check.ok) {
+        return res.status(400).json({ success: false, message: check.message });
+      }
+    }
+
     // Optional: upload straight into an existing folder. Anything in
     // webkitRelativePaths (a dropped/selected folder) is rebuilt UNDER it.
     let basePath = "";
@@ -644,8 +658,7 @@ export const createDocument = async (
           departmentId: department ?? mapping?.departmentName,
           tags: tags ? (Array.isArray(tags) ? tags : [tags]) : [],
           documentType: documentType ?? "working",
-          categoryId:
-            documentType === "learning" && categoryId ? categoryId : undefined,
+          categoryId: categoryId ? categoryId : undefined,
           status: "draft",
         });
 
@@ -1158,7 +1171,22 @@ export const updateDocument = async (
       if (priority) update.priority = priority;
       if (tags) update.tags = tags;
     }
-    if (doc.documentType === "learning" && categoryId !== undefined) {
+    if (categoryId !== undefined) {
+      if (categoryId) {
+        const check = await validateCategoryForDocument(
+          categoryId,
+          doc.documentType,
+          // Personal categories belong to the document's owner, which may not
+          // be the editor (a supervisor re-filing a subordinate's document).
+          doc.documentType === "learning"
+            ? req.user!.userId
+            : String(doc.ownerId),
+        );
+        if (!check.ok) {
+          res.status(400).json({ success: false, message: check.message });
+          return;
+        }
+      }
       update.categoryId = categoryId
         ? new mongoose.Types.ObjectId(categoryId)
         : null;
@@ -1938,6 +1966,60 @@ export const downloadDocument = async (
       forceAttachment: true,
     });
     res.redirect(302, url);
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * GET /documents/:id/download-status
+ *
+ * Has the caller already downloaded this document? Lets the UI warn before a
+ * repeat download. Based on the "downloaded" audit entries that
+ * downloadDocument writes, so it covers every client, not just this browser.
+ */
+export const getDownloadStatus = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const doc = await DocumentModel.findById(req.params.id);
+    if (!doc) {
+      res.status(404).json({ success: false, message: "Document not found" });
+      return;
+    }
+    const access = await canAccess(
+      doc as Parameters<typeof canAccess>[0],
+      req.user!.userId,
+      req.user!.role,
+    );
+    if (!access) {
+      res.status(403).json({ success: false, message: "Access denied" });
+      return;
+    }
+
+    const filter = {
+      documentId: doc._id,
+      actorId: new mongoose.Types.ObjectId(req.user!.userId),
+      action: "downloaded",
+    };
+    const [count, last] = await Promise.all([
+      AuditLog.countDocuments(filter),
+      AuditLog.findOne(filter).sort({ timestamp: -1 }).select("timestamp").lean(),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        downloaded: count > 0,
+        count,
+        lastDownloadedAt: last?.timestamp ?? null,
+        // A newer file may have replaced the one they downloaded; the UI
+        // uses this to avoid nagging when the file has changed since.
+        fileModifiedAt: doc.modifiedAt ?? doc.updatedAt,
+      },
+    });
   } catch (err) {
     next(err);
   }

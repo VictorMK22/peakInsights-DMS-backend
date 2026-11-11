@@ -14,6 +14,11 @@ import {
   getTaskLeaderboard,
   getUserAppraisal,
 } from "../controllers/taskController";
+import {
+  getMyTaskReminders,
+  setTaskReminder,
+  clearTaskReminder,
+} from "../controllers/taskReminderController";
 
 /**
  * Tasks — own TAT, efficiency, collaboration, file uploads, document linking.
@@ -39,6 +44,11 @@ router.get(
   getTaskLeaderboard,
 );
 router.get("/analytics/appraisal/:userId", getUserAppraisal);
+
+// ── Reminders ("/reminders/mine" before /:id) ─────────────────────
+router.get("/reminders/mine", getMyTaskReminders);
+router.put("/:id/reminder", setTaskReminder);
+router.delete("/:id/reminder", clearTaskReminder);
 
 // ── CRUD ──────────────────────────────────────────────────────────
 router.get("/", getTasks);
