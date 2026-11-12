@@ -21,11 +21,9 @@ jobs:
             -X POST "${API_BASE_URL}/api/cron/sales-weekly-report" \
             -H "Authorization: Bearer ${CRON_SECRET}" \
             -H "Content-Type: application/json")
-
           echo "HTTP status: $http_status"
           cat /tmp/response.json
           echo ""
-
           if [ "$http_status" -ge 400 ]; then
             echo "::error::Sales weekly report cron call failed with status $http_status"
             exit 1
