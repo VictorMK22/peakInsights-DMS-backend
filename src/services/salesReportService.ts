@@ -81,11 +81,13 @@ export interface SalesRepActivity {
   agreementsSent: number;
   won: number;
   lost: number;
+  /** Leads this rep created that sit in each stage right now (not range-limited). */
+  pipeline: Record<string, number>;
 }
 
 export type SalesActivityTotals = Omit<
   SalesRepActivity,
-  "userId" | "name" | "email"
+  "userId" | "name" | "email" | "pipeline"
 >;
 
 export interface SalesActivityReport {
@@ -136,6 +138,7 @@ export async function buildSalesActivityReport(
     stageMoves,
     pipelineRows,
     industryRows,
+    repPipelineRows,
   ] = await Promise.all([
     countBy(ClientModel, "createdBy", inRange("createdAt")),
     // Meetings logged against a client…
@@ -206,6 +209,19 @@ export async function buildSalesActivityReport(
       { $sort: { n: -1 } },
       { $limit: 10 },
     ]),
+    // Current pipeline broken down by the rep who owns (created) the lead.
+    ClientModel.aggregate<{
+      _id: { u: mongoose.Types.ObjectId; s: string | null };
+      n: number;
+    }>([
+      { $match: { isSalesLead: true, createdBy: { $in: ids } } },
+      {
+        $group: {
+          _id: { u: "$createdBy", s: "$salesStage" },
+          n: { $sum: 1 },
+        },
+      },
+    ]),
   ]);
 
   const pick = (rows: Counted[], id: unknown) =>
@@ -213,6 +229,16 @@ export async function buildSalesActivityReport(
   const stage = (id: unknown, s: string) =>
     stageMoves.find((m) => String(m._id.u) === String(id) && m._id.s === s)
       ?.n ?? 0;
+
+  const repPipeline = (id: unknown) => {
+    const out: Record<string, number> = {};
+    for (const row of repPipelineRows) {
+      if (String(row._id.u) !== String(id)) continue;
+      const key = row._id.s ?? "in_discussion"; // unset stage = in discussion
+      out[key] = (out[key] ?? 0) + row.n;
+    }
+    return out;
+  };
 
   const repRows: SalesRepActivity[] = reps.map((r) => {
     const callsN = pick(calls, r._id);
@@ -234,6 +260,7 @@ export async function buildSalesActivityReport(
       agreementsSent: stage(r._id, "agreement_sent"),
       won: stage(r._id, "won"),
       lost: stage(r._id, "lost"),
+      pipeline: repPipeline(r._id),
     };
   });
 
@@ -278,5 +305,244 @@ export async function buildSalesActivityReport(
       pipelineRows.map((r) => [r._id ?? "in_discussion", r.n]),
     ),
     industries: industryRows.map((r) => ({ industry: r._id, count: r.n })),
+  };
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Drill-down: the clients behind one number in the report.
+// ═════════════════════════════════════════════════════════════════
+
+export const ACTIVITY_METRICS = [
+  "leadsAdded",
+  "meetingsSet",
+  "meetingsDone",
+  "calls",
+  "emails",
+  "whatsapp",
+  "notes",
+  "proposalsSent",
+  "agreementsSent",
+  "won",
+  "lost",
+] as const;
+export type ActivityMetric = (typeof ACTIVITY_METRICS)[number];
+
+export const PIPELINE_STAGES = [
+  "in_discussion",
+  "proposal_sent",
+  "awaiting_decision",
+  "agreement_sent",
+  "won",
+  "lost",
+] as const;
+
+export interface SalesDetailClient {
+  clientId: string;
+  name: string;
+  company?: string;
+  industry?: string;
+  email?: string;
+  phone?: string;
+  salesStage?: string;
+  /** How many events for this client make up the number. */
+  count: number;
+  lastAt: string | null;
+  /** Up to 5 most recent events, newest first. */
+  events: { at: string; label: string }[];
+}
+
+interface RawEvent {
+  clientId: mongoose.Types.ObjectId;
+  at: Date;
+  label: string;
+}
+
+const trunc = (s: unknown, n = 80) => {
+  const t = String(s ?? "").replace(/\s+/g, " ").trim();
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+};
+
+/** True when `metric` is a pipeline-stage snapshot key such as "stage:won". */
+export function parseStageMetric(metric: string): string | null {
+  if (!metric.startsWith("stage:")) return null;
+  const s = metric.slice(6);
+  return (PIPELINE_STAGES as readonly string[]).includes(s) ? s : null;
+}
+
+export async function buildSalesRepDetail(
+  userId: string,
+  metric: string,
+  from: Date,
+  to: Date,
+): Promise<{ metric: string; total: number; clients: SalesDetailClient[] }> {
+  const uid = new mongoose.Types.ObjectId(userId);
+  const range = (field: string) => ({ [field]: { $gte: from, $lt: to } });
+  let events: RawEvent[] = [];
+  let snapshotClients: any[] | null = null;
+
+  const stageEvents = async (stageName: string) => {
+    const rows = await ClientModel.aggregate<{
+      _id: mongoose.Types.ObjectId;
+      at: Date;
+      note?: string;
+    }>([
+      { $unwind: "$salesStageHistory" },
+      {
+        $match: {
+          "salesStageHistory.changedBy": uid,
+          "salesStageHistory.stage": stageName,
+          "salesStageHistory.changedAt": { $gte: from, $lt: to },
+        },
+      },
+      {
+        $project: {
+          at: "$salesStageHistory.changedAt",
+          note: "$salesStageHistory.note",
+        },
+      },
+    ]);
+    return rows.map<RawEvent>((r) => ({
+      clientId: r._id,
+      at: r.at,
+      label: r.note ? `Moved to ${stageName.replace("_", " ")} — ${trunc(r.note)}` : `Moved to ${stageName.replace("_", " ")}`,
+    }));
+  };
+
+  const stageFilter = parseStageMetric(metric);
+  if (stageFilter) {
+    // Snapshot: leads this rep owns that are in the stage right now.
+    const stageMatch =
+      stageFilter === "in_discussion"
+        ? { $in: ["in_discussion", null] }
+        : stageFilter;
+    snapshotClients = await ClientModel.find({
+      isSalesLead: true,
+      createdBy: uid,
+      salesStage: stageMatch,
+    })
+      .sort({ updatedAt: -1 })
+      .lean();
+  } else {
+    switch (metric as ActivityMetric) {
+      case "leadsAdded": {
+        const rows = await ClientModel.find({ createdBy: uid, ...range("createdAt") })
+          .select("_id createdAt")
+          .lean();
+        events = rows.map((r) => ({ clientId: r._id as any, at: r.createdAt, label: "Lead added" }));
+        break;
+      }
+      case "meetingsSet": {
+        const [logged, cal] = await Promise.all([
+          ClientMeetingModel.find({ authorId: uid, ...range("createdAt") }).lean(),
+          MeetingModel.find({
+            organizer: uid,
+            clientId: { $exists: true, $ne: null },
+            ...range("createdAt"),
+          }).lean(),
+        ]);
+        events = [
+          ...logged.map((m: any) => ({ clientId: m.clientId, at: m.createdAt, label: `Meeting set: ${trunc(m.title)}` })),
+          ...cal.map((m: any) => ({ clientId: m.clientId, at: m.createdAt, label: `Video meeting set: ${trunc(m.title)}` })),
+        ];
+        break;
+      }
+      case "meetingsDone": {
+        const [logged, cal] = await Promise.all([
+          ClientMeetingModel.find({ authorId: uid, status: "done", ...range("completedAt") }).lean(),
+          MeetingModel.find({
+            organizer: uid,
+            clientId: { $exists: true, $ne: null },
+            status: "completed",
+            ...range("startTime"),
+          }).lean(),
+        ]);
+        events = [
+          ...logged.map((m: any) => ({ clientId: m.clientId, at: m.completedAt ?? m.createdAt, label: `Meeting done: ${trunc(m.title)}` })),
+          ...cal.map((m: any) => ({ clientId: m.clientId, at: m.startTime, label: `Video meeting done: ${trunc(m.title)}` })),
+        ];
+        break;
+      }
+      case "calls": {
+        const rows = await ClientCallModel.find({ authorId: uid, ...range("calledAt") }).lean();
+        events = rows.map((c: any) => ({ clientId: c.clientId, at: c.calledAt, label: `Call (${c.direction}): ${trunc(c.summary)}` }));
+        break;
+      }
+      case "emails": {
+        const rows = await ClientEmailModel.find({
+          authorId: uid,
+          direction: "outbound",
+          ...range("createdAt"),
+        }).lean();
+        events = rows.map((e: any) => ({ clientId: e.clientId, at: e.createdAt, label: `Email: ${trunc(e.subject)}` }));
+        break;
+      }
+      case "whatsapp": {
+        const rows = await ClientWhatsappMessageModel.find({
+          authorId: uid,
+          direction: "outbound",
+          ...range("createdAt"),
+        }).lean();
+        events = rows.map((w: any) => ({ clientId: w.clientId, at: w.createdAt, label: `WhatsApp: ${trunc(w.body)}` }));
+        break;
+      }
+      case "notes": {
+        const rows = await ClientNoteModel.find({ authorId: uid, ...range("createdAt") }).lean();
+        events = rows.map((n: any) => ({ clientId: n.clientId, at: n.createdAt, label: `Note: ${trunc(n.body)}` }));
+        break;
+      }
+      case "proposalsSent":
+        events = await stageEvents("proposal_sent");
+        break;
+      case "agreementsSent":
+        events = await stageEvents("agreement_sent");
+        break;
+      case "won":
+        events = await stageEvents("won");
+        break;
+      case "lost":
+        events = await stageEvents("lost");
+        break;
+      default:
+        throw new Error(`Unknown metric: ${metric}`);
+    }
+  }
+
+  // Group events per client, newest first.
+  const byClient = new Map<string, RawEvent[]>();
+  for (const e of events) {
+    if (!e.clientId) continue;
+    const k = String(e.clientId);
+    byClient.set(k, [...(byClient.get(k) ?? []), e]);
+  }
+
+  const clientDocs: any[] = snapshotClients
+    ? snapshotClients
+    : await ClientModel.find({
+        _id: { $in: [...byClient.keys()].map((k) => new mongoose.Types.ObjectId(k)) },
+      }).lean();
+
+  const clients: SalesDetailClient[] = clientDocs.map((c) => {
+    const evs = (byClient.get(String(c._id)) ?? []).sort(
+      (a, b) => b.at.getTime() - a.at.getTime(),
+    );
+    return {
+      clientId: String(c._id),
+      name: c.name,
+      company: c.company,
+      industry: c.industry,
+      email: c.email,
+      phone: c.phone,
+      salesStage: c.salesStage ?? (c.isSalesLead ? "in_discussion" : undefined),
+      count: snapshotClients ? 1 : evs.length,
+      lastAt: (evs[0]?.at ?? c.updatedAt)?.toISOString?.() ?? null,
+      events: evs.slice(0, 5).map((e) => ({ at: e.at.toISOString(), label: e.label })),
+    };
+  });
+
+  clients.sort((a, b) => (b.lastAt ?? "").localeCompare(a.lastAt ?? ""));
+  return {
+    metric,
+    total: snapshotClients ? clients.length : events.length,
+    clients,
   };
 }
