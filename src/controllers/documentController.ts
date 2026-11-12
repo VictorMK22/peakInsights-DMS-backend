@@ -474,8 +474,9 @@ export const createDocument = async (
     // Document type rules:
     //   CEO / Supervisor → 'learning' by default (they upload training materials).
     //                      They may explicitly choose 'storage' to override.
-    //   User             → 'working' always (task documents; cannot set learning).
-    //                      They may explicitly choose 'storage' for reference files.
+    //   Everyone else    → 'working' by default (task documents).
+    //                      They may explicitly choose 'storage' for reference
+    //                      files, or 'learning' to share training material.
     const uploaderRole = req.user!.role;
     let documentType: string;
     if (
@@ -485,7 +486,12 @@ export const createDocument = async (
     ) {
       documentType = rawDocumentType === "storage" ? "storage" : "learning";
     } else {
-      documentType = rawDocumentType === "storage" ? "storage" : "working";
+      // Any role may share learning material; everything else defaults to
+      // working documents.
+      documentType =
+        rawDocumentType === "storage" || rawDocumentType === "learning"
+          ? rawDocumentType
+          : "working";
     }
 
     // Optional: attach the uploads to a client. Requires access to that
