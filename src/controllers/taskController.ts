@@ -373,6 +373,13 @@ export const updateTask = async (
           });
           return;
         }
+        if (task.status === "pending" && !task.assigneeReviewedAt) {
+          res.status(400).json({
+            success: false,
+            message: REVIEW_BEFORE_TARGET_MESSAGE,
+          });
+          return;
+        }
         task.targetMinutes = targetMinutes;
       }
     }
@@ -384,10 +391,66 @@ export const updateTask = async (
   }
 };
 
+const REVIEW_BEFORE_TARGET_MESSAGE =
+  "Review the task first, then set your target time — the target should reflect how easy or hard the task is.";
+
+// ─────────────────────────────────────────────────────────────────
+// MARK REVIEWED — the assignee confirms they have gone through the task
+// (brief, attached files, deadline). Setting a target time and starting
+// is only allowed afterwards. Idempotent.
+// ─────────────────────────────────────────────────────────────────
+export const markTaskReviewed = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const task = await TaskModel.findById(req.params.id);
+    if (!task) {
+      res.status(404).json({ success: false, message: "Task not found" });
+      return;
+    }
+
+    const userId = req.user!.userId;
+    const isAssignee = task.assignedTo.toString() === userId;
+    const isCEO = req.user!.role === "ceo";
+    if (!isAssignee && !isCEO && !isActiveCollaborator(task, userId)) {
+      res.status(403).json({
+        success: false,
+        message:
+          "Only the task assignee or an accepted collaborator can review a task before starting it",
+      });
+      return;
+    }
+    if (task.status !== "pending") {
+      res.status(400).json({
+        success: false,
+        message: "Only tasks that haven't been started can be reviewed",
+      });
+      return;
+    }
+
+    if (!task.assigneeReviewedAt) {
+      task.assigneeReviewedAt = new Date();
+      task.assigneeReviewedBy = new mongoose.Types.ObjectId(userId);
+      await task.save();
+    }
+
+    res.json({
+      success: true,
+      message: "Task reviewed — you can now set your target time",
+      data: { task: await populateTaskDetail(task._id) },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 // ─────────────────────────────────────────────────────────────────
 // UPDATE STATUS — TAT lifecycle
 //
-//  pending     → in_progress : assignee commits targetMinutes
+//  pending     → in_progress : assignee commits targetMinutes (only after
+//                              reviewing the task — see markTaskReviewed)
 //  in_progress → submitted   : assignee attaches supporting documents
 //  submitted   → completed   : approver (supervisor/CEO) reviews docs + approves
 //  submitted   → rejected    : approver rejects with reason (goes back to in_progress)
@@ -480,6 +543,13 @@ export const updateTaskStatus = async (
 
     // ── pending → in_progress ────────────────────────────────────
     if (status === "in_progress" && task.status === "pending") {
+      if (!task.assigneeReviewedAt) {
+        res.status(400).json({
+          success: false,
+          message: REVIEW_BEFORE_TARGET_MESSAGE,
+        });
+        return;
+      }
       const target = targetMinutes ?? task.targetMinutes;
       if (!target || target < 1) {
         res.status(400).json({

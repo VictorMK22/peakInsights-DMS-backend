@@ -15,9 +15,12 @@ export type TaskPriority = "low" | "medium" | "high" | "critical";
  *
  * TAT lifecycle:
  *   1. CEO/Supervisor creates task (optionally uploads supporting files)
- *   2. Assignee sets targetMinutes + starts        → in_progress, startedAt recorded
- *   3. Assignee submits with supporting documents  → submitted
- *   4. Supervisor/CEO reviews linked documents     → completed OR rejected
+ *   2. Assignee reviews the task (brief, files, deadline) and confirms
+ *      they have → assigneeReviewedAt recorded. Only then can they set a
+ *      target time, so the commitment reflects how easy or hard it is.
+ *   3. Assignee sets targetMinutes + starts        → in_progress, startedAt recorded
+ *   4. Assignee submits with supporting documents  → submitted
+ *   5. Supervisor/CEO reviews linked documents     → completed OR rejected
  *
  * efficiencyRatio = targetMinutes / tatMinutes
  *   > 1.0  finished faster than committed (excellent)
@@ -86,6 +89,11 @@ export interface ITask extends Document {
   status: TaskStatus;
   priority: TaskPriority;
   dueDate?: Date;
+
+  // Assignee's pre-start review: set when they confirm they have gone
+  // through the task. Required before a target time can be set/started.
+  assigneeReviewedAt?: Date;
+  assigneeReviewedBy?: mongoose.Types.ObjectId;
 
   // TAT
   targetMinutes?: number;
@@ -182,6 +190,8 @@ const TaskSchema = new Schema<ITask>(
     dueDate: { type: Date },
 
     // TAT
+    assigneeReviewedAt: { type: Date },
+    assigneeReviewedBy: { type: Schema.Types.ObjectId, ref: "User" },
     targetMinutes: { type: Number, min: 1 },
     startedAt: { type: Date },
     submittedAt: { type: Date },

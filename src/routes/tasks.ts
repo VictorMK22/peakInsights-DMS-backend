@@ -7,6 +7,7 @@ import {
   getTask,
   updateTask,
   updateTaskStatus,
+  markTaskReviewed,
   approveTask,
   deleteTask,
   inviteTaskCollaborator,
@@ -25,8 +26,11 @@ import {
  *
  * Lifecycle:
  *   POST   /              CEO/Supervisor creates task (can upload briefing files)
+ *   PATCH  /:id/review    Assignee confirms they've reviewed the task; required
+ *                         before a target time can be set / the task started
  *   PATCH  /:id/status    Drives TAT state machine:
- *                           pending → in_progress (assignee sets targetMinutes)
+ *                           pending → in_progress (assignee sets targetMinutes,
+ *                                                  after reviewing the task)
  *                           in_progress → submitted (assignee attaches docs)
  *                           submitted → completed   (approver approves)
  *                           submitted → rejected    (approver rejects, back to in_progress)
@@ -58,6 +62,7 @@ router.post("/", uploadToLocal.any(), createTask);
 
 router.get("/:id", getTask);
 router.put("/:id", updateTask);
+router.patch("/:id/review", markTaskReviewed);
 router.patch("/:id/status", updateTaskStatus);
 router.patch("/:id/approve", approveTask);
 router.delete("/:id", deleteTask);
