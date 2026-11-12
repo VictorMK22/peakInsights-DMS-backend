@@ -211,7 +211,7 @@ export const getZohoCalendarEvents = async (req: AuthRequest, res: Response) => 
       return res.json({ success: true, data: { connected, events: [] } });
     }
     const meetings = await MeetingModel.find({
-      status: { $ne: "cancelled" },
+      status: { $nin: ["cancelled", "postponed"] },
       startTime: { $lt: to },
       endTime: { $gt: from },
       $or: [{ organizer: userId }, { "attendees.userId": userId }],

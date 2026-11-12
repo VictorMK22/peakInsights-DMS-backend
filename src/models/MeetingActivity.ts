@@ -23,6 +23,7 @@ export type MeetingActivityAction =
   | "participant_tentative"
   | "meeting_rescheduled"
   | "meeting_updated"
+  | "meeting_postponed"
   | "meeting_cancelled"
   | "meeting_completed"
   | "meeting_started"
@@ -55,6 +56,7 @@ const MeetingActivitySchema = new Schema<IMeetingActivity>(
         "participant_tentative",
         "meeting_rescheduled",
         "meeting_updated",
+        "meeting_postponed",
         "meeting_started",
         "recording_available",
         "meeting_cancelled",

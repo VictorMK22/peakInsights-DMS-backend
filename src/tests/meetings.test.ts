@@ -315,6 +315,162 @@ describe("PATCH /api/meetings/:id/cancel — cancelMeeting", () => {
   });
 });
 
+describe("PATCH /api/meetings/:id/postpone — postponeMeeting", () => {
+  const createMeetingFor = async (
+    token: string,
+    extra: Record<string, unknown> = {},
+  ) => {
+    const res = await request(app)
+      .post("/api/meetings")
+      .set("Authorization", `Bearer ${token}`)
+      .send({
+        title: "Postpone me",
+        startTime: inOneHour().toISOString(),
+        endTime: inTwoHours().toISOString(),
+        ...extra,
+      });
+    return res.body.data.meeting._id as string;
+  };
+
+  it("marks the meeting postponed (not deleted), notifies attendees and logs it", async () => {
+    const { token: ceoToken } = await createUserWithToken("ceo");
+    const { user: attendee } = await createUserWithToken("accountant");
+    const meetingId = await createMeetingFor(ceoToken, {
+      attendeeIds: [String(attendee._id)],
+    });
+    const newDate = new Date(Date.now() + 3 * 24 * 3600_000);
+
+    const res = await request(app)
+      .patch(`/api/meetings/${meetingId}/postpone`)
+      .set("Authorization", `Bearer ${ceoToken}`)
+      .send({ postponedTo: newDate.toISOString(), reason: "Client travelling" });
+    expect(res.status).toBe(200);
+
+    const meeting = await MeetingModel.findById(meetingId);
+    expect(meeting).not.toBeNull();
+    expect(meeting?.status).toBe("postponed");
+    expect(meeting?.postponedTo?.getTime()).toBe(newDate.getTime());
+    expect(meeting?.postponementReason).toBe("Client travelling");
+
+    // A new meeting now exists at the new time, with the same attendees.
+    const created = await MeetingModel.findById(meeting?.postponedToMeetingId);
+    expect(created?.status).toBe("scheduled");
+    expect(created?.startTime.getTime()).toBe(newDate.getTime());
+    expect(created!.endTime.getTime() - created!.startTime.getTime()).toBe(
+      3600_000,
+    );
+    expect(created?.attendees.map((a) => String(a.userId))).toEqual([
+      String(attendee._id),
+    ]);
+    expect(created?.attendees[0].status).toBe("pending");
+    expect(res.body.data.newMeeting._id).toBe(String(created?._id));
+
+    const activity = await MeetingActivityModel.find({ meetingId });
+    expect(activity.map((a) => a.action)).toContain("meeting_postponed");
+  });
+
+  it("returns 409 when the new time conflicts, and proceeds with force", async () => {
+    const { token: ceoToken } = await createUserWithToken("ceo");
+    const meetingId = await createMeetingFor(ceoToken);
+    const slot = new Date(Date.now() + 4 * 24 * 3600_000);
+    await createMeetingFor(ceoToken, {
+      title: "Already there",
+      startTime: slot.toISOString(),
+      endTime: new Date(slot.getTime() + 3600_000).toISOString(),
+    });
+
+    const blocked = await request(app)
+      .patch(`/api/meetings/${meetingId}/postpone`)
+      .set("Authorization", `Bearer ${ceoToken}`)
+      .send({ postponedTo: slot.toISOString() });
+    expect(blocked.status).toBe(409);
+    expect((await MeetingModel.findById(meetingId))?.status).toBe("scheduled");
+
+    const forced = await request(app)
+      .patch(`/api/meetings/${meetingId}/postpone`)
+      .set("Authorization", `Bearer ${ceoToken}`)
+      .send({ postponedTo: slot.toISOString(), force: true });
+    expect(forced.status).toBe(200);
+  });
+
+  it("allows postponing without a new date (TBD)", async () => {
+    const { token: ceoToken } = await createUserWithToken("ceo");
+    const meetingId = await createMeetingFor(ceoToken);
+    const res = await request(app)
+      .patch(`/api/meetings/${meetingId}/postpone`)
+      .set("Authorization", `Bearer ${ceoToken}`)
+      .send({});
+    expect(res.status).toBe(200);
+    const meeting = await MeetingModel.findById(meetingId);
+    expect(meeting?.status).toBe("postponed");
+    expect(meeting?.postponedTo).toBeUndefined();
+    expect(meeting?.postponedToMeetingId).toBeUndefined();
+  });
+
+  it("rejects a past or invalid new date", async () => {
+    const { token: ceoToken } = await createUserWithToken("ceo");
+    const meetingId = await createMeetingFor(ceoToken);
+    const past = await request(app)
+      .patch(`/api/meetings/${meetingId}/postpone`)
+      .set("Authorization", `Bearer ${ceoToken}`)
+      .send({ postponedTo: new Date(Date.now() - 3600_000).toISOString() });
+    expect(past.status).toBe(400);
+    const bad = await request(app)
+      .patch(`/api/meetings/${meetingId}/postpone`)
+      .set("Authorization", `Bearer ${ceoToken}`)
+      .send({ postponedTo: "not-a-date" });
+    expect(bad.status).toBe(400);
+    expect((await MeetingModel.findById(meetingId))?.status).toBe("scheduled");
+  });
+
+  it("is forbidden to non-organizers and can't postpone twice", async () => {
+    const { token: ceoToken } = await createUserWithToken("ceo");
+    const { token: outsiderToken } = await createUserWithToken("accountant");
+    const meetingId = await createMeetingFor(ceoToken);
+
+    const forbidden = await request(app)
+      .patch(`/api/meetings/${meetingId}/postpone`)
+      .set("Authorization", `Bearer ${outsiderToken}`)
+      .send({});
+    expect(forbidden.status).toBe(403);
+
+    await request(app)
+      .patch(`/api/meetings/${meetingId}/postpone`)
+      .set("Authorization", `Bearer ${ceoToken}`)
+      .send({});
+    const again = await request(app)
+      .patch(`/api/meetings/${meetingId}/postpone`)
+      .set("Authorization", `Bearer ${ceoToken}`)
+      .send({});
+    expect(again.status).toBe(400);
+  });
+
+  it("frees the organizer's time; a TBD-postponed meeting is rescheduled by editing it", async () => {
+    const { token: ceoToken } = await createUserWithToken("ceo");
+    const meetingId = await createMeetingFor(ceoToken);
+    await request(app)
+      .patch(`/api/meetings/${meetingId}/postpone`)
+      .set("Authorization", `Bearer ${ceoToken}`)
+      .send({});
+
+    // Same slot is no longer a conflict while the meeting is postponed.
+    const clash = await createMeetingFor(ceoToken, { title: "Takes the slot" });
+    expect(clash).toBeTruthy();
+
+    const start = new Date(Date.now() + 5 * 24 * 3600_000);
+    const end = new Date(start.getTime() + 3600_000);
+    const edit = await request(app)
+      .put(`/api/meetings/${meetingId}`)
+      .set("Authorization", `Bearer ${ceoToken}`)
+      .send({ startTime: start.toISOString(), endTime: end.toISOString() });
+    expect(edit.status).toBe(200);
+
+    const meeting = await MeetingModel.findById(meetingId);
+    expect(meeting?.status).toBe("scheduled");
+    expect(meeting?.postponedTo).toBeUndefined();
+  });
+});
+
 describe("GET /api/meetings/:id/activity", () => {
   it("is visible to participants and forbidden to outsiders", async () => {
     const { token: ceoToken } = await createUserWithToken("ceo");

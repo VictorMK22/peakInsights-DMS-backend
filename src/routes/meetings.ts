@@ -6,6 +6,7 @@ import {
   getMeeting,
   updateMeeting,
   cancelMeeting,
+  postponeMeeting,
   respondToMeeting,
   checkAvailability,
   getMeetingActivityHistory,
@@ -26,6 +27,8 @@ import {
  *                                abandoned / link regenerated); refuses saved meetings' events
  *   GET    /:id                  Single meeting detail
  *   PUT    /:id                  Organizer edits (re-checks conflicts if time/attendees changed)
+ *   PATCH  /:id/postpone         Organizer postpones (kept on the calendar as "Postponed to
+ *                                <date>"; tagged attendees are notified)
  *   PATCH  /:id/cancel           Organizer cancels (optionally the whole recurring series)
  *   PATCH  /:id/respond          Invited attendee sets accepted/declined/tentative
  *   GET    /:id/activity         Automatic activity trail for this meeting
@@ -51,6 +54,7 @@ router.delete("/zoho-meeting-link/:eventUid", discardZohoMeetingLink);
 
 router.get("/:id", getMeeting);
 router.put("/:id", updateMeeting);
+router.patch("/:id/postpone", postponeMeeting);
 router.patch("/:id/cancel", cancelMeeting);
 router.patch("/:id/respond", respondToMeeting);
 router.get("/:id/activity", getMeetingActivityHistory);

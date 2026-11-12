@@ -733,6 +733,44 @@ export async function sendMeetingUpdatedEmail(
   );
 }
 
+/** Sent when a meeting is postponed (optionally to a known new date). */
+export async function sendMeetingPostponedEmail(
+  data: MeetingEmailData & { postponedTo?: Date; reason?: string },
+  fromEmail?: string,
+): Promise<void> {
+  await send(
+    data.toEmail,
+    `⏸️ Postponed: "${data.title}"`,
+    wrap(
+      "Meeting Postponed",
+      `
+      ${h1("Meeting Postponed")}
+      ${p("Hi " + data.toName + ", " + data.organizerName + " postponed this meeting.")}
+      ${info("Title", data.title)}
+      ${info("Was scheduled for", formatMeetingWindow(data.startTime, data.endTime))}
+      ${
+        data.postponedTo
+          ? info(
+              "Postponed to",
+              data.postponedTo.toLocaleString([], {
+                dateStyle: "medium",
+                timeStyle: "short",
+              }),
+            )
+          : info("Postponed to", "New date to be confirmed")
+      }
+      ${data.reason ? info("Reason", data.reason) : ""}
+      ${
+        data.isExternal
+          ? highlight("Please update your own calendar once a new time is confirmed.")
+          : btn("View Meeting", `${APP_URL}/meetings`)
+      }
+    `,
+    ),
+    fromEmail,
+  );
+}
+
 /** Sent when a meeting (or an occurrence of a series) is cancelled. */
 export async function sendMeetingCancelledEmail(
   data: MeetingEmailData & { reason?: string },

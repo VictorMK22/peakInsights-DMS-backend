@@ -43,7 +43,7 @@ const overlaps = (
 /**
  * Every interval during which `userId` is busy, within [from, to]:
  *   - meetings where they're the organizer or an attendee who hasn't
- *     declined, on a meeting that hasn't been cancelled
+ *     declined, on a meeting that hasn't been cancelled or postponed
  *   - personal calendar blocks (out-of-office, focus time, etc.)
  *   - busy time on their connected Zoho Calendar (if any), shown only
  *     as a generic "Busy" — event titles from Zoho are never exposed
@@ -55,7 +55,7 @@ export const getUserBusyIntervals = async (
   excludeMeetingId?: string,
 ): Promise<BusyInterval[]> => {
   const meetingFilter: Record<string, unknown> = {
-    status: { $ne: "cancelled" },
+    status: { $nin: ["cancelled", "postponed"] },
     startTime: { $lt: to },
     endTime: { $gt: from },
     $or: [

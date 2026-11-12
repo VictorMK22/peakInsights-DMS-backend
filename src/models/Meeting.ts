@@ -19,7 +19,16 @@ import mongoose, { Document, Schema } from "mongoose";
  *    meeting itself has not been cancelled.
  */
 
-export type MeetingStatus = "scheduled" | "cancelled" | "completed";
+// "postponed" = the organizer pushed the meeting back instead of deleting it.
+// The record stays on the calendar (shown as "Postponed to <date>") so nobody
+// loses track of it, but it no longer blocks anyone's availability and is
+// skipped by the reminder / auto-complete sweeps. Moving it to a new time
+// through the normal edit flow turns it back into "scheduled".
+export type MeetingStatus =
+  | "scheduled"
+  | "postponed"
+  | "cancelled"
+  | "completed";
 export type RsvpStatus = "pending" | "accepted" | "declined" | "tentative";
 export type RecurrenceFrequency =
   | "none"
@@ -91,6 +100,13 @@ export interface IMeeting extends Document {
 
   status: MeetingStatus;
   cancellationReason?: string;
+  // Set only while status === "postponed". `postponedTo` is optional: an
+  // organizer may postpone without a new date yet ("date TBD").
+  postponedTo?: Date;
+  postponementReason?: string;
+  // When the postponement came with a new time, the meeting created for
+  // that time. The original stays as the "Postponed to <date>" marker.
+  postponedToMeetingId?: mongoose.Types.ObjectId;
 
   // Recurrence — only present on the series "master" definition, but
   // copied onto every generated occurrence so each instance knows the
@@ -177,10 +193,13 @@ const MeetingSchema = new Schema<IMeeting>(
 
     status: {
       type: String,
-      enum: ["scheduled", "cancelled", "completed"],
+      enum: ["scheduled", "postponed", "cancelled", "completed"],
       default: "scheduled",
     },
     cancellationReason: { type: String, trim: true },
+    postponedTo: { type: Date },
+    postponementReason: { type: String, trim: true },
+    postponedToMeetingId: { type: Schema.Types.ObjectId, ref: "Meeting" },
 
     recurrence: {
       type: RecurrenceRuleSchema,

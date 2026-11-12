@@ -15,6 +15,7 @@ import {
 import {
   sendMeetingInviteEmail,
   sendMeetingUpdatedEmail,
+  sendMeetingPostponedEmail,
   sendMeetingCancelledEmail,
 } from "../services/emailService";
 import {
@@ -812,6 +813,19 @@ export const updateMeeting = async (
 
     const newStart = startTime ? new Date(startTime) : meeting.startTime;
     const newEnd = endTime ? new Date(endTime) : meeting.endTime;
+    if (
+      meeting.status === "postponed" &&
+      meeting.postponedToMeetingId &&
+      (newStart.getTime() !== meeting.startTime.getTime() ||
+        newEnd.getTime() !== meeting.endTime.getTime())
+    ) {
+      res.status(400).json({
+        success: false,
+        message:
+          "This meeting was postponed to a new date — edit the new meeting instead",
+      });
+      return;
+    }
     if (newEnd <= newStart) {
       res
         .status(400)
@@ -875,6 +889,15 @@ export const updateMeeting = async (
     meeting.startTime = newStart;
     meeting.endTime = newEnd;
 
+    // Giving a postponed meeting a new time brings it back onto the
+    // calendar as a normal scheduled meeting.
+    const wasPostponed = meeting.status === "postponed";
+    if (wasPostponed && timeChanged) {
+      meeting.status = "scheduled";
+      meeting.postponedTo = undefined;
+      meeting.postponementReason = undefined;
+    }
+
     if (attendeeIds) {
       meeting.attendees = nextAttendeeIds.map((userId) => {
         const existing = meeting.attendees.find(
@@ -910,7 +933,9 @@ export const updateMeeting = async (
     // or without a Zoho Meeting) in step with the edit. Awaited, because on
     // Vercel work still running after the response is cut off. Never
     // throws: Zoho being down can't fail the update.
-    await syncUpdatedMeetingToZoho(meeting, previousCalendar);
+    if (meeting.status !== "postponed") {
+      await syncUpdatedMeetingToZoho(meeting, previousCalendar);
+    }
 
     const organizerUser = await User.findById(meeting.organizer)
       .select("name email")
@@ -972,7 +997,7 @@ export const updateMeeting = async (
       actorId: req.user!.userId,
       action: timeChanged ? "meeting_rescheduled" : "meeting_updated",
       message: timeChanged
-        ? `${organizerUser?.name ?? "The organizer"} rescheduled "${meeting.title}" to ${meeting.startTime.toLocaleString()}${trimmedComment ? ` — "${trimmedComment}"` : ""}`
+        ? `${organizerUser?.name ?? "The organizer"} ${wasPostponed ? "set a new time for the postponed meeting" : "rescheduled"} "${meeting.title}" to ${meeting.startTime.toLocaleString()}${trimmedComment ? ` — "${trimmedComment}"` : ""}`
         : `${organizerUser?.name ?? "The organizer"} updated "${meeting.title}"`,
       details: trimmedComment ? { comment: trimmedComment } : undefined,
     });
@@ -982,6 +1007,283 @@ export const updateMeeting = async (
       success: true,
       message: "Meeting updated",
       data: { meeting: populated },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────
+// POSTPONE — organizer only. The meeting stays on the calendar (marked
+// "Postponed to <date>") instead of being deleted, and everyone tagged
+// on it is notified in-app and by email.
+// ─────────────────────────────────────────────────────────────────
+export const postponeMeeting = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const meeting = await MeetingModel.findById(req.params.id);
+    if (!meeting) {
+      res.status(404).json({ success: false, message: "Meeting not found" });
+      return;
+    }
+    const role = req.user!.role;
+    if (
+      !canManageMeeting(meeting, req.user!.userId) &&
+      role !== "ceo" &&
+      role !== "tech"
+    ) {
+      res.status(403).json({
+        success: false,
+        message: "Only the organizer can postpone this meeting",
+      });
+      return;
+    }
+    // Same rule as cancelling: a sales person moves a lead's meeting by
+    // changing its date with a comment, so the lead's history stays intact.
+    if (role === "sales_person" && meeting.clientId) {
+      res.status(403).json({
+        success: false,
+        message:
+          "Sales can't postpone a lead's meeting — change the date and add a comment instead",
+      });
+      return;
+    }
+    if (meeting.status !== "scheduled") {
+      res.status(400).json({
+        success: false,
+        message: `Only scheduled meetings can be postponed (this one is ${meeting.status})`,
+      });
+      return;
+    }
+
+    // postponedTo = new start; postponedEnd = new end (defaults to the
+    // same duration as the original). Omit both for "date TBD".
+    const {
+      postponedTo,
+      postponedEnd,
+      reason,
+      force = false,
+    } = req.body as {
+      postponedTo?: string;
+      postponedEnd?: string;
+      reason?: string;
+      force?: boolean;
+    };
+
+    let newDate: Date | undefined;
+    let newEnd: Date | undefined;
+    if (postponedTo) {
+      newDate = new Date(postponedTo);
+      if (Number.isNaN(newDate.getTime())) {
+        res
+          .status(400)
+          .json({ success: false, message: "postponedTo is not a valid date" });
+        return;
+      }
+      if (newDate.getTime() <= Date.now()) {
+        res.status(400).json({
+          success: false,
+          message: "postponedTo must be a future date",
+        });
+        return;
+      }
+      newEnd = postponedEnd
+        ? new Date(postponedEnd)
+        : new Date(
+            newDate.getTime() +
+              (meeting.endTime.getTime() - meeting.startTime.getTime()),
+          );
+      if (Number.isNaN(newEnd.getTime()) || newEnd <= newDate) {
+        res.status(400).json({
+          success: false,
+          message: "postponedEnd must be after postponedTo",
+        });
+        return;
+      }
+
+      // Same conflict check as creating/editing a meeting at that time.
+      const participantIds = [
+        idOf(meeting.organizer),
+        ...meeting.attendees.map((a) => idOf(a.userId)),
+      ];
+      const conflicts = await checkConflicts(
+        participantIds,
+        newDate,
+        newEnd,
+        String(meeting._id),
+      );
+      if (conflicts.length > 0 && !force) {
+        const suggestions = await suggestAvailableSlots(
+          participantIds,
+          Math.round((newEnd.getTime() - newDate.getTime()) / 60_000),
+          newDate,
+        );
+        res.status(409).json({
+          success: false,
+          message: "One or more participants have a scheduling conflict",
+          data: { conflicts, suggestions },
+        });
+        return;
+      }
+    }
+    const trimmedReason = reason?.trim() || undefined;
+
+    meeting.status = "postponed";
+    meeting.postponedTo = newDate;
+    meeting.postponementReason = trimmedReason;
+    await meeting.save();
+
+    // A new date was given: put the meeting on the calendar at that time
+    // right away. The original stays behind as the "Postponed to <date>"
+    // marker and points at the new one. Attendees get one email (the
+    // postponement notice below), not a second invitation.
+    let newMeeting: IMeeting | undefined;
+    if (newDate && newEnd) {
+      // A generated Zoho Meeting link dies with the Zoho event removed
+      // below, so it isn't carried over; hand-pasted links are.
+      const keepLink = meeting.conferenceProvider !== "zoho_meeting";
+      newMeeting = await MeetingModel.create({
+        title: meeting.title,
+        description: meeting.description,
+        agenda: meeting.agenda,
+        organizer: meeting.organizer,
+        attendees: meeting.attendees.map((a) => ({
+          userId: a.userId,
+          status: "pending" as RsvpStatus,
+          invitedAt: new Date(),
+        })),
+        externalAttendees: meeting.externalAttendees,
+        startTime: newDate,
+        endTime: newEnd,
+        location: meeting.location,
+        meetingLink: keepLink ? meeting.meetingLink : undefined,
+        conferenceProvider: keepLink ? meeting.conferenceProvider : undefined,
+        targetDepartments: meeting.targetDepartments,
+        organizationWide: meeting.organizationWide,
+        reminderMinutesBefore: meeting.reminderMinutesBefore,
+        clientId: meeting.clientId,
+      });
+      meeting.postponedToMeetingId = newMeeting._id;
+      await meeting.save();
+    }
+
+    // The Zoho event no longer reflects reality; drop it. Scheduling the
+    // meeting again (edit flow) creates a fresh one. Awaited — see the
+    // update path above.
+    await removeMeetingsFromZoho([meeting], idOf(meeting.organizer));
+    if (meeting.calendarEventUid) {
+      await MeetingModel.updateOne(
+        { _id: meeting._id },
+        { $unset: { calendarEventUid: "", calendarEventEtag: "" } },
+      );
+    }
+
+    if (newMeeting) {
+      await pushNewMeetingsToZoho([newMeeting], idOf(meeting.organizer));
+    }
+
+    const organizerUser = await User.findById(meeting.organizer)
+      .select("name email")
+      .lean();
+    const newDateLabel = newDate
+      ? newDate.toLocaleString([], { dateStyle: "medium", timeStyle: "short" })
+      : undefined;
+    const notifyIds = meeting.attendees.map((a) => idOf(a.userId));
+    await Promise.all(
+      notifyIds.map((userId) =>
+        createNotification(
+          userId,
+          `${organizerUser?.name ?? "The organizer"} postponed the meeting "${meeting.title}"${
+            newDateLabel ? ` to ${newDateLabel}` : ""
+          }`,
+          "meeting_postponed",
+          {
+            meetingId: String(meeting._id),
+            title: meeting.title,
+            postponedTo: newDate,
+            reason: trimmedReason,
+            newMeetingId: newMeeting ? String(newMeeting._id) : undefined,
+          },
+        ),
+      ),
+    );
+
+    // Email everyone tagged — internal + external attendees. A failure
+    // here is logged but never fails the postponement itself.
+    await (async () => {
+      const invitedUsers = await User.find({ _id: { $in: notifyIds } })
+        .select("name email")
+        .lean();
+      const recipients = [
+        ...invitedUsers
+          .filter((u) => u.email)
+          .map((u) => ({
+            toEmail: u.email as string,
+            toName: u.name,
+            isExternal: false,
+          })),
+        ...meeting.externalAttendees.map((e) => ({
+          toEmail: e.email,
+          toName: e.name ?? e.email,
+          isExternal: true,
+        })),
+      ];
+      await Promise.all(
+        recipients.map((r) =>
+          sendMeetingPostponedEmail({
+            toEmail: r.toEmail,
+            toName: r.toName,
+            isExternal: r.isExternal,
+            meetingId: String(meeting._id),
+            title: meeting.title,
+            organizerName: organizerUser?.name ?? "A colleague",
+            startTime: meeting.startTime,
+            endTime: meeting.endTime,
+            postponedTo: newDate,
+            reason: trimmedReason,
+          }),
+        ),
+      );
+    })().catch((err) =>
+      console.error("Meeting postponement email batch failed:", err),
+    );
+
+    await logMeetingActivity({
+      meetingId: meeting._id,
+      seriesId: meeting.seriesId,
+      clientId: meeting.clientId,
+      actorId: req.user!.userId,
+      action: "meeting_postponed",
+      message: `${organizerUser?.name ?? "The organizer"} postponed "${meeting.title}"${
+        newDateLabel ? ` to ${newDateLabel}` : ""
+      }${trimmedReason ? ` — ${trimmedReason}` : ""}`,
+      details: { postponedTo: newDate, reason: trimmedReason },
+    });
+    if (newMeeting) {
+      await logMeetingActivity({
+        meetingId: newMeeting._id,
+        seriesId: newMeeting.seriesId,
+        clientId: newMeeting.clientId,
+        actorId: req.user!.userId,
+        action: "meeting_created",
+        message: `${organizerUser?.name ?? "The organizer"} moved "${meeting.title}" here from ${meeting.startTime.toLocaleString()} (postponed)`,
+        details: { postponedFromMeetingId: String(meeting._id) },
+      });
+    }
+
+    const populated = await populateMeeting(MeetingModel.findById(meeting._id));
+    res.json({
+      success: true,
+      message: "Meeting postponed",
+      data: {
+        meeting: populated,
+        newMeeting: newMeeting
+          ? await populateMeeting(MeetingModel.findById(newMeeting._id))
+          : undefined,
+      },
     });
   } catch (err) {
     next(err);
