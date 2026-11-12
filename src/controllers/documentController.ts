@@ -845,9 +845,11 @@ export const getDocuments = async (
     // compatible with normal pagination — unlike filtering after the
     // page is fetched, the totals/pagination stay accurate.
     if (readStatus === "read" || readStatus === "unread") {
-      const readIds = await DocumentReadModel.find({ user: uid }).distinct(
-        "documentId",
-      );
+      // Only completed reads count — merely opening a material doesn't.
+      const readIds = await DocumentReadModel.find({
+        user: uid,
+        ...COMPLETED_READ,
+      }).distinct("documentId");
       filter["_id"] =
         readStatus === "read" ? { $in: readIds } : { $nin: readIds };
     }
@@ -905,21 +907,41 @@ export const getDocuments = async (
             documentId: { $in: docIds },
             user: uid,
           })
-            .select("documentId")
+            .select("documentId status")
             .lean(),
           DocumentReadModel.aggregate([
-            { $match: { documentId: { $in: docIds } } },
+            {
+              $match: {
+                documentId: { $in: docIds },
+                ...COMPLETED_READ,
+              },
+            },
             { $group: { _id: "$documentId", count: { $sum: 1 } } },
           ]),
         ])
       : [[], []];
-    const myReadSet = new Set(myReads.map((r) => r.documentId.toString()));
+    const myReadSet = new Set(
+      myReads
+        .filter((r) => (r as { status?: string }).status !== "opened")
+        .map((r) => r.documentId.toString()),
+    );
+    const myOpenedSet = new Set(
+      myReads
+        .filter((r) => (r as { status?: string }).status === "opened")
+        .map((r) => r.documentId.toString()),
+    );
     const readerCountMap = new Map(
       readerCounts.map((r) => [r._id.toString(), r.count as number]),
     );
     const documentsWithReadState = documents.map((d) => ({
       ...d,
       hasRead: myReadSet.has(d._id.toString()),
+      // "opened" = loaded or downloaded but not yet genuinely read.
+      readStatus: myReadSet.has(d._id.toString())
+        ? "read"
+        : myOpenedSet.has(d._id.toString())
+          ? "opened"
+          : "unread",
       readerCount: readerCountMap.get(d._id.toString()) ?? 0,
     }));
 
@@ -982,21 +1004,196 @@ export const getDocument = async (
         documentId: doc._id,
         user: req.user!.userId,
       }).lean(),
-      DocumentReadModel.countDocuments({ documentId: doc._id }),
+      DocumentReadModel.countDocuments({
+        documentId: doc._id,
+        ...COMPLETED_READ,
+      }),
     ]);
+    const progress = readProgressSummary(myRead as ReadRow, doc);
 
     res.json({
       success: true,
       data: {
         document: {
           ...attachSignedUrls(doc),
-          hasRead: !!myRead,
+          hasRead: progress.status === "read",
+          readProgress: progress,
           readerCount,
         },
       },
     });
   } catch (err) {
     next(err);
+  }
+};
+
+/**
+ * Records that `userId` has read a document (creates the read receipt the
+ * first time, otherwise refreshes lastReadAt). Shared by the explicit
+ * "mark read" endpoint and by every route that actually serves the file
+ * (preview / download), so a non-learning document keeps its receipt however the
+ * person opens it. `increment` bumps readCount — off for the implicit paths
+ * so re-opening a preview doesn't inflate the number.
+ */
+const recordDocumentRead = async (
+  documentId: mongoose.Types.ObjectId | string,
+  userId: string,
+  increment: boolean,
+) => {
+  const now = new Date();
+  const touch = {
+    $set: { lastReadAt: now },
+    ...(increment ? { $inc: { readCount: 1 } } : {}),
+  };
+  const existing = await DocumentReadModel.findOne({
+    documentId,
+    user: userId,
+  });
+  if (existing) {
+    return DocumentReadModel.findByIdAndUpdate(existing._id, touch, {
+      new: true,
+    });
+  }
+  try {
+    return await DocumentReadModel.create({
+      documentId,
+      user: userId,
+      firstReadAt: now,
+      lastReadAt: now,
+      readCount: 1,
+    });
+  } catch (createErr: any) {
+    // Two near-simultaneous first-reads both missed `existing` — the unique
+    // (documentId, user) index rejected the second insert. Update the row
+    // the other request won.
+    if (createErr?.code === 11000) {
+      return DocumentReadModel.findOneAndUpdate(
+        { documentId, user: userId },
+        touch,
+        { new: true },
+      );
+    }
+    throw createErr;
+  }
+};
+
+// ── Read tracking rules ───────────────────────────────────────────
+// Opening a learning material is NOT the same as reading it. A row is
+// "opened" until the person has spent enough active time with it (measured
+// on the server from heartbeats, so it can't be faked with one request) and,
+// where the viewer can measure scrolling, reached the end. They can also
+// confirm they've read it once they've given it at least half the expected
+// time. Legacy rows have no status and count as read.
+const COMPLETED_READ = { status: { $ne: "opened" } } as const;
+const MAX_HEARTBEAT_SECONDS = 15; // most active time one heartbeat can add
+const MIN_CONFIRM_SECONDS = 10; // floor for the manual "mark as read"
+const CONFIRM_FRACTION = 0.5; // share of the required time before confirming
+const SCROLL_COMPLETE_PCT = 80; // how far down counts as "got to the end"
+
+/** Seconds of active reading a document warrants, from its size/length. */
+const requiredReadSeconds = (doc: {
+  contentText?: string;
+  fileSize?: number;
+}): number => {
+  const words = doc.contentText
+    ? doc.contentText.trim().split(/\s+/).length
+    : 0;
+  // ~40% of a 250 wpm read: enough to rule out opening and leaving, without
+  // forcing people through every word of long material.
+  if (words > 0) return Math.min(240, Math.max(20, Math.round((words / 250) * 60 * 0.4)));
+  const mb = (doc.fileSize ?? 0) / (1024 * 1024);
+  return Math.min(180, Math.max(20, Math.round(15 + mb * 20)));
+};
+
+type ReadRow = {
+  status?: string;
+  activeSeconds?: number;
+  maxScrollPct?: number;
+  scrollTracked?: boolean;
+  downloaded?: boolean;
+} | null;
+
+/** The reading-progress summary the UI renders. */
+const readProgressSummary = (
+  row: ReadRow,
+  doc: { contentText?: string; fileSize?: number },
+) => {
+  const requiredSeconds = requiredReadSeconds(doc);
+  const status: "unread" | "opened" | "read" = !row
+    ? "unread"
+    : row.status === "opened"
+      ? "opened"
+      : "read";
+  const activeSeconds = Math.round(row?.activeSeconds ?? 0);
+  return {
+    status,
+    activeSeconds,
+    requiredSeconds,
+    scrollTracked: !!row?.scrollTracked,
+    maxScrollPct: Math.round(row?.maxScrollPct ?? 0),
+    canConfirm:
+      status === "opened" &&
+      (!!row?.downloaded ||
+        activeSeconds >=
+          Math.max(MIN_CONFIRM_SECONDS, requiredSeconds * CONFIRM_FRACTION)),
+  };
+};
+
+/**
+ * Record that a learning material was opened/downloaded — without counting
+ * it as read. Creates an "opened" row if there isn't one; never downgrades
+ * a completed read.
+ */
+const recordDocumentOpened = async (
+  documentId: mongoose.Types.ObjectId | string,
+  userId: string,
+  downloaded = false,
+) => {
+  const now = new Date();
+  const update = {
+    $set: { lastReadAt: now, ...(downloaded ? { downloaded: true } : {}) },
+    $setOnInsert: {
+      status: "opened",
+      firstReadAt: now,
+      readCount: 1,
+      activeSeconds: 0,
+    },
+  };
+  try {
+    return await DocumentReadModel.findOneAndUpdate(
+      { documentId, user: userId },
+      update,
+      { new: true, upsert: true },
+    );
+  } catch (err: any) {
+    if (err?.code === 11000) {
+      return DocumentReadModel.findOneAndUpdate(
+        { documentId, user: userId },
+        { $set: update.$set },
+        { new: true },
+      );
+    }
+    throw err;
+  }
+};
+
+/**
+ * Best-effort open tracking for learning materials: never blocks or fails
+ * the request that served the file. Previewing or downloading only marks the
+ * material "opened"; it becomes "read" through reading progress.
+ */
+const markLearningReadQuietly = async (
+  doc: { _id: mongoose.Types.ObjectId | string; documentType?: string },
+  userId: string,
+  downloaded = false,
+) => {
+  if (doc.documentType !== "learning") return;
+  try {
+    // Serving the file only counts as "opened" — see the read tracking rules.
+    await recordDocumentOpened(doc._id, userId, downloaded);
+    await invalidateCache(userId);
+  } catch (err) {
+    console.error("implicit open tracking failed:", err);
   }
 };
 
@@ -1015,7 +1212,7 @@ export const markDocumentRead = async (
 ): Promise<void> => {
   try {
     const doc = await DocumentModel.findById(req.params.id).select(
-      "ownerId supervisorId documentType _id",
+      "ownerId supervisorId documentType _id contentText fileSize",
     );
     if (!doc) {
       res.status(404).json({ success: false, message: "Document not found" });
@@ -1032,54 +1229,178 @@ export const markDocumentRead = async (
       return;
     }
 
-    const now = new Date();
-    const existing = await DocumentReadModel.findOne({
-      documentId: doc._id,
-      user: req.user!.userId,
-    });
-
-    let read;
-    if (existing) {
-      read = await DocumentReadModel.findByIdAndUpdate(
-        existing._id,
-        { $set: { lastReadAt: now }, $inc: { readCount: 1 } },
+    // Learning material: this is the person confirming they've read it, and
+    // it only counts once they've spent a reasonable amount of time with it.
+    if (doc.documentType === "learning") {
+      const row = await DocumentReadModel.findOne({
+        documentId: doc._id,
+        user: req.user!.userId,
+      });
+      const progress = readProgressSummary(row as ReadRow, doc);
+      if (progress.status === "read") {
+        const readerCount = await DocumentReadModel.countDocuments({
+          documentId: doc._id,
+          ...COMPLETED_READ,
+        });
+        res.json({
+          success: true,
+          message: "Already marked as read",
+          data: { read: row, readerCount, progress },
+        });
+        return;
+      }
+      if (!progress.canConfirm) {
+        res.status(409).json({
+          success: false,
+          message:
+            "Spend a little more time with this material before marking it as read",
+          data: { progress },
+        });
+        return;
+      }
+      const read = await DocumentReadModel.findOneAndUpdate(
+        { documentId: doc._id, user: req.user!.userId },
+        {
+          $set: {
+            status: "read",
+            completedAt: new Date(),
+            completionMethod: "confirmed",
+            lastReadAt: new Date(),
+          },
+          $inc: { readCount: 1 },
+        },
         { new: true },
       );
-    } else {
-      try {
-        read = await DocumentReadModel.create({
-          documentId: doc._id,
-          user: req.user!.userId,
-          firstReadAt: now,
-          lastReadAt: now,
-          readCount: 1,
-        });
-      } catch (createErr: any) {
-        // Two near-simultaneous first-reads both missed `existing` —
-        // the unique (documentId, user) index rejected the second
-        // insert. Fall back to updating the row the other request won.
-        if (createErr?.code === 11000) {
-          read = await DocumentReadModel.findOneAndUpdate(
-            { documentId: doc._id, user: req.user!.userId },
-            { $set: { lastReadAt: now }, $inc: { readCount: 1 } },
-            { new: true },
-          );
-        } else {
-          throw createErr;
-        }
-      }
+      await invalidateCache(req.user!.userId);
+      const readerCount = await DocumentReadModel.countDocuments({
+        documentId: doc._id,
+        ...COMPLETED_READ,
+      });
+      res.json({
+        success: true,
+        message: "Marked as read",
+        data: {
+          read,
+          readerCount,
+          progress: readProgressSummary(read as ReadRow, doc),
+        },
+      });
+      return;
     }
 
+    // Non-learning documents keep the simple receipt behaviour.
+    const read = await recordDocumentRead(doc._id, req.user!.userId, true);
     await invalidateCache(req.user!.userId);
-
     const readerCount = await DocumentReadModel.countDocuments({
       documentId: doc._id,
+      ...COMPLETED_READ,
     });
-
     res.json({
       success: true,
       message: "Marked as read",
       data: { read, readerCount },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────
+// READING PROGRESS (heartbeat)
+// The viewer calls this every few seconds while the person is actively
+// looking at a learning material (tab visible, recent activity). Time is
+// credited on the server — capped per beat and by the real time elapsed
+// since the last beat — so a material only becomes "read" through real
+// engagement, never by merely being opened. When enough active time has
+// built up (and the reader reached the end, where scrolling is measurable)
+// it completes automatically.
+// ─────────────────────────────────────────────────────────────────
+export const recordReadProgress = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const doc = await DocumentModel.findById(req.params.id).select(
+      "ownerId supervisorId documentType _id contentText fileSize",
+    );
+    if (!doc) {
+      res.status(404).json({ success: false, message: "Document not found" });
+      return;
+    }
+    const access = await canAccess(
+      doc as Parameters<typeof canAccess>[0],
+      req.user!.userId,
+      req.user!.role,
+    );
+    if (!access) {
+      res.status(403).json({ success: false, message: "Access denied" });
+      return;
+    }
+    if (doc.documentType !== "learning") {
+      res.json({ success: true, data: { progress: null } });
+      return;
+    }
+
+    const claimed = Number(req.body?.seconds);
+    const scrollRaw = req.body?.scrollPct;
+    const scrollPct =
+      typeof scrollRaw === "number" && Number.isFinite(scrollRaw)
+        ? Math.min(100, Math.max(0, scrollRaw))
+        : null;
+
+    let row = await DocumentReadModel.findOne({
+      documentId: doc._id,
+      user: req.user!.userId,
+    });
+    if (!row) {
+      row = await recordDocumentOpened(doc._id, req.user!.userId);
+    }
+    if (!row) {
+      res.status(500).json({ success: false, message: "Could not track reading" });
+      return;
+    }
+
+    if (row.status === "opened") {
+      const now = new Date();
+      const since = row.lastHeartbeatAt ?? row.lastReadAt ?? now;
+      const elapsed = Math.max(0, (now.getTime() - since.getTime()) / 1000);
+      const delta = Math.max(
+        0,
+        Math.min(
+          Number.isFinite(claimed) ? claimed : 0,
+          elapsed + 1, // can't credit more time than has actually passed
+          MAX_HEARTBEAT_SECONDS,
+        ),
+      );
+      row.activeSeconds = (row.activeSeconds ?? 0) + delta;
+      row.lastHeartbeatAt = now;
+      row.lastReadAt = now;
+      if (scrollPct !== null) {
+        row.scrollTracked = true;
+        row.maxScrollPct = Math.max(row.maxScrollPct ?? 0, scrollPct);
+      }
+
+      const required = requiredReadSeconds(doc);
+      const reachedEnd =
+        !row.scrollTracked || (row.maxScrollPct ?? 0) >= SCROLL_COMPLETE_PCT;
+      if (row.activeSeconds >= required && reachedEnd) {
+        row.status = "read";
+        row.completedAt = now;
+        row.completionMethod = "engagement";
+        row.readCount = (row.readCount ?? 0) + 1;
+      }
+      await row.save();
+      if (row.status === "read") await invalidateCache(req.user!.userId);
+    }
+
+    const readerCount = await DocumentReadModel.countDocuments({
+      documentId: doc._id,
+      ...COMPLETED_READ,
+    });
+    res.json({
+      success: true,
+      data: { progress: readProgressSummary(row as ReadRow, doc), readerCount },
     });
   } catch (err) {
     next(err);
@@ -1115,14 +1436,23 @@ export const getDocumentReaders = async (
       return;
     }
 
-    const reads = await DocumentReadModel.find({ documentId: doc._id })
-      .populate("user", "name email role")
-      .sort({ lastReadAt: -1 })
-      .lean();
+    // Only people who completed it are "readers"; people who merely opened
+    // it are reported as a count so owners can see who started but didn't
+    // finish.
+    const [reads, openedOnly] = await Promise.all([
+      DocumentReadModel.find({ documentId: doc._id, ...COMPLETED_READ })
+        .populate("user", "name email role")
+        .sort({ lastReadAt: -1 })
+        .lean(),
+      DocumentReadModel.countDocuments({
+        documentId: doc._id,
+        status: "opened",
+      }),
+    ]);
 
     res.json({
       success: true,
-      data: { readers: reads, total: reads.length },
+      data: { readers: reads, total: reads.length, openedOnly },
     });
   } catch (err) {
     next(err);
@@ -1900,6 +2230,9 @@ export const previewDocument = async (
       return;
     }
 
+    // Previewing a learning material only marks it "opened", not read.
+    await markLearningReadQuietly(doc, req.user!.userId);
+
     const mimeType = doc.fileType;
 
     // DOCX → HTML via mammoth (no LibreOffice)
@@ -1965,6 +2298,10 @@ export const downloadDocument = async (
       actorId: req.user!.userId,
       action: "downloaded",
     });
+
+    // Downloading a learning material only marks it "opened" (they may read it
+    // offline and confirm later) — it does not count as read by itself.
+    await markLearningReadQuietly(doc, req.user!.userId, true);
 
     const url = await getSignedFileUrl(doc.fileKey, {
       filename: doc.fileName,

@@ -3,8 +3,14 @@ import mongoose from "mongoose";
 /**
  * DocumentRead
  *
- * One row per (document, user) pair — records that a user has opened
- * a resource, when they first did so, and how many times they've
+ * One row per (document, user) pair. A row starts as "opened" (the person
+ * loaded or downloaded the material) and only becomes "read" once they have
+ * genuinely gone through it — enough active reading time (tracked on the
+ * server from heartbeats) and, where the viewer can measure it, scrolled to
+ * the end — or explicitly confirmed it after a minimum amount of time.
+ * Rows written before this field existed have no status and count as read.
+ *
+ * Records when they first did so, and how many times they've
  * been back. Primarily used by the Learning Library to show "who's
  * read this" and per-user completion state, but works for any
  * document type since read receipts aren't learning-specific.
@@ -37,6 +43,25 @@ const documentReadSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+    // "opened" = loaded/downloaded only; "read" = completed. Defaults to
+    // "read" so legacy rows (and non-learning documents) keep counting.
+    status: {
+      type: String,
+      enum: ["opened", "read"],
+      default: "read",
+    },
+    // Seconds of verified, active reading (visible tab + recent activity),
+    // accumulated server-side from heartbeats.
+    activeSeconds: { type: Number, default: 0 },
+    // Furthest scroll position reached (0–100), only meaningful when the
+    // viewer could measure scrolling (scrollTracked).
+    maxScrollPct: { type: Number, default: 0 },
+    scrollTracked: { type: Boolean, default: false },
+    lastHeartbeatAt: { type: Date },
+    // The file was downloaded — they may be reading it offline.
+    downloaded: { type: Boolean, default: false },
+    completedAt: { type: Date },
+    completionMethod: { type: String, enum: ["engagement", "confirmed"] },
     // Number of times markDocumentRead has been called for this pair
     // (i.e. distinct open events, not page renders).
     readCount: {

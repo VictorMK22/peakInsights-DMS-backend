@@ -21,6 +21,7 @@ import {
   updateComment,
   deleteComment,
   markDocumentRead,
+  recordReadProgress,
   getDocumentReaders,
   previewDocument,
   downloadDocument,
@@ -64,6 +65,7 @@ router.delete("/:id/comments/:commentId", deleteComment);
 
 // ── Read receipts ────────────────────────────────────────────────
 router.post("/:id/read", markDocumentRead);
+router.post("/:id/read-progress", recordReadProgress);
 router.get("/:id/reads", getDocumentReaders);
 
 // ── Utility ───────────────────────────────────────────────────────
