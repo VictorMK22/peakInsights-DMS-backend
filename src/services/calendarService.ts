@@ -3,6 +3,7 @@ import { MeetingModel } from "../models/Meeting";
 import { CalendarBlockModel } from "../models/CalendarBlock";
 import { User } from "../models/User";
 import { getZohoBusyWindows } from "./zohoCalendarService";
+import { toEatFrame, fromEatFrame } from "../utils/eatTime";
 
 // ─────────────────────────────────────────────────────────────────
 // Shared shapes
@@ -182,7 +183,7 @@ export const checkConflicts = async (
 
 /**
  * Scans forward from `searchFrom` (defaults to now) across working
- * hours (08:00–18:00, Mon–Fri) looking for windows of `durationMinutes`
+ * hours (08:00–18:00 EAT, Mon–Fri) looking for windows of `durationMinutes`
  * where none of `userIds` have a conflict. Returns up to
  * MAX_SUGGESTIONS candidate slots.
  */
@@ -192,8 +193,14 @@ export const suggestAvailableSlots = async (
   searchFrom: Date = new Date(),
 ): Promise<SuggestedSlot[]> => {
   const uniqueIds = [...new Set(userIds)];
-  const rangeEnd = new Date(searchFrom);
-  rangeEnd.setDate(rangeEnd.getDate() + SUGGESTION_SEARCH_DAYS);
+  // Working hours and weekdays are East Africa Time. All the walking below
+  // happens on EAT "frame" dates (local getters read as EAT wall-clock) so
+  // it's correct whatever timezone the server runs in; slots are converted
+  // back to real instants when they're emitted.
+  const frameFrom = toEatFrame(searchFrom);
+  const frameRangeEnd = new Date(frameFrom);
+  frameRangeEnd.setDate(frameRangeEnd.getDate() + SUGGESTION_SEARCH_DAYS);
+  const rangeEnd = fromEatFrame(frameRangeEnd);
 
   // Pull every user's busy intervals once for the whole search window,
   // rather than re-querying per candidate slot.
@@ -206,14 +213,14 @@ export const suggestAvailableSlots = async (
   }
 
   const suggestions: SuggestedSlot[] = [];
-  const cursor = new Date(searchFrom);
+  const cursor = new Date(frameFrom);
   // Round up to the next SLOT_STEP_MINUTES boundary.
   cursor.setSeconds(0, 0);
   const remainder = cursor.getMinutes() % SLOT_STEP_MINUTES;
   if (remainder !== 0)
     cursor.setMinutes(cursor.getMinutes() + (SLOT_STEP_MINUTES - remainder));
 
-  while (cursor < rangeEnd && suggestions.length < MAX_SUGGESTIONS) {
+  while (cursor < frameRangeEnd && suggestions.length < MAX_SUGGESTIONS) {
     const day = cursor.getDay();
     const hour = cursor.getHours();
 
@@ -230,13 +237,15 @@ export const suggestAvailableSlots = async (
       continue;
     }
 
-    const slotStart = new Date(cursor);
-    const slotEnd = new Date(cursor.getTime() + durationMinutes * 60_000);
+    const slotStartFrame = new Date(cursor);
+    const slotEndFrame = new Date(cursor.getTime() + durationMinutes * 60_000);
+    const slotStart = fromEatFrame(slotStartFrame);
+    const slotEnd = fromEatFrame(slotEndFrame);
 
     // Slot must finish before the work day ends.
     const workEndToday = new Date(cursor);
     workEndToday.setHours(WORK_DAY_END_HOUR, 0, 0, 0);
-    if (slotEnd > workEndToday) {
+    if (slotEndFrame > workEndToday) {
       cursor.setDate(cursor.getDate() + (day === 5 ? 3 : 1));
       cursor.setHours(WORK_DAY_START_HOUR, 0, 0, 0);
       continue;
@@ -275,7 +284,7 @@ export interface RecurrenceRuleInput {
 
 const MAX_OCCURRENCES = 52;
 
-export const expandRecurrence = (
+const expandRecurrenceInFrame = (
   firstStart: Date,
   firstEnd: Date,
   rule: RecurrenceRuleInput,
@@ -352,6 +361,28 @@ export const expandRecurrence = (
   return occurrences.length > 0
     ? occurrences
     : [{ startTime: firstStart, endTime: firstEnd }];
+};
+
+/**
+ * Recurrence is evaluated in East Africa Time so "every Monday at 09:00"
+ * means 09:00 EAT on Mondays EAT, regardless of the server's timezone.
+ */
+export const expandRecurrence = (
+  firstStart: Date,
+  firstEnd: Date,
+  rule: RecurrenceRuleInput,
+): { startTime: Date; endTime: Date }[] => {
+  const frameRule: RecurrenceRuleInput = rule?.endDate
+    ? { ...rule, endDate: toEatFrame(new Date(rule.endDate)) }
+    : rule;
+  return expandRecurrenceInFrame(
+    toEatFrame(firstStart),
+    toEatFrame(firstEnd),
+    frameRule,
+  ).map((o) => ({
+    startTime: fromEatFrame(o.startTime),
+    endTime: fromEatFrame(o.endTime),
+  }));
 };
 
 export const newSeriesId = (): mongoose.Types.ObjectId =>

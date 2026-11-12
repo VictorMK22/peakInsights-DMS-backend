@@ -20,6 +20,7 @@
 
 import crypto from "crypto";
 import { Resend } from "resend";
+import { formatEatDateTime, formatEatWindow } from "../utils/eatTime";
 
 /** What a successful send hands back to callers. */
 interface SentMessageInfo {
@@ -670,10 +671,7 @@ interface MeetingEmailData {
 }
 
 const formatMeetingWindow = (start: Date, end: Date) =>
-  `${start.toLocaleString([], { dateStyle: "medium", timeStyle: "short" })} – ${end.toLocaleTimeString(
-    [],
-    { timeStyle: "short" },
-  )}`;
+  formatEatWindow(start, end);
 
 /** Sent to every internal + external invitee when a meeting is created. */
 export async function sendMeetingInviteEmail(
@@ -752,10 +750,7 @@ export async function sendMeetingPostponedEmail(
         data.postponedTo
           ? info(
               "Postponed to",
-              data.postponedTo.toLocaleString([], {
-                dateStyle: "medium",
-                timeStyle: "short",
-              }),
+              formatEatDateTime(data.postponedTo),
             )
           : info("Postponed to", "New date to be confirmed")
       }

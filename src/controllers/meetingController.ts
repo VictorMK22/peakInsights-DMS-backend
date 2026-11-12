@@ -33,6 +33,7 @@ import {
   deleteZohoEvent,
   zohoMeetingJoinLink,
 } from "../services/zohoCalendarService";
+import { formatEatDateTime, formatEatTime } from "../utils/eatTime";
 
 // A recurring series is capped so "invite everyone, repeat forever"
 // can't silently generate an unbounded number of documents — see
@@ -274,7 +275,7 @@ export const createMeeting = async (
           userId,
           `${organizerUser?.name ?? "Someone"} invited you to "${title}"${
             isSeries ? " (recurring)" : ""
-          } on ${start.toLocaleString()}`,
+          } on ${formatEatDateTime(start)}`,
           "meeting_invite",
           {
             meetingId: String(firstMeeting._id),
@@ -345,7 +346,7 @@ export const createMeeting = async (
       action: "meeting_created",
       message: `${organizerUser?.name ?? "Someone"} scheduled "${title}"${
         isSeries ? ` (recurring, ${created.length} occurrence(s))` : ""
-      } for ${start.toLocaleString()}`,
+      } for ${formatEatDateTime(start)}`,
       details: {
         attendeeCount: resolvedAttendeeIds.length,
         externalAttendeeCount: cleanExternalAttendees.length,
@@ -997,7 +998,7 @@ export const updateMeeting = async (
       actorId: req.user!.userId,
       action: timeChanged ? "meeting_rescheduled" : "meeting_updated",
       message: timeChanged
-        ? `${organizerUser?.name ?? "The organizer"} ${wasPostponed ? "set a new time for the postponed meeting" : "rescheduled"} "${meeting.title}" to ${meeting.startTime.toLocaleString()}${trimmedComment ? ` — "${trimmedComment}"` : ""}`
+        ? `${organizerUser?.name ?? "The organizer"} ${wasPostponed ? "set a new time for the postponed meeting" : "rescheduled"} "${meeting.title}" to ${formatEatDateTime(meeting.startTime)}${trimmedComment ? ` — "${trimmedComment}"` : ""}`
         : `${organizerUser?.name ?? "The organizer"} updated "${meeting.title}"`,
       details: trimmedComment ? { comment: trimmedComment } : undefined,
     });
@@ -1189,7 +1190,7 @@ export const postponeMeeting = async (
       .select("name email")
       .lean();
     const newDateLabel = newDate
-      ? newDate.toLocaleString([], { dateStyle: "medium", timeStyle: "short" })
+      ? formatEatDateTime(newDate)
       : undefined;
     const notifyIds = meeting.attendees.map((a) => idOf(a.userId));
     await Promise.all(
@@ -1269,7 +1270,7 @@ export const postponeMeeting = async (
         clientId: newMeeting.clientId,
         actorId: req.user!.userId,
         action: "meeting_created",
-        message: `${organizerUser?.name ?? "The organizer"} moved "${meeting.title}" here from ${meeting.startTime.toLocaleString()} (postponed)`,
+        message: `${organizerUser?.name ?? "The organizer"} moved "${meeting.title}" here from ${formatEatDateTime(meeting.startTime)} (postponed)`,
         details: { postponedFromMeetingId: String(meeting._id) },
       });
     }
@@ -1539,13 +1540,7 @@ export const runMeetingReminderSweep = async (): Promise<{ sent: number }> => {
       [...new Set(recipientIds)].map((userId) =>
         createNotification(
           userId,
-          `Reminder: "${meeting.title}" starts at ${meeting.startTime.toLocaleTimeString(
-            [],
-            {
-              hour: "2-digit",
-              minute: "2-digit",
-            },
-          )}`,
+          `Reminder: "${meeting.title}" starts at ${formatEatTime(meeting.startTime)}`,
           "meeting_reminder",
           {
             meetingId: String(meeting._id),
