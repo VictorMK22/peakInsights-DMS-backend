@@ -100,6 +100,12 @@ const TECH_DEPARTMENTS = (
   .map((d) => d.trim().toLowerCase())
   .filter(Boolean);
 
+/** True when a (free-text) department name counts as Tech. */
+export const isTechDepartmentName = (dept?: string | null): boolean => {
+  const d = dept?.trim().toLowerCase();
+  return !!d && TECH_DEPARTMENTS.includes(d);
+};
+
 /**
  * Allows the CEO, plus supervisors whose own department is Tech.
  * Every other supervisor (and every other role) gets a 403.

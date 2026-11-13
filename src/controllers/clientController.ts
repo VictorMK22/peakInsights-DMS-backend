@@ -512,14 +512,13 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
   }
 };
 
-// CEO may delete any client. A sales person may delete only the leads they
-// created themselves, and only while they have not been won (once won, the
-// CEO allocates an accountant and the client is no longer the BD's to remove).
+// Only the CEO may delete a client. Sales persons (and everyone else) are
+// denied, including for leads they added themselves.
 export const deleteClient = async (req: AuthRequest, res: Response) => {
-  if (!isCEO(req) && !isSalesPerson(req))
+  if (!isCEO(req))
     return res.status(403).json({
       success: false,
-      message: "You do not have permission to delete clients",
+      message: "Only the CEO can delete clients",
     });
   try {
     const client = await ClientModel.findById(req.params.id).select(
@@ -529,19 +528,6 @@ export const deleteClient = async (req: AuthRequest, res: Response) => {
       return res
         .status(404)
         .json({ success: false, message: "Client not found" });
-
-    if (!isCEO(req)) {
-      if (client.createdBy?.toString() !== req.user!.userId)
-        return res.status(403).json({
-          success: false,
-          message: "You can only delete clients you added",
-        });
-      if (client.salesStage === "won")
-        return res.status(403).json({
-          success: false,
-          message: "Won clients can no longer be deleted",
-        });
-    }
 
     await ClientModel.findByIdAndDelete(req.params.id);
     await ClientEmailModel.deleteMany({ clientId: req.params.id });

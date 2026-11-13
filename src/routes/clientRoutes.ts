@@ -43,6 +43,13 @@ import {
   resendClientWhatsappMessage,
   deleteClientWhatsappMessage,
 } from "../controllers/clientWhatsappController";
+import {
+  getClientExtraInfo,
+  createClientExtraField,
+  updateClientExtraField,
+  deleteClientExtraField,
+  revealClientExtraField,
+} from "../controllers/clientExtraInfoController";
 
 const router = Router();
 
@@ -140,6 +147,14 @@ router.delete("/:id/calls/:callId", deleteClientCall);
 // client. Create/update tasks via the normal /tasks endpoints (pass
 // clientId in the body to link them here).
 router.get("/:id/tasks", getClientTasks);
+
+// Extra info (iTax / eTIMS logins, etc.) — won/existing clients only;
+// CEO, assigned accountant(s) and the winning sales person (see controller)
+router.get("/:id/extra-info", getClientExtraInfo);
+router.post("/:id/extra-info", createClientExtraField);
+router.put("/:id/extra-info/:fieldId", updateClientExtraField);
+router.delete("/:id/extra-info/:fieldId", deleteClientExtraField);
+router.get("/:id/extra-info/:fieldId/reveal", revealClientExtraField);
 
 // Linked working documents
 router.get("/:id/documents", getClientDocuments);
