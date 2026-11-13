@@ -11,6 +11,7 @@ import { SupervisorMapping } from "../models/SupervisorMapping";
 import { sendDirectUserEmail } from "../services/emailService";
 import { getLocalFileUrl } from "../middleware/upload";
 import { createNotification } from "../services/notificationService";
+import { getAccountantSupervisorIds } from "../utils/accountantSupervisors";
 import mongoose from "mongoose";
 import * as XLSX from "xlsx";
 
@@ -32,6 +33,17 @@ const isSalesPerson = (r: AuthRequest) => r.user!.role === "sales_person";
 const addsProspect = (r: AuthRequest) =>
   isSalesPerson(r) ||
   (isCEO(r) && (r.body?.asLead === true || r.body?.asLead === "true"));
+
+/**
+ * Who may serve an existing / won client: an accountant or an accountant
+ * supervisor (the CEO is also allowed, but that check needs the caller's id,
+ * so each caller handles "self" itself).
+ */
+const canServeClient = (
+  role: string,
+  id: string,
+  accountantSupervisorIds: Set<string>,
+) => role === "accountant" || accountantSupervisorIds.has(id);
 
 /** Attach fresh short-lived signed URLs to a set of stored attachments. */
 const withSignedAttachmentUrls = (attachments: IClientEmailAttachment[] = []) =>
@@ -568,11 +580,11 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
 
     // Who may be newly assigned depends on what the client is:
     //   prospect (still in the pipeline)  → sales people
-    //   existing / won client             → accountants
+    //   existing / won client             → accountants and accountant
+    //                                       supervisors
     // and in both cases the CEO may assign THEMSELF. People already on the
     // client (e.g. the sales person who won it) are kept as they are.
     const prospect = current.isSalesLead && current.salesStage !== "won";
-    const allowedRole = prospect ? "sales_person" : "accountant";
     const already = new Set(current.assignedTo.map((id) => id.toString()));
     const newIds = [...new Set(userIds.map(String))].filter(
       (id) => !already.has(id),
@@ -580,17 +592,23 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
     const found = await User.find({ _id: { $in: newIds } })
       .select("role isActive")
       .lean();
+    const supervisorIds = prospect
+      ? new Set<string>()
+      : await getAccountantSupervisorIds();
     const invalid = newIds.some((id) => {
       const u = found.find((f) => String(f._id) === id);
-      const isSelf = id === req.user!.userId && u?.role === "ceo";
-      return !u || !u.isActive || (u.role !== allowedRole && !isSelf);
+      if (!u || !u.isActive) return true;
+      if (id === req.user!.userId && u.role === "ceo") return false; // self
+      return prospect
+        ? u.role !== "sales_person"
+        : !canServeClient(u.role, id, supervisorIds);
     });
     if (invalid)
       return res.status(400).json({
         success: false,
         message: prospect
           ? "A prospect can only be assigned to sales people (or yourself)"
-          : "A client can only be assigned to accountants (or yourself)",
+          : "A client can only be assigned to accountants, accountant supervisors (or yourself)",
       });
 
     const client = await ClientModel.findByIdAndUpdate(
@@ -607,6 +625,164 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
     res.json({ success: true, data: { client } });
     return;
   } catch (err) {
+    res.status(500).json({ success: false });
+    return;
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
+// BULK ASSIGNMENT  POST /clients/bulk-assign  { clientIds, userIds }
+// CEO picks several won / existing clients and puts the chosen accountants
+// / accountant supervisors (or themself) on all of them at once.
+//
+// It only ADDS people: everyone already on a client (including the sales
+// person who won it) stays, because the selected clients each have a
+// different set of assignees. Use the per-client assign to remove someone.
+//
+// A won prospect that has no allocated accountant yet also gets the FIRST
+// person in `userIds` as its allocated accountant, so it stops showing as
+// "Awaiting accountant". One that already has one keeps it.
+// ═══════════════════════════════════════════════════════════════
+
+const BULK_ASSIGN_MAX_CLIENTS = 200;
+
+export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
+  if (!isCEO(req))
+    return res
+      .status(403)
+      .json({ success: false, message: "Only CEO can assign clients" });
+  try {
+    const { clientIds, userIds } = req.body as {
+      clientIds?: unknown;
+      userIds?: unknown;
+    };
+    if (!Array.isArray(clientIds) || clientIds.length === 0)
+      return res
+        .status(400)
+        .json({ success: false, message: "Select at least one client" });
+    if (!Array.isArray(userIds) || userIds.length === 0)
+      return res.status(400).json({
+        success: false,
+        message: "Choose at least one person to assign",
+      });
+    const validId = (id: unknown): id is string =>
+      typeof id === "string" && mongoose.Types.ObjectId.isValid(id);
+    if (!clientIds.every(validId) || !userIds.every(validId))
+      return res
+        .status(400)
+        .json({ success: false, message: "Contains an invalid id" });
+
+    const uniqueClientIds = [...new Set(clientIds as string[])];
+    const uniqueUserIds = [...new Set(userIds as string[])];
+    if (uniqueClientIds.length > BULK_ASSIGN_MAX_CLIENTS)
+      return res.status(400).json({
+        success: false,
+        message: `You can assign up to ${BULK_ASSIGN_MAX_CLIENTS} clients at a time`,
+      });
+
+    const [clients, people, supervisorIds] = await Promise.all([
+      ClientModel.find({ _id: { $in: uniqueClientIds } }).select(
+        "name assignedTo isSalesLead salesStage allocatedAccountant",
+      ),
+      User.find({ _id: { $in: uniqueUserIds } })
+        .select("role isActive")
+        .lean(),
+      getAccountantSupervisorIds(),
+    ]);
+
+    if (clients.length !== uniqueClientIds.length)
+      return res.status(404).json({
+        success: false,
+        message: "Some of the selected clients no longer exist",
+      });
+    if (clients.some((c) => c.isSalesLead && c.salesStage !== "won"))
+      return res.status(400).json({
+        success: false,
+        message:
+          "Prospects can't be assigned here — select won or existing clients only",
+      });
+
+    const invalidPerson = uniqueUserIds.some((id) => {
+      const u = people.find((p) => String(p._id) === id);
+      if (!u || !u.isActive) return true;
+      if (id === req.user!.userId && u.role === "ceo") return false; // self
+      return !canServeClient(u.role, id, supervisorIds);
+    });
+    if (invalidPerson)
+      return res.status(400).json({
+        success: false,
+        message:
+          "Clients can only be assigned to accountants, accountant supervisors (or yourself)",
+      });
+
+    const toObjectId = (id: string) => new mongoose.Types.ObjectId(id);
+    const now = new Date();
+    const primaryId = uniqueUserIds[0];
+    const ops: mongoose.AnyBulkWriteOperation<any>[] = [];
+    const newlyAssigned = new Map<string, { id: string; name: string }[]>();
+    let alreadyAssigned = 0;
+
+    for (const c of clients) {
+      const have = new Set(c.assignedTo.map((id) => id.toString()));
+      const added = uniqueUserIds.filter((id) => !have.has(id));
+      const needsAllocation =
+        !!c.isSalesLead && c.salesStage === "won" && !c.allocatedAccountant;
+      if (added.length === 0 && !needsAllocation) {
+        alreadyAssigned += 1;
+        continue;
+      }
+
+      const $set: Record<string, unknown> = {};
+      if (added.length > 0) $set.assignedAt = now;
+      if (needsAllocation) {
+        $set.allocatedAccountant = toObjectId(primaryId);
+        $set.allocatedAt = now;
+        $set.allocatedBy = toObjectId(req.user!.userId);
+      }
+      ops.push({
+        updateOne: {
+          filter: { _id: c._id },
+          update: {
+            $addToSet: { assignedTo: { $each: uniqueUserIds.map(toObjectId) } },
+            $set,
+          },
+        },
+      });
+      for (const id of added) {
+        newlyAssigned.set(id, [
+          ...(newlyAssigned.get(id) ?? []),
+          { id: String(c._id), name: c.name },
+        ]);
+      }
+    }
+
+    if (ops.length > 0) await ClientModel.bulkWrite(ops);
+
+    // One notification per person (not one per client), so assigning 40
+    // clients to an accountant doesn't send 40 pings.
+    for (const [userId, assigned] of newlyAssigned) {
+      if (userId === req.user!.userId) continue;
+      try {
+        await createNotification(
+          userId,
+          assigned.length === 1
+            ? `You have been allocated a new client: ${assigned[0].name}`
+            : `You have been allocated ${assigned.length} new clients`,
+          "client_allocated",
+          assigned.length === 1 ? { clientId: assigned[0].id } : undefined,
+        );
+      } catch (err) {
+        console.error("❌ client_allocated notify failed:", err);
+      }
+    }
+
+    res.json({
+      success: true,
+      data: { updated: ops.length, alreadyAssigned },
+    });
+    return;
+  } catch (err) {
+    console.error("bulkAssignClients error:", err);
     res.status(500).json({ success: false });
     return;
   }
@@ -640,9 +816,13 @@ export const getAwaitingAllocation = async (
       .limit(100)
       .lean();
 
+    const supervisorIds = await getAccountantSupervisorIds();
     const pending = clients.filter(
       (c: any) =>
-        !(c.assignedTo ?? []).some((u: any) => u?.role === "accountant"),
+        !(c.assignedTo ?? []).some(
+          (u: any) =>
+            u && canServeClient(u.role, String(u._id), supervisorIds),
+        ),
     );
     res.json({ success: true, data: { clients: pending } });
     return;
@@ -686,14 +866,19 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
       !!accountant &&
       accountant.role === "ceo" &&
       accountant._id.toString() === req.user!.userId;
+    const supervisorIds =
+      accountant && accountant.role === "supervisor"
+        ? await getAccountantSupervisorIds()
+        : new Set<string>();
     if (
       !accountant ||
       !accountant.isActive ||
-      (accountant.role !== "accountant" && !allocatingToSelf)
+      (!canServeClient(accountant.role, String(accountant._id), supervisorIds) &&
+        !allocatingToSelf)
     )
       return res.status(400).json({
         success: false,
-        message: "Choose an active accountant (or yourself)",
+        message: "Choose an active accountant, accountant supervisor (or yourself)",
       });
 
     const previous = client.allocatedAccountant?.toString();
@@ -1053,13 +1238,25 @@ export const getAssignableEmployees = async (
 ) => {
   if (!isCEO(req)) return res.status(403).json({ success: false });
   try {
-    const employees = await User.find({
-      role: { $in: ["supervisor", "sales_person", "accountant"] },
-      isActive: true,
-    })
-      .select("_id name email role profilePicture department")
-      .sort({ name: 1 })
-      .lean();
+    const [people, supervisorIds] = await Promise.all([
+      User.find({
+        role: { $in: ["supervisor", "sales_person", "accountant"] },
+        isActive: true,
+      })
+        .select("_id name email role profilePicture department")
+        .sort({ name: 1 })
+        .lean(),
+      getAccountantSupervisorIds(),
+    ]);
+    // Sales people (for prospects) and accountants are listed as they are.
+    // Supervisors are listed ONLY when they supervise accountants — those
+    // are the only supervisors a client can be assigned to — and are marked
+    // so the UI can offer them next to the accountants.
+    const employees = people
+      .filter((p) => p.role !== "supervisor" || supervisorIds.has(String(p._id)))
+      .map((p) =>
+        p.role === "supervisor" ? { ...p, accountantSupervisor: true } : p,
+      );
     res.json({ success: true, data: { employees } });
     return;
   } catch (err) {

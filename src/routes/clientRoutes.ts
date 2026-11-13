@@ -11,6 +11,7 @@ import {
   updateClient,
   deleteClient,
   assignClient,
+  bulkAssignClients,
   getAwaitingAllocation,
   allocateAccountant,
   updateClientStage,
@@ -76,6 +77,7 @@ router.use(authenticate);
 // Static routes BEFORE /:id
 router.get("/employees", getAssignableEmployees);
 router.get("/awaiting-allocation", getAwaitingAllocation);
+router.post("/bulk-assign", bulkAssignClients);
 router.get("/import/template", downloadClientImportTemplate);
 router.post("/import", handleImportUpload, importClients);
 

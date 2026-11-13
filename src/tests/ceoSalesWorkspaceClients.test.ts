@@ -5,6 +5,7 @@ import { startTestDb, stopTestDb } from "./helpers/db";
 import { createUserWithToken } from "./helpers/fixtures";
 import { ClientModel } from "../models/Client";
 import { User } from "../models/User";
+import { SupervisorMapping } from "../models/SupervisorMapping";
 
 beforeAll(async () => {
   await startTestDb();
@@ -206,5 +207,177 @@ describe("assigning clients", () => {
     // the rep who won it stays assigned while an accountant is added
     const res = await assign(ceo, id, [String(rep._id), String(acct._id)]);
     expect(res.status).toBe(200);
+  });
+});
+
+
+describe("accountant supervisors and bulk assignment", () => {
+  const assign = (token: string, id: string, userIds: string[]) =>
+    request(app).post(`/api/clients/${id}/assign`).set(auth(token)).send({ userIds });
+  const bulk = (token: string, clientIds: string[], userIds: string[]) =>
+    request(app).post("/api/clients/bulk-assign").set(auth(token)).send({ clientIds, userIds });
+  const employees = (token: string) =>
+    request(app).get("/api/clients/employees").set(auth(token));
+
+  /** A supervisor whose active team is the given users. */
+  const supervisorOf = async (team: string[], department?: string) => {
+    const { user } = await createUserWithToken("supervisor");
+    if (department) await User.updateOne({ _id: user._id }, { department });
+    for (const id of team) {
+      await SupervisorMapping.create({
+        supervisorId: user._id,
+        subordinateId: id,
+        departmentName: department ?? "Team",
+        assignedBy: user._id,
+        status: "active",
+      });
+    }
+    return user;
+  };
+  const existing = async (ceo: string, name: string) =>
+    (await post(ceo, { name })).body.data.client._id as string;
+
+  afterEach(async () => {
+    await SupervisorMapping.deleteMany({});
+    await User.deleteMany({});
+  });
+
+  it("the CEO's assignee list has accountants and accountant supervisors only, not other supervisors", async () => {
+    const { token: ceo } = await createUserWithToken("ceo");
+    const { user: acct } = await createUserWithToken("accountant");
+    const { user: rep } = await createUserWithToken("sales_person");
+    const acctSup = await supervisorOf([String(acct._id)]);
+    const salesSup = await supervisorOf([String(rep._id)]);
+    const financeSup = await supervisorOf([], "Finance"); // no team yet, Finance dept
+
+    const res = await employees(ceo);
+    const ids = res.body.data.employees.map((e: any) => e._id);
+    expect(ids).toContain(String(acct._id));
+    expect(ids).toContain(String(acctSup._id));
+    expect(ids).toContain(String(financeSup._id));
+    expect(ids).not.toContain(String(salesSup._id));
+    const flagged = res.body.data.employees.find((e: any) => e._id === String(acctSup._id));
+    expect(flagged.accountantSupervisor).toBe(true);
+  });
+
+  it("an existing client can be assigned to an accountant supervisor, but not to another kind of supervisor", async () => {
+    const { token: ceo } = await createUserWithToken("ceo");
+    const { user: acct } = await createUserWithToken("accountant");
+    const { user: rep } = await createUserWithToken("sales_person");
+    const acctSup = await supervisorOf([String(acct._id)]);
+    const salesSup = await supervisorOf([String(rep._id)]);
+    const id = await existing(ceo, "Old Client");
+
+    expect((await assign(ceo, id, [String(acctSup._id)])).status).toBe(200);
+    expect((await assign(ceo, id, [String(acctSup._id), String(salesSup._id)])).status).toBe(400);
+  });
+
+  it("a won client can be allocated to an accountant supervisor", async () => {
+    const { token: ceo } = await createUserWithToken("ceo");
+    const { user: acct } = await createUserWithToken("accountant");
+    const acctSup = await supervisorOf([String(acct._id)]);
+    const made = await post(ceo, { name: "Won Co", asLead: true });
+    const id = made.body.data.client._id;
+    await stage(ceo, id, "won");
+    const res = await request(app)
+      .post(`/api/clients/${id}/allocate-accountant`)
+      .set(auth(ceo))
+      .send({ accountantId: String(acctSup._id) });
+    expect(res.status).toBe(200);
+  });
+
+  it("assigns several existing clients to an accountant in one request", async () => {
+    const { token: ceo } = await createUserWithToken("ceo");
+    const { user: acct } = await createUserWithToken("accountant");
+    const a = await existing(ceo, "Client A");
+    const b = await existing(ceo, "Client B");
+    const c = await existing(ceo, "Client C");
+
+    const res = await bulk(ceo, [a, b, c], [String(acct._id)]);
+    expect(res.status).toBe(200);
+    expect(res.body.data.updated).toBe(3);
+    for (const id of [a, b, c]) {
+      const stored = await ClientModel.findById(id).lean();
+      expect(stored!.assignedTo.map(String)).toContain(String(acct._id));
+    }
+  });
+
+  it("only adds people: existing assignees stay, and re-running changes nothing", async () => {
+    const { token: ceo } = await createUserWithToken("ceo");
+    const { user: first } = await createUserWithToken("accountant");
+    const { user: second } = await createUserWithToken("accountant");
+    const id = await existing(ceo, "Client A");
+    await assign(ceo, id, [String(first._id)]);
+
+    const res = await bulk(ceo, [id], [String(second._id)]);
+    expect(res.body.data.updated).toBe(1);
+    const stored = await ClientModel.findById(id).lean();
+    expect(stored!.assignedTo.map(String).sort()).toEqual(
+      [String(first._id), String(second._id)].sort(),
+    );
+
+    const again = await bulk(ceo, [id], [String(second._id)]);
+    expect(again.body.data.updated).toBe(0);
+    expect(again.body.data.alreadyAssigned).toBe(1);
+    expect((await ClientModel.findById(id).lean())!.assignedTo).toHaveLength(2);
+  });
+
+  it("allocates won clients that have no accountant yet, and keeps an existing allocation", async () => {
+    const { token: ceo } = await createUserWithToken("ceo");
+    const { user: first } = await createUserWithToken("accountant");
+    const { user: second } = await createUserWithToken("accountant");
+    const wonId = async (name: string) => {
+      const made = await post(ceo, { name, asLead: true });
+      await stage(ceo, made.body.data.client._id, "won");
+      return made.body.data.client._id as string;
+    };
+    const fresh = await wonId("Fresh Win");
+    const taken = await wonId("Already Served");
+    await request(app)
+      .post(`/api/clients/${taken}/allocate-accountant`)
+      .set(auth(ceo))
+      .send({ accountantId: String(first._id) });
+
+    const res = await bulk(ceo, [fresh, taken], [String(second._id)]);
+    expect(res.status).toBe(200);
+    expect(String((await ClientModel.findById(fresh).lean())!.allocatedAccountant)).toBe(String(second._id));
+    expect(String((await ClientModel.findById(taken).lean())!.allocatedAccountant)).toBe(String(first._id));
+
+    const pending = await request(app).get("/api/clients/awaiting-allocation").set(auth(ceo));
+    expect(pending.body.data.clients).toEqual([]);
+  });
+
+  it("lets the CEO include themself and accountant supervisors in a bulk assignment", async () => {
+    const { user: ceoUser, token: ceo } = await createUserWithToken("ceo");
+    const { user: acct } = await createUserWithToken("accountant");
+    const acctSup = await supervisorOf([String(acct._id)]);
+    const id = await existing(ceo, "Client A");
+    const res = await bulk(ceo, [id], [String(ceoUser._id), String(acctSup._id)]);
+    expect(res.status).toBe(200);
+  });
+
+  it("refuses prospects, sales people, other supervisors and non-CEO callers", async () => {
+    const { token: ceo } = await createUserWithToken("ceo");
+    const { token: acctToken, user: acct } = await createUserWithToken("accountant");
+    const { user: rep } = await createUserWithToken("sales_person");
+    const salesSup = await supervisorOf([String(rep._id)]);
+    const id = await existing(ceo, "Client A");
+    const prospect = (await post(ceo, { name: "Prospect", asLead: true })).body.data.client._id;
+
+    expect((await bulk(ceo, [id, prospect], [String(acct._id)])).status).toBe(400);
+    expect((await bulk(ceo, [id], [String(rep._id)])).status).toBe(400);
+    expect((await bulk(ceo, [id], [String(salesSup._id)])).status).toBe(400);
+    expect((await bulk(acctToken, [id], [String(acct._id)])).status).toBe(403);
+    // nothing was changed by the refused requests
+    expect((await ClientModel.findById(id).lean())!.assignedTo).toHaveLength(0);
+  });
+
+  it("validates the request body", async () => {
+    const { token: ceo } = await createUserWithToken("ceo");
+    const { user: acct } = await createUserWithToken("accountant");
+    const id = await existing(ceo, "Client A");
+    expect((await bulk(ceo, [], [String(acct._id)])).status).toBe(400);
+    expect((await bulk(ceo, [id], [])).status).toBe(400);
+    expect((await bulk(ceo, ["not-an-id"], [String(acct._id)])).status).toBe(400);
   });
 });
