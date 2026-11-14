@@ -8,7 +8,10 @@ import {
 import { DocumentModel } from "../models/Document";
 import { User } from "../models/User";
 import { SupervisorMapping } from "../models/SupervisorMapping";
-import { sendDirectUserEmail } from "../services/emailService";
+import {
+  sendClientAssignedEmail,
+  sendDirectUserEmail,
+} from "../services/emailService";
 import { getLocalFileUrl } from "../middleware/upload";
 import { createNotification } from "../services/notificationService";
 import { getAccountantSupervisorIds } from "../utils/accountantSupervisors";
@@ -44,6 +47,30 @@ const canServeClient = (
   id: string,
   accountantSupervisorIds: Set<string>,
 ) => role === "accountant" || accountantSupervisorIds.has(id);
+
+/**
+ * Emails a newly assigned accountant / supervisor. Best-effort: a mail
+ * problem must never fail (or roll back) the assignment itself.
+ */
+const emailAssignee = async (
+  assignee: { name: string; email?: string; role: string },
+  assignerId: string,
+  clients: { id: string; name: string }[],
+) => {
+  if (!assignee.email || clients.length === 0) return;
+  try {
+    const assigner = await User.findById(assignerId).select("name").lean();
+    await sendClientAssignedEmail({
+      assigneeName: assignee.name,
+      assigneeTo: assignee.email,
+      assigneeRole: assignee.role,
+      assignerName: assigner?.name ?? "The CEO",
+      clients,
+    });
+  } catch (err) {
+    console.error("❌ client assignment email failed:", err);
+  }
+};
 
 /** Attach fresh short-lived signed URLs to a set of stored attachments. */
 const withSignedAttachmentUrls = (attachments: IClientEmailAttachment[] = []) =>
@@ -512,13 +539,14 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
   }
 };
 
-// Only the CEO may delete a client. Sales persons (and everyone else) are
-// denied, including for leads they added themselves.
+// CEO may delete any client. A sales person may delete only the leads they
+// created themselves, and only while they have not been won (once won, the
+// CEO allocates an accountant and the client is no longer the BD's to remove).
 export const deleteClient = async (req: AuthRequest, res: Response) => {
-  if (!isCEO(req))
+  if (!isCEO(req) && !isSalesPerson(req))
     return res.status(403).json({
       success: false,
-      message: "Only the CEO can delete clients",
+      message: "You do not have permission to delete clients",
     });
   try {
     const client = await ClientModel.findById(req.params.id).select(
@@ -528,6 +556,19 @@ export const deleteClient = async (req: AuthRequest, res: Response) => {
       return res
         .status(404)
         .json({ success: false, message: "Client not found" });
+
+    if (!isCEO(req)) {
+      if (client.createdBy?.toString() !== req.user!.userId)
+        return res.status(403).json({
+          success: false,
+          message: "You can only delete clients you added",
+        });
+      if (client.salesStage === "won")
+        return res.status(403).json({
+          success: false,
+          message: "Won clients can no longer be deleted",
+        });
+    }
 
     await ClientModel.findByIdAndDelete(req.params.id);
     await ClientEmailModel.deleteMany({ clientId: req.params.id });
@@ -576,7 +617,7 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
       (id) => !already.has(id),
     );
     const found = await User.find({ _id: { $in: newIds } })
-      .select("role isActive")
+      .select("name email role isActive")
       .lean();
     const supervisorIds = prospect
       ? new Set<string>()
@@ -608,6 +649,30 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
       { new: true },
     ).populate("assignedTo", "name email role profilePicture");
     if (!client) return res.status(404).json({ success: false });
+
+    // Tell each newly added accountant / supervisor — in the app and by
+    // email. (Done before responding so it isn't cut off on serverless.)
+    if (!prospect) {
+      for (const id of newIds) {
+        if (id === req.user!.userId) continue;
+        try {
+          await createNotification(
+            id,
+            `You have been allocated a new client: ${client.name}`,
+            "client_allocated",
+            { clientId: String(client._id) },
+          );
+        } catch (err) {
+          console.error("❌ client_allocated notify failed:", err);
+        }
+        const person = found.find((f) => String(f._id) === id);
+        if (person)
+          await emailAssignee(person, req.user!.userId, [
+            { id: String(client._id), name: client.name },
+          ]);
+      }
+    }
+
     res.json({ success: true, data: { client } });
     return;
   } catch (err) {
@@ -671,7 +736,7 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
         "name assignedTo isSalesLead salesStage allocatedAccountant",
       ),
       User.find({ _id: { $in: uniqueUserIds } })
-        .select("role isActive")
+        .select("name email role isActive")
         .lean(),
       getAccountantSupervisorIds(),
     ]);
@@ -760,6 +825,9 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
       } catch (err) {
         console.error("❌ client_allocated notify failed:", err);
       }
+      // ...and one email per person, listing the clients they were given.
+      const person = people.find((u) => String(u._id) === userId);
+      if (person) await emailAssignee(person, req.user!.userId, assigned);
     }
 
     res.json({
@@ -884,13 +952,17 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
     // Tell the accountant, and the sales person who won the client.
     if (previous !== next) {
       try {
-        if (next !== req.user!.userId)
+        if (next !== req.user!.userId) {
           await createNotification(
             next,
             `You have been allocated a new client: ${client.name}`,
             "client_allocated",
             { clientId: String(client._id) },
           );
+          await emailAssignee(accountant, req.user!.userId, [
+            { id: String(client._id), name: client.name },
+          ]);
+        }
         const salesId = client.createdBy?.toString();
         if (salesId && salesId !== req.user!.userId && salesId !== next) {
           await createNotification(

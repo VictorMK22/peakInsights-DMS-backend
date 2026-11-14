@@ -442,6 +442,63 @@ export async function sendTaskAssignedEmail(
   );
 }
 
+// ═════════════════════════════════════════════════════════════════
+// CLIENTS
+// ═════════════════════════════════════════════════════════════════
+
+interface ClientAssignedEmailData {
+  assigneeName: string;
+  assigneeTo: string;
+  /** Decides which workspace the button opens. */
+  assigneeRole: string;
+  assignerName: string;
+  clients: { id: string; name: string }[];
+}
+
+const MAX_CLIENTS_LISTED = 15;
+
+/** Sent to an accountant / accountant supervisor when the CEO assigns them clients. */
+export async function sendClientAssignedEmail(
+  data: ClientAssignedEmailData,
+  fromEmail?: string,
+): Promise<void> {
+  const n = data.clients.length;
+  if (n === 0) return;
+  const base = data.assigneeRole === "supervisor" ? "supervisor" : "accountant";
+  const link =
+    n === 1
+      ? `${APP_URL}/${base}/clients/${encodeURIComponent(data.clients[0].id)}`
+      : `${APP_URL}/${base}/clients`;
+  const listed = data.clients
+    .slice(0, MAX_CLIENTS_LISTED)
+    .map((c) => `<li style="margin:2px 0;">${esc(c.name)}</li>`)
+    .join("");
+  const more =
+    n > MAX_CLIENTS_LISTED
+      ? `<p style="margin:0 0 16px;font-size:14px;color:#475569;">…and ${n - MAX_CLIENTS_LISTED} more.</p>`
+      : "";
+  await send(
+    data.assigneeTo,
+    n === 1
+      ? `👤 New client assigned: ${data.clients[0].name}`
+      : `👤 ${n} new clients assigned to you`,
+    wrap(
+      "Client Assigned",
+      `
+      ${h1(n === 1 ? "You have a new client" : `You have ${n} new clients`)}
+      ${p("Hi " + esc(data.assigneeName) + ", " + esc(data.assignerName) + " has assigned " + (n === 1 ? "a client" : "clients") + " to you.")}
+      ${
+        n === 1
+          ? info("Client", esc(data.clients[0].name))
+          : `<ul style="margin:0 0 12px;padding-left:20px;font-size:14px;color:#0f172a;">${listed}</ul>${more}`
+      }
+      ${btn(n === 1 ? "View Client" : "View My Clients", link)}
+    `,
+    ),
+    fromEmail,
+  );
+}
+
 /** Sent to the assigner when the task is completed by the assignee. */
 export async function sendTaskCompletedEmail(
   to: string,

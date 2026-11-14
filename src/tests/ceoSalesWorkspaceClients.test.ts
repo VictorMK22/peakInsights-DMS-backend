@@ -6,6 +6,7 @@ import { createUserWithToken } from "./helpers/fixtures";
 import { ClientModel } from "../models/Client";
 import { User } from "../models/User";
 import { SupervisorMapping } from "../models/SupervisorMapping";
+import * as emailService from "../services/emailService";
 
 beforeAll(async () => {
   await startTestDb();
@@ -370,6 +371,77 @@ describe("accountant supervisors and bulk assignment", () => {
     expect((await bulk(acctToken, [id], [String(acct._id)])).status).toBe(403);
     // nothing was changed by the refused requests
     expect((await ClientModel.findById(id).lean())!.assignedTo).toHaveLength(0);
+  });
+
+  it("emails each assignee once: a bulk assignment sends one email listing all their clients", async () => {
+    const sent = jest
+      .spyOn(emailService, "sendClientAssignedEmail")
+      .mockResolvedValue(undefined);
+    try {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { user: acct } = await createUserWithToken("accountant");
+      const a = await existing(ceo, "Client A");
+      const b = await existing(ceo, "Client B");
+      const c = await existing(ceo, "Client C");
+
+      await bulk(ceo, [a, b, c], [String(acct._id)]);
+      expect(sent).toHaveBeenCalledTimes(1);
+      const data = sent.mock.calls[0][0];
+      expect(data.assigneeTo).toBe(acct.email);
+      expect(data.clients.map((x) => x.name).sort()).toEqual(["Client A", "Client B", "Client C"]);
+
+      // re-running adds nobody new, so nobody is emailed again
+      sent.mockClear();
+      await bulk(ceo, [a, b, c], [String(acct._id)]);
+      expect(sent).not.toHaveBeenCalled();
+    } finally {
+      sent.mockRestore();
+    }
+  });
+
+  it("emails a newly assigned accountant on single assign and allocate, but not the CEO themself", async () => {
+    const sent = jest
+      .spyOn(emailService, "sendClientAssignedEmail")
+      .mockResolvedValue(undefined);
+    try {
+      const { user: ceoUser, token: ceo } = await createUserWithToken("ceo");
+      const { user: acct } = await createUserWithToken("accountant");
+      const id = await existing(ceo, "Client A");
+
+      await assign(ceo, id, [String(ceoUser._id)]);
+      expect(sent).not.toHaveBeenCalled();
+
+      await assign(ceo, id, [String(ceoUser._id), String(acct._id)]);
+      expect(sent).toHaveBeenCalledTimes(1);
+      expect(sent.mock.calls[0][0].assigneeTo).toBe(acct.email);
+
+      sent.mockClear();
+      const won = (await post(ceo, { name: "Won Co", asLead: true })).body.data.client._id;
+      await stage(ceo, won, "won");
+      await request(app)
+        .post(`/api/clients/${won}/allocate-accountant`)
+        .set(auth(ceo))
+        .send({ accountantId: String(acct._id) });
+      expect(sent).toHaveBeenCalledTimes(1);
+    } finally {
+      sent.mockRestore();
+    }
+  });
+
+  it("a failing email never fails the assignment", async () => {
+    const sent = jest
+      .spyOn(emailService, "sendClientAssignedEmail")
+      .mockRejectedValue(new Error("mail down"));
+    try {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { user: acct } = await createUserWithToken("accountant");
+      const id = await existing(ceo, "Client A");
+      const res = await bulk(ceo, [id], [String(acct._id)]);
+      expect(res.status).toBe(200);
+      expect((await ClientModel.findById(id).lean())!.assignedTo.map(String)).toContain(String(acct._id));
+    } finally {
+      sent.mockRestore();
+    }
   });
 
   it("validates the request body", async () => {
