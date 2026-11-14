@@ -599,6 +599,7 @@ export const updateTaskStatus = async (
         task.assignedBy.toString(),
         `Task "${task.title}" has been submitted for your review`,
         "task_submitted",
+        { taskId: task._id.toString(), taskTitle: task.title },
       );
     }
 
@@ -641,6 +642,7 @@ export const updateTaskStatus = async (
         `Task "${task.title}" has been approved and marked complete`,
         "task_completed",
         {
+          taskId: task._id.toString(),
           taskTitle: task.title,
           assigneeName: assigneeUser?.name ?? "The assignee",
           efficiencyRatio: task.efficiencyRatio,
@@ -670,6 +672,7 @@ export const updateTaskStatus = async (
         task.assignedTo.toString(),
         `Task "${task.title}" was rejected: ${rejectionReason}`,
         "task_rejected",
+        { taskId: task._id.toString(), taskTitle: task.title },
       );
     }
 
@@ -1331,6 +1334,7 @@ export const approveTask = async (
       `Task "${task.title}" has been approved and marked complete`,
       "task_completed",
       {
+        taskId: task._id.toString(),
         taskTitle: task.title,
         assigneeName: assigneeUser?.name ?? "The assignee",
         efficiencyRatio: task.efficiencyRatio,

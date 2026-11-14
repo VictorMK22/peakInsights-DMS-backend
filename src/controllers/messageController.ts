@@ -169,7 +169,12 @@ const sendGroupMessage = async (
           String(r._id),
           `New message from ${senderName}: ${subject ?? body.slice(0, 60)}`,
           "new_message",
-          { senderName, messageSubject: subject, messageBody: body },
+          {
+            messageId: String(docs[i]._id),
+            senderName,
+            messageSubject: subject,
+            messageBody: body,
+          },
         );
         try {
           getIO().to(`user:${r._id}`).emit("new-message", {
@@ -339,6 +344,8 @@ export const sendMessage = async (
       `New message from ${sender?.name ?? "Someone"}: ${subject ?? body.slice(0, 60)}`,
       "new_message",
       {
+        // Replies open the root thread they belong to.
+        messageId: String(parentId || message._id),
         senderName: sender?.name ?? "Someone",
         messageSubject: subject,
         messageBody: body,

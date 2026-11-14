@@ -36,6 +36,7 @@ export const createNotification = async (
           _id: notification._id,
           message,
           type,
+          meta,
           read: false,
           createdAt: notification.createdAt,
         });
