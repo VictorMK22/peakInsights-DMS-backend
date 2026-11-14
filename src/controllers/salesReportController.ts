@@ -13,7 +13,7 @@ import {
 /**
  * GET /api/analytics/sales-activity?from=2026-11-02&to=2026-11-09   (CEO)
  * `from` is inclusive, `to` is exclusive; plain dates are Nairobi midnight.
- * With no params it reports on the last completed Monday–Sunday week.
+ * With no params it reports on the latest Friday–Thursday reporting week.
  */
 export const getSalesActivityReport = async (
   req: AuthRequest,

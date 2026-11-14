@@ -853,7 +853,7 @@ export async function sendMeetingCancelledEmail(
 export interface SalesWeeklyReportEmailData {
   recipientName: string;
   periodLabel: string;
-  /** Monday of the reported week, YYYY-MM-DD — used to deep-link the report page. */
+  /** Friday (start) of the reported week, YYYY-MM-DD — used to deep-link the report page. */
   from: string;
   totals: SalesReportRow;
   reps: (SalesReportRow & { name: string })[];

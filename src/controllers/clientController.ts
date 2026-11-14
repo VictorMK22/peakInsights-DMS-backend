@@ -14,6 +14,8 @@ import {
 } from "../services/emailService";
 import { getLocalFileUrl } from "../middleware/upload";
 import { createNotification } from "../services/notificationService";
+import { syncMyMailbox } from "../services/emailSyncService";
+import { EmailIntegrationModel } from "../models/EmailIntegration";
 import { getAccountantSupervisorIds } from "../utils/accountantSupervisors";
 import mongoose from "mongoose";
 import * as XLSX from "xlsx";
@@ -1115,6 +1117,69 @@ export const getClientEmails = async (req: AuthRequest, res: Response) => {
   } catch (err) {
     res.status(500).json({ success: false });
     return;
+  }
+};
+
+// POST /clients/:id/emails/sync — pull in any new mail from the mailboxes that
+// can receive this client's replies (every assigned employee, plus whoever is
+// looking at the page), so the thread is up to date without leaving the page
+// or waiting for the scheduled sync. Throttled per client.
+const lastClientEmailSync = new Map<string, number>();
+const CLIENT_EMAIL_SYNC_COOLDOWN_MS = 20_000;
+
+export const syncClientEmails = async (req: AuthRequest, res: Response) => {
+  try {
+    const ok = await canAccess(req.params.id, req.user!.userId, req.user!.role);
+    if (!ok)
+      return res.status(403).json({ success: false, message: "Access denied" });
+
+    const client = await ClientModel.findById(req.params.id).select(
+      "assignedTo",
+    );
+    if (!client) return res.status(404).json({ success: false });
+
+    const userIds = [
+      ...new Set([
+        ...client.assignedTo.map((id) => id.toString()),
+        req.user!.userId,
+      ]),
+    ];
+
+    // Who has a connected mailbox, and who doesn't (their replies can't arrive).
+    const [connected, people] = await Promise.all([
+      EmailIntegrationModel.find({
+        userId: { $in: userIds },
+        status: { $ne: "disconnected" },
+      }).select("userId"),
+      User.find({ _id: { $in: userIds } }).select("name"),
+    ]);
+    const connectedIds = new Set(connected.map((c) => c.userId.toString()));
+    const notConnected = people
+      .filter((p) => !connectedIds.has(p._id.toString()))
+      .map((p) => ({ _id: p._id.toString(), name: p.name }));
+
+    const last = lastClientEmailSync.get(req.params.id) ?? 0;
+    if (Date.now() - last < CLIENT_EMAIL_SYNC_COOLDOWN_MS) {
+      return res.json({
+        success: true,
+        data: { throttled: true, synced: 0, notConnected },
+      });
+    }
+    lastClientEmailSync.set(req.params.id, Date.now());
+
+    const results = await Promise.allSettled(
+      userIds.filter((u) => connectedIds.has(u)).map((u) => syncMyMailbox(u)),
+    );
+    let synced = 0;
+    for (const r of results) {
+      if (r.status === "fulfilled" && r.value) synced += r.value.messagesSynced;
+      else if (r.status === "rejected")
+        console.error("Client email sync failed for a mailbox:", r.reason);
+    }
+
+    return res.json({ success: true, data: { synced, notConnected } });
+  } catch (err) {
+    return res.status(500).json({ success: false });
   }
 };
 

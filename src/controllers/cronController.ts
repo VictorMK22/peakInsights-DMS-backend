@@ -13,6 +13,7 @@ import { User } from "../models/User";
 import {
   buildSalesActivityReport,
   lastCompletedWeek,
+  eatDateString,
   formatPeriodLabel,
 } from "../services/salesReportService";
 import { sendSalesWeeklyReportEmail } from "../services/emailService";
@@ -156,9 +157,9 @@ export const runTaskReminders = async (_req: Request, res: Response) => {
 };
 
 /**
- * POST /api/cron/sales-weekly-report — call once a week (Monday morning).
+ * POST /api/cron/sales-weekly-report — call once a week (Thursday 23:59 EAT).
  * Emails every active CEO a summary of the sales team's activity for the last
- * completed Monday–Sunday week (Nairobi time): leads added, meetings, client
+ * Friday–Thursday week ending that night (Nairobi time): leads added, meetings, client
  * discussions and pipeline movement, per sales person.
  */
 export const runSalesWeeklyReport = async (_req: Request, res: Response) => {
@@ -175,7 +176,7 @@ export const runSalesWeeklyReport = async (_req: Request, res: Response) => {
         sendSalesWeeklyReportEmail(ceo.email, {
           recipientName: ceo.name,
           periodLabel,
-          from: from.toISOString().slice(0, 10),
+          from: eatDateString(from),
           totals: report.totals,
           reps: report.reps,
           pipeline: report.pipeline,

@@ -17,6 +17,7 @@ import {
   updateClientStage,
   getClientEmails,
   sendClientEmail,
+  syncClientEmails,
   deleteClientEmail,
   getClientDocuments,
   getAssignableEmployees,
@@ -110,6 +111,7 @@ router.patch("/:id/stage", updateClientStage);
 // exclusively via Zoho sync (see services/emailSyncService.ts), which
 // writes directly into ClientEmail with source: "external_sync".
 router.get("/:id/emails", getClientEmails);
+router.post("/:id/emails/sync", syncClientEmails);
 router.post("/:id/emails/send", uploadToLocal.any(), sendClientEmail);
 router.delete("/:id/emails/:emailId", deleteClientEmail);
 

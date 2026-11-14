@@ -12,7 +12,7 @@ import { MeetingModel } from "../models/Meeting";
 // Sales-team activity report. Everything here is read from data the
 // app already records — no new collections. Used by:
 //   GET  /api/analytics/sales-activity     (CEO, any date range)
-//   POST /api/cron/sales-weekly-report     (emails the CEO every Monday)
+//   POST /api/cron/sales-weekly-report     (emails the CEO every Thursday 23:59 EAT)
 // ═════════════════════════════════════════════════════════════════
 
 // Africa/Nairobi is UTC+3 all year (no daylight saving).
@@ -20,20 +20,35 @@ const EAT_OFFSET_MS = 3 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 export const MAX_REPORT_RANGE_DAYS = 92;
 
-/** Monday 00:00 → next Monday 00:00 (Nairobi time) of the last COMPLETED week. */
+/**
+ * The sales reporting week runs Friday 00:00 → next Friday 00:00 (Nairobi),
+ * i.e. Friday through Thursday. The weekly email goes out Thursday 23:59 EAT,
+ * so the week it reports is the one ENDING that night.
+ *
+ * `now` is nudged forward 6 hours before picking the Friday boundary: a run at
+ * Thursday 23:59 (or one that GitHub Actions starts a few hours late, after
+ * midnight) lands on the Friday that closes the week, while any run from Friday
+ * midday through Wednesday returns the most recently finished week.
+ */
+const REPORT_GRACE_MS = 6 * 60 * 60 * 1000;
 export function lastCompletedWeek(now: Date = new Date()): {
   from: Date;
   to: Date;
 } {
-  const eat = new Date(now.getTime() + EAT_OFFSET_MS);
-  const daysSinceMonday = (eat.getUTCDay() + 6) % 7; // Mon = 0 … Sun = 6
-  const thisMondayAsUtc = Date.UTC(
+  const eat = new Date(now.getTime() + REPORT_GRACE_MS + EAT_OFFSET_MS);
+  const daysSinceFriday = (eat.getUTCDay() + 2) % 7; // Fri = 0 … Thu = 6
+  const fridayAsUtc = Date.UTC(
     eat.getUTCFullYear(),
     eat.getUTCMonth(),
-    eat.getUTCDate() - daysSinceMonday,
+    eat.getUTCDate() - daysSinceFriday,
   );
-  const to = new Date(thisMondayAsUtc - EAT_OFFSET_MS);
+  const to = new Date(fridayAsUtc - EAT_OFFSET_MS);
   return { from: new Date(to.getTime() - 7 * DAY_MS), to };
+}
+
+/** The Nairobi calendar date (YYYY-MM-DD) of an instant — used for report links. */
+export function eatDateString(d: Date): string {
+  return new Date(d.getTime() + EAT_OFFSET_MS).toISOString().slice(0, 10);
 }
 
 /** "2026-11-02" is read as midnight in Nairobi; full ISO strings are used as-is. */

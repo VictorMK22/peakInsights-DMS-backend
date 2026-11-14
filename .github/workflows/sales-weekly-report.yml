@@ -1,14 +1,15 @@
 name: Sales weekly report cron
 
-# Calls POST /api/cron/sales-weekly-report every Monday at 08:00 Nairobi time
-# (05:00 UTC). It emails the CEO the sales team's activity for the week that
-# just ended. Uses the same secrets as the other cron workflows:
+# Calls POST /api/cron/sales-weekly-report every Thursday at 23:59 Nairobi time
+# (20:59 UTC). It emails the CEO the sales team's activity for the Friday–Thursday
+# week that is ending. (GitHub may start scheduled runs a few minutes late; the
+# report week is chosen so a late start still reports the right week.) Uses the same secrets as the other cron workflows:
 #   CRON_SECRET, API_BASE_URL  (Repo Settings → Secrets and variables → Actions)
 # Copy this file to .github/workflows/ to enable it.
 
 on:
   schedule:
-    - cron: "0 5 * * 1" # Mondays 05:00 UTC = 08:00 EAT
+    - cron: "59 20 * * 4" # Thursdays 20:59 UTC = 23:59 EAT
   workflow_dispatch: {}
 
 jobs:
