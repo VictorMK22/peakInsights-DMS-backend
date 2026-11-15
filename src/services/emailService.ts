@@ -725,10 +725,39 @@ interface MeetingEmailData {
   isRecurring?: boolean;
   /** True when this recipient has no login (external attendee) — swaps the CTA button for a plain "add to calendar" note instead of a deep link. */
   isExternal?: boolean;
+  /**
+   * Signed token (utils/meetingRsvpToken.ts) identifying this recipient for
+   * this meeting. When present the email carries Accept / Decline buttons
+   * that work without logging in; when absent it falls back to the old
+   * "View & Respond" deep link (internal) / plain note (external).
+   */
+  rsvpToken?: string;
 }
 
 const formatMeetingWindow = (start: Date, end: Date) =>
   formatEatWindow(start, end);
+
+/**
+ * Where the Accept / Decline buttons lead: the public response page in the
+ * web app. Opening the page records nothing — the person confirms there
+ * (and, for Decline, gives a reason) — so mail scanners that pre-fetch
+ * every link can't answer on anyone's behalf.
+ */
+export const buildRsvpUrl = (
+  token: string,
+  action: "accept" | "tentative" | "decline",
+): string =>
+  `${APP_URL}/meeting-rsvp?token=${encodeURIComponent(token)}&action=${action}`;
+
+const rsvpBlock = (token: string) => `
+  <div style="margin:8px 0 4px;">
+    <span style="display:inline-block;margin-right:10px;">${btn("✓ Accept", buildRsvpUrl(token, "accept"), "#16a34a")}</span>
+    <span style="display:inline-block;margin-right:10px;">${btn("? Maybe", buildRsvpUrl(token, "tentative"), "#d97706")}</span>
+    <span style="display:inline-block;">${btn("✕ Decline", buildRsvpUrl(token, "decline"), "#dc2626")}</span>
+  </div>
+  <p style="margin:0 0 16px;font-size:13px;color:#64748b;line-height:1.6;">
+    No login needed. If you decline, you'll be asked to give the organizer a short reason.
+  </p>`;
 
 /** Sent to every internal + external invitee when a meeting is created. */
 export async function sendMeetingInviteEmail(
@@ -747,12 +776,15 @@ export async function sendMeetingInviteEmail(
       ${info("When", formatMeetingWindow(data.startTime, data.endTime) + (data.isRecurring ? " (recurring)" : ""))}
       ${data.location ? info("Location", data.location) : ""}
       ${data.meetingLink ? info("Meeting link", `<a href="${data.meetingLink}">${data.meetingLink}</a>`) : ""}
+      ${data.rsvpToken ? p("<strong>Will you be there?</strong> Please let " + esc(data.organizerName) + " know:") + rsvpBlock(data.rsvpToken) : ""}
       ${
         data.isExternal
           ? highlight(
               "This invitation was sent to your email address. Please add it to your own calendar — you'll receive an email if it's rescheduled or cancelled.",
             )
-          : btn("View & Respond", `${APP_URL}/meetings`)
+          : data.rsvpToken
+            ? ""
+            : btn("View & Respond", `${APP_URL}/meetings`)
       }
     `,
     ),
@@ -777,10 +809,13 @@ export async function sendMeetingUpdatedEmail(
       ${info("New time", formatMeetingWindow(data.startTime, data.endTime))}
       ${data.location ? info("Location", data.location) : ""}
       ${data.meetingLink ? info("Meeting link", `<a href="${data.meetingLink}">${data.meetingLink}</a>`) : ""}
+      ${data.rsvpToken ? p("Your earlier response was cleared because the time changed. <strong>Can you still make it?</strong>") + rsvpBlock(data.rsvpToken) : ""}
       ${
         data.isExternal
           ? highlight("Please update your own calendar to match.")
-          : btn("View Meeting", `${APP_URL}/meetings`)
+          : data.rsvpToken
+            ? ""
+            : btn("View Meeting", `${APP_URL}/meetings`)
       }
     `,
     ),

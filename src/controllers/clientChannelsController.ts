@@ -6,6 +6,7 @@ import { ClientNoteModel } from "../models/ClientNote";
 import { ClientMeetingModel } from "../models/ClientMeeting";
 import { MeetingModel } from "../models/Meeting";
 import { getClientMeetingActivity } from "../services/meetingActivityService";
+import { redactDeclineReasons } from "../services/meetingRsvpService";
 import { ClientCallModel } from "../models/ClientCall";
 import { TaskModel } from "../models/Task";
 import { calculateTAT, formatTAT } from "../utils/tatCalculator";
@@ -124,7 +125,9 @@ export const getClientScheduledMeetings = async (
     const end = stopped ? new Date(m.updatedAt) : new Date();
     const idleMinutes = Math.max(0, calculateTAT(new Date(m.createdAt), end));
     return {
-      ...m,
+      // Decline reasons are for the organizer only, not everyone who can
+      // see this client's timeline.
+      ...redactDeclineReasons(m, req.user!.userId),
       idleMinutes,
       idleFormatted: formatTAT(idleMinutes),
       idleStopped: stopped,

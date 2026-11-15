@@ -26,6 +26,7 @@ import departmentRoutes from "./routes/departments";
 import trashRoutes from "./routes/trash";
 import learningCategoryRoutes from "./routes/learningCategories";
 import meetingRoutes from "./routes/meetings";
+import meetingRsvpRoutes from "./routes/meetingRsvp";
 import notificationRoutes from "./routes/notifications";
 import presenceRoutes from "./routes/presence";
 import calendarBlockRoutes from "./routes/calendarBlocks";
@@ -162,6 +163,9 @@ app.use("/api/departments", departmentRoutes);
 app.use("/api/trash", trashRoutes);
 app.use("/api/learning-categories", learningCategoryRoutes);
 app.use("/api/meetings", meetingRoutes);
+// Public — token-authorised Accept / Decline links from invitation emails
+// (external invitees have no account, so this must not require auth).
+app.use("/api/meeting-rsvp", meetingRsvpRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/presence", presenceRoutes);
 app.use("/api/calendar-blocks", calendarBlockRoutes);

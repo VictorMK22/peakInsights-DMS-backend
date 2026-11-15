@@ -23,6 +23,12 @@ import {
   getMeetingActivity,
 } from "../services/meetingActivityService";
 import {
+  parseRsvpInput,
+  recordRsvp,
+  redactDeclineReasons,
+} from "../services/meetingRsvpService";
+import { createRsvpToken, RsvpTokenActor } from "../utils/meetingRsvpToken";
+import {
   pushNewMeetingsToZoho,
   syncUpdatedMeetingToZoho,
   removeMeetingsFromZoho,
@@ -44,6 +50,23 @@ const idOf = (v: unknown): string =>
   v && typeof v === "object" && "_id" in (v as any)
     ? String((v as any)._id)
     : String(v);
+
+/**
+ * Token for the Accept / Decline buttons in an invitation email. If one
+ * can't be made (e.g. JWT_SECRET missing), the email still goes out —
+ * without the buttons — rather than failing the whole create/update.
+ */
+const safeRsvpToken = (
+  meetingId: string,
+  actor: RsvpTokenActor,
+): string | undefined => {
+  try {
+    return createRsvpToken(meetingId, actor);
+  } catch (err) {
+    console.error("Could not create RSVP token:", err);
+    return undefined;
+  }
+};
 
 const populateMeeting = (query: any) =>
   query
@@ -308,11 +331,13 @@ export const createMeeting = async (
             toEmail: u.email as string,
             toName: u.name,
             isExternal: false,
+            actor: { kind: "user", userId: String(u._id) } as RsvpTokenActor,
           })),
         ...cleanExternalAttendees.map((e) => ({
           toEmail: e.email,
           toName: e.name ?? e.email,
           isExternal: true,
+          actor: { kind: "external", email: e.email } as RsvpTokenActor,
         })),
       ];
       await Promise.all(
@@ -329,6 +354,7 @@ export const createMeeting = async (
             meetingLink,
             isRecurring: Boolean(isSeries),
             isExternal: r.isExternal,
+            rsvpToken: safeRsvpToken(String(firstMeeting._id), r.actor),
           }),
         ),
       );
@@ -682,7 +708,11 @@ export const getMeetings = async (
     res.json({
       success: true,
       message: "Meetings retrieved",
-      data: { meetings },
+      data: {
+        meetings: meetings.map((m: unknown) =>
+          redactDeclineReasons(m, req.user!.userId),
+        ),
+      },
     });
   } catch (err) {
     next(err);
@@ -717,7 +747,7 @@ export const getMeeting = async (
     res.json({
       success: true,
       message: "Meeting retrieved",
-      data: { meeting },
+      data: { meeting: redactDeclineReasons(meeting, req.user!.userId) },
     });
   } catch (err) {
     next(err);
@@ -923,7 +953,15 @@ export const updateMeeting = async (
         if (!newlyAdded.includes(idOf(a.userId))) {
           a.status = "pending";
           a.respondedAt = undefined;
+          a.declineReason = undefined;
         }
+      });
+      // External invitees answer from their email too, so a new time
+      // invalidates their answers the same way.
+      meeting.externalAttendees.forEach((e) => {
+        e.status = "pending";
+        e.respondedAt = undefined;
+        e.declineReason = undefined;
       });
       meeting.reminderSent = false;
     }
@@ -966,15 +1004,26 @@ export const updateMeeting = async (
       const recipients = [
         ...invitedUsers
           .filter((u) => u.email)
-          .map((u) => ({ toEmail: u.email as string, toName: u.name })),
+          .map((u) => ({
+            toEmail: u.email as string,
+            toName: u.name,
+            isExternal: false,
+            // Added by this very edit: they've never been invited by
+            // email, so they get a proper invitation, not an "update".
+            isNew: newlyAdded.includes(String(u._id)),
+            actor: { kind: "user", userId: String(u._id) } as RsvpTokenActor,
+          })),
         ...meeting.externalAttendees.map((e) => ({
           toEmail: e.email,
           toName: e.name ?? e.email,
+          isExternal: true,
+          isNew: false,
+          actor: { kind: "external", email: e.email } as RsvpTokenActor,
         })),
       ];
       await Promise.all(
-        recipients.map((r) =>
-          sendMeetingUpdatedEmail({
+        recipients.map((r) => {
+          const email = {
             toEmail: r.toEmail,
             toName: r.toName,
             meetingId: String(meeting._id),
@@ -984,8 +1033,25 @@ export const updateMeeting = async (
             endTime: meeting.endTime,
             location: meeting.location,
             meetingLink: meeting.meetingLink,
-          }),
-        ),
+            isExternal: r.isExternal,
+          };
+          if (r.isNew) {
+            return sendMeetingInviteEmail({
+              ...email,
+              isRecurring: meeting.isRecurringInstance,
+              rsvpToken: safeRsvpToken(String(meeting._id), r.actor),
+            });
+          }
+          // Everyone's answer was just cleared when the time moved, so
+          // the update email asks them to answer again. For a
+          // detail-only edit nobody's answer changed — no buttons.
+          return sendMeetingUpdatedEmail({
+            ...email,
+            rsvpToken: timeChanged
+              ? safeRsvpToken(String(meeting._id), r.actor)
+              : undefined,
+          });
+        }),
       );
     })().catch((err) =>
       console.error("Meeting update email batch failed:", err),
@@ -1432,77 +1498,54 @@ export const cancelMeeting = async (
 // ─────────────────────────────────────────────────────────────────
 // RSVP — invited attendee responds
 // ─────────────────────────────────────────────────────────────────
+/**
+ * An invited attendee answers from inside the app. The email Accept /
+ * Decline links reach the same rules through the public
+ * /api/meeting-rsvp endpoints; both go through services/meetingRsvpService
+ * so they can't disagree. Declining requires a reason either way.
+ */
 export const respondToMeeting = async (
   req: AuthRequest,
   res: Response,
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const { status } = req.body as { status: RsvpStatus };
-    if (!["accepted", "declined", "tentative"].includes(status)) {
-      res.status(400).json({
+    const input = parseRsvpInput(req.body, [
+      "accepted",
+      "declined",
+      "tentative",
+    ]);
+    if (!input.ok) {
+      res.status(input.httpStatus).json({
         success: false,
-        message: "status must be one of: accepted, declined, tentative",
+        code: input.code,
+        message: input.message,
       });
       return;
     }
 
-    const meeting = await MeetingModel.findById(req.params.id);
-    if (!meeting) {
-      res.status(404).json({ success: false, message: "Meeting not found" });
-      return;
-    }
-
-    const attendee = meeting.attendees.find(
-      (a) => idOf(a.userId) === req.user!.userId,
+    const recorded = await recordRsvp(
+      req.params.id,
+      { kind: "user", userId: req.user!.userId },
+      input.status,
+      input.reason,
     );
-    if (!attendee) {
-      res.status(403).json({
+    if (!recorded.ok) {
+      res.status(recorded.httpStatus).json({
         success: false,
-        message: "You were not invited to this meeting",
+        code: recorded.code,
+        message: recorded.message,
       });
       return;
     }
 
-    attendee.status = status;
-    attendee.respondedAt = new Date();
-    await meeting.save();
-
-    const responder = await User.findById(req.user!.userId)
-      .select("name")
-      .lean();
-    await createNotification(
-      idOf(meeting.organizer),
-      `${responder?.name ?? "A participant"} ${status} the invite for "${meeting.title}"`,
-      "meeting_response",
-      {
-        meetingId: String(meeting._id),
-        status,
-        respondentName: responder?.name,
-      },
+    const populated = await populateMeeting(
+      MeetingModel.findById(req.params.id),
     );
-
-    const populated = await populateMeeting(MeetingModel.findById(meeting._id));
-
-    const activityAction =
-      status === "accepted"
-        ? "participant_accepted"
-        : status === "declined"
-          ? "participant_declined"
-          : "participant_tentative";
-    await logMeetingActivity({
-      meetingId: meeting._id,
-      seriesId: meeting.seriesId,
-      clientId: meeting.clientId,
-      actorId: req.user!.userId,
-      action: activityAction,
-      message: `${responder?.name ?? "A participant"} ${status} the invite for "${meeting.title}"`,
-    });
-
     res.json({
       success: true,
       message: "Response recorded",
-      data: { meeting: populated },
+      data: { meeting: redactDeclineReasons(populated, req.user!.userId) },
     });
   } catch (err) {
     next(err);

@@ -37,21 +37,34 @@ export type RecurrenceFrequency =
   | "monthly"
   | "custom";
 
+// Declining requires a short explanation for the organizer. The cap keeps
+// it a note rather than an essay (and bounds what we store / notify).
+export const MAX_DECLINE_REASON_LENGTH = 500;
+
 export interface IMeetingAttendee {
   userId: mongoose.Types.ObjectId;
   status: RsvpStatus;
   respondedAt?: Date;
+  // Why they declined. Always set when status === "declined", cleared on
+  // any other response. Visible to the organizer only — everyone else
+  // gets it stripped (see services/meetingRsvpService.redactDeclineReasons).
+  declineReason?: string;
   // Snapshot of who invited them — always the organizer today, but
   // kept as its own field in case delegated invites are added later.
   invitedAt: Date;
 }
 
-// External attendees are invited by email and aren't system users —
-// no availability checking or RSVP tracking is possible for them, but
-// they still receive the invitation/update/cancellation emails.
+// External attendees are invited by email and aren't system users — no
+// availability checking is possible for them. They have no login, so they
+// answer the invitation from the Accept / Decline links in their email
+// (see utils/meetingRsvpToken.ts) and receive the update/cancellation
+// emails like everyone else.
 export interface IExternalAttendee {
   email: string;
   name?: string;
+  status: RsvpStatus;
+  respondedAt?: Date;
+  declineReason?: string; // same rules as IMeetingAttendee.declineReason
 }
 
 export interface IRecurrenceRule {
@@ -141,6 +154,7 @@ const MeetingAttendeeSchema = new Schema<IMeetingAttendee>(
       default: "pending",
     },
     respondedAt: { type: Date },
+    declineReason: { type: String, trim: true, maxlength: MAX_DECLINE_REASON_LENGTH },
     invitedAt: { type: Date, default: Date.now },
   },
   { _id: false },
@@ -150,6 +164,15 @@ const ExternalAttendeeSchema = new Schema<IExternalAttendee>(
   {
     email: { type: String, required: true, trim: true, lowercase: true },
     name: { type: String, trim: true },
+    // Defaults to "pending" for existing invitees too: Mongoose fills a
+    // missing path on read, so no data migration is needed.
+    status: {
+      type: String,
+      enum: ["pending", "accepted", "declined", "tentative"],
+      default: "pending",
+    },
+    respondedAt: { type: Date },
+    declineReason: { type: String, trim: true, maxlength: MAX_DECLINE_REASON_LENGTH },
   },
   { _id: false },
 );
