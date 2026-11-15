@@ -399,63 +399,151 @@ export const importClients = async (req: AuthRequest, res: Response) => {
   }
 };
 
+/**
+ * The people whose clients the caller may look at (and therefore the only
+ * people they may filter or group by):
+ *   CEO            → null: anyone, no restriction
+ *   supervisor     → themself + everyone they actively supervise
+ *   everyone else  → just themself
+ */
+const browsableOwnerIds = async (
+  req: AuthRequest,
+): Promise<mongoose.Types.ObjectId[] | null> => {
+  if (isCEO(req)) return null;
+  const uid = new mongoose.Types.ObjectId(req.user!.userId);
+  if (req.user!.role !== "supervisor") return [uid];
+  const maps = await SupervisorMapping.find({
+    supervisorId: uid,
+    status: "active",
+  }).select("subordinateId");
+  return [uid, ...maps.map((m) => m.subordinateId)];
+};
+
+/** Mongo condition for a client nobody is assigned to. */
+const UNASSIGNED_CONDITION = {
+  $or: [{ assignedTo: { $exists: false } }, { assignedTo: { $size: 0 } }],
+};
+
+/** `filter` AND-ed with one more condition, without touching `filter`. */
+const withCondition = (
+  filter: Record<string, unknown>,
+  condition: Record<string, unknown>,
+): Record<string, unknown> => ({
+  ...filter,
+  $and: [...((filter.$and as Record<string, unknown>[]) ?? []), condition],
+});
+
+/**
+ * Filter shared by the flat list (GET /clients) and the grouped list
+ * (GET /clients/grouped): what the caller may see, narrowed by the
+ * mine / sales / tab / search query params.
+ */
+const buildClientListFilter = (
+  query: Record<string, string>,
+  uid: mongoose.Types.ObjectId,
+  owners: mongoose.Types.ObjectId[] | null,
+): Record<string, unknown> => {
+  const { search, salesStage, salesOnly, tab, mine } = query;
+  const filter: Record<string, unknown> = {};
+
+  // CEO: all clients. Supervisor: clients where they are directly assigned
+  // OR any of their subordinates are. Everyone else: only their own.
+  if (owners) filter.assignedTo = { $in: owners };
+
+  // GET /clients?mine=true — only clients assigned to the caller. Lets the
+  // CEO, working in the Sales or Accountant workspace, see just their own
+  // book instead of every client in the company.
+  if (mine === "true") filter.assignedTo = uid;
+
+  // Sales pipeline filters — e.g. GET /clients?salesOnly=true&salesStage=won
+  if (salesOnly === "true") filter.isSalesLead = true;
+  if (salesStage) filter.salesStage = salesStage;
+
+  const and: Record<string, unknown>[] = [];
+  // GET /clients?tab=prospects|won — the CEO's two client lists:
+  //   prospects → leads still in the pipeline (any stage but won, lost included)
+  //   won       → won clients plus existing clients added before the pipeline
+  if (tab === "prospects")
+    and.push({ isSalesLead: true, salesStage: { $ne: "won" } });
+  else if (tab === "won")
+    and.push({ $or: [{ isSalesLead: { $ne: true } }, { salesStage: "won" }] });
+  if (search)
+    and.push({
+      $or: [
+        { name: { $regex: search, $options: "i" } },
+        { company: { $regex: search, $options: "i" } },
+        { email: { $regex: search, $options: "i" } },
+      ],
+    });
+  if (and.length) filter.$and = and;
+  return filter;
+};
+
+/** `?assignee=` value meaning "clients nobody is assigned to" (CEO only). */
+const UNASSIGNED = "unassigned";
+
+type AssigneeCheck =
+  | { condition: Record<string, unknown> | null }
+  | { error: { status: number; message: string } };
+
+/**
+ * Turns `?assignee=<userId | "unassigned">` into a Mongo condition, after
+ * checking the caller may look at that person's clients: the CEO may look at
+ * anyone; a supervisor only at themself and their active team; anyone else
+ * only at themself.
+ */
+const checkAssignee = (
+  raw: unknown,
+  owners: mongoose.Types.ObjectId[] | null,
+): AssigneeCheck => {
+  if (raw === undefined || raw === "") return { condition: null };
+  if (raw === UNASSIGNED) {
+    return owners
+      ? { error: { status: 403, message: "Access denied" } }
+      : { condition: UNASSIGNED_CONDITION };
+  }
+  if (typeof raw !== "string" || !/^[a-f\d]{24}$/i.test(raw))
+    return { error: { status: 400, message: "Invalid assignee" } };
+  const id = new mongoose.Types.ObjectId(raw);
+  if (owners && !owners.some((o) => o.equals(id)))
+    return { error: { status: 403, message: "Access denied" } };
+  return { condition: { assignedTo: id } };
+};
+
+const CLIENT_LIST_POPULATE = [
+  { path: "assignedTo", select: "name email role profilePicture" },
+  { path: "allocatedAccountant", select: "name email" },
+  { path: "createdBy", select: "name role" },
+] as const;
+
+// GET /clients
+//   ?assignee=<userId>     only that person's clients — the CEO may pick
+//                          anyone, a supervisor themself or their team
+//   ?assignee=unassigned   clients nobody is assigned to (CEO only)
 export const getClients = async (req: AuthRequest, res: Response) => {
   try {
-    const {
-      page = "1",
-      limit = "20",
-      search,
-      salesStage,
-      salesOnly,
-      tab,
-      mine,
-    } = req.query as Record<string, string>;
+    const { page = "1", limit = "20", assignee } = req.query as Record<
+      string,
+      string
+    >;
     const skip = (Number(page) - 1) * Number(limit);
     const uid = new mongoose.Types.ObjectId(req.user!.userId);
 
-    const filter: Record<string, unknown> = {};
-
-    if (isCEO(req)) {
-      // CEO: all clients
-    } else if (req.user!.role === "supervisor") {
-      // Supervisor: clients where they are directly assigned OR any of their subordinates are assigned
-      const maps = await SupervisorMapping.find({
-        supervisorId: uid,
-        status: "active",
-      }).select("subordinateId");
-      const subIds = maps.map((m) => m.subordinateId);
-      filter.assignedTo = { $in: [uid, ...subIds] };
-    } else {
-      // User / Sales person: only directly assigned
-      filter.assignedTo = uid;
+    const owners = await browsableOwnerIds(req);
+    const picked = checkAssignee(assignee, owners);
+    if ("error" in picked) {
+      res
+        .status(picked.error.status)
+        .json({ success: false, message: picked.error.message });
+      return;
     }
 
-    // GET /clients?mine=true — only clients assigned to the caller. Lets the
-    // CEO, working in the Sales or Accountant workspace, see just their own
-    // book instead of every client in the company.
-    if (mine === "true") filter.assignedTo = uid;
-
-    // Sales pipeline filters — e.g. GET /clients?salesOnly=true&salesStage=won
-    if (salesOnly === "true") filter.isSalesLead = true;
-    if (salesStage) filter.salesStage = salesStage;
-
-    const and: Record<string, unknown>[] = [];
-    // GET /clients?tab=prospects|won — the CEO's two client lists:
-    //   prospects → leads still in the pipeline (any stage but won, lost included)
-    //   won       → won clients plus existing clients added before the pipeline
-    if (tab === "prospects")
-      and.push({ isSalesLead: true, salesStage: { $ne: "won" } });
-    else if (tab === "won")
-      and.push({ $or: [{ isSalesLead: { $ne: true } }, { salesStage: "won" }] });
-    if (search)
-      and.push({
-        $or: [
-          { name: { $regex: search, $options: "i" } },
-          { company: { $regex: search, $options: "i" } },
-          { email: { $regex: search, $options: "i" } },
-        ],
-      });
-    if (and.length) filter.$and = and;
+    let filter = buildClientListFilter(
+      req.query as Record<string, string>,
+      uid,
+      owners,
+    );
+    if (picked.condition) filter = withCondition(filter, picked.condition);
 
     const [clients, total] = await Promise.all([
       ClientModel.find(filter)
@@ -481,6 +569,151 @@ export const getClients = async (req: AuthRequest, res: Response) => {
     });
     return;
   } catch (err) {
+    res.status(500).json({ success: false });
+    return;
+  }
+};
+
+// GET /clients/grouped — the caller's clients grouped by the person they are
+// assigned to (CEO and supervisors only). Takes the same mine / salesOnly /
+// salesStage / tab / search params as GET /clients.
+//
+//   ?perGroup=N   clients previewed per person (default 5, max 20; 0 = counts
+//                 only). Each group's `total` is always the full count — the
+//                 client opens a person's whole list with ?assignee=<id>.
+//
+// A client assigned to several people is listed under each of them, so the
+// group totals can add up to more than `totalClients` (the distinct count).
+// A supervisor's groups are limited to themself and their active team, and
+// every team member is listed — with total 0 if they have no clients — so a
+// picker built from this stays stable. The CEO also gets an "unassigned"
+// group (user: null) when there are such clients.
+export const getClientsGrouped = async (req: AuthRequest, res: Response) => {
+  try {
+    if (!isCEO(req) && req.user!.role !== "supervisor") {
+      res.status(403).json({ success: false, message: "Access denied" });
+      return;
+    }
+    const query = req.query as Record<string, string>;
+    const uid = new mongoose.Types.ObjectId(req.user!.userId);
+    const owners = await browsableOwnerIds(req);
+    const filter = buildClientListFilter(query, uid, owners);
+    const perGroup = Math.min(
+      Math.max(parseInt(query.perGroup ?? "5", 10) || 0, 0),
+      20,
+    );
+
+    // Whose groups may appear: with mine=true only the caller's own.
+    // null = anyone (CEO).
+    const scope = query.mine === "true" ? [uid] : owners;
+
+    const [rows, unassignedTotal, totalClients] = await Promise.all([
+      ClientModel.aggregate<{
+        _id: mongoose.Types.ObjectId;
+        total: number;
+        ids?: mongoose.Types.ObjectId[];
+      }>([
+        { $match: filter },
+        { $sort: { createdAt: -1 } },
+        { $unwind: "$assignedTo" },
+        ...(scope ? [{ $match: { assignedTo: { $in: scope } } }] : []),
+        {
+          $group: {
+            _id: "$assignedTo",
+            total: { $sum: 1 },
+            ...(perGroup > 0 ? { ids: { $push: "$_id" } } : {}),
+          },
+        },
+        ...(perGroup > 0
+          ? [
+              {
+                $project: { total: 1, ids: { $slice: ["$ids", perGroup] } },
+              },
+            ]
+          : []),
+      ]),
+      scope
+        ? 0
+        : ClientModel.countDocuments(withCondition(filter, UNASSIGNED_CONDITION)),
+      ClientModel.countDocuments(filter),
+    ]);
+
+    const unassignedIds =
+      !scope && perGroup > 0 && unassignedTotal > 0
+        ? (
+            await ClientModel.find(withCondition(filter, UNASSIGNED_CONDITION))
+              .sort({ createdAt: -1 })
+              .limit(perGroup)
+              .select("_id")
+              .lean()
+          ).map((c) => c._id as mongoose.Types.ObjectId)
+        : [];
+
+    // Who the groups belong to. A supervisor's whole active team is listed
+    // even with no clients; anyone else only appears if they have some.
+    const withClients = new Set(rows.map((r) => String(r._id)));
+    const emptyTeamIds =
+      scope && req.user!.role === "supervisor"
+        ? scope.filter((id) => !withClients.has(String(id)))
+        : [];
+    const [people, clientDocs] = await Promise.all([
+      User.find({
+        $or: [
+          { _id: { $in: rows.map((r) => r._id) } },
+          { _id: { $in: emptyTeamIds }, isActive: true },
+        ],
+      })
+        .select("name email role profilePicture department")
+        .lean(),
+      (() => {
+        const ids = [...rows.flatMap((r) => r.ids ?? []), ...unassignedIds];
+        return ids.length
+          ? ClientModel.find({ _id: { $in: ids } })
+              .populate([...CLIENT_LIST_POPULATE])
+              .lean()
+          : Promise.resolve([]);
+      })(),
+    ]);
+    const personById = new Map(people.map((p) => [String(p._id), p]));
+    const clientById = new Map(clientDocs.map((c) => [String(c._id), c]));
+    const pick = (ids: mongoose.Types.ObjectId[] = []) =>
+      ids.flatMap((id) => clientById.get(String(id)) ?? []);
+
+    const personGroups = [
+      ...rows.flatMap((r) => {
+        const user = personById.get(String(r._id));
+        return user
+          ? [{ key: String(r._id), user, total: r.total, clients: pick(r.ids) }]
+          : []; // assigned to a user who no longer exists
+      }),
+      ...emptyTeamIds.flatMap((id) => {
+        const user = personById.get(String(id));
+        return user ? [{ key: String(id), user, total: 0, clients: pick() }] : [];
+      }),
+    ].sort((a, b) => {
+      // The caller first, then alphabetical.
+      const mine = (g: { key: string }) => (g.key === String(uid) ? 0 : 1);
+      return mine(a) - mine(b) || a.user.name.localeCompare(b.user.name);
+    });
+
+    const groups: {
+      key: string;
+      user: (typeof personGroups)[number]["user"] | null;
+      total: number;
+      clients: unknown[];
+    }[] = [...personGroups];
+    if (unassignedTotal > 0)
+      groups.push({
+        key: UNASSIGNED,
+        user: null,
+        total: unassignedTotal,
+        clients: pick(unassignedIds),
+      });
+
+    res.json({ success: true, data: { groups, totalClients } });
+    return;
+  } catch (err) {
+    console.error("getClientsGrouped error:", err);
     res.status(500).json({ success: false });
     return;
   }
