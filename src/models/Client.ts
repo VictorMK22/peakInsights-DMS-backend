@@ -21,6 +21,15 @@ export interface ISalesStageEntry {
   changedAt: Date;
 }
 
+// A staff member who used to serve this client and was later deactivated or
+// deleted. Kept so the CEO can see who the client was with before.
+export interface IFormerAssignee {
+  userId: mongoose.Types.ObjectId;
+  name: string;
+  role?: string;
+  releasedAt: Date;
+}
+
 export interface IClient extends Document {
   name: string;
   email?: string;
@@ -48,6 +57,14 @@ export interface IClient extends Document {
   allocatedAccountant?: mongoose.Types.ObjectId;
   allocatedAt?: Date;
   allocatedBy?: mongoose.Types.ObjectId;
+  // Set when the accountant serving this client left (deactivated/deleted) and
+  // nobody else is serving them. The client lands in the CEO's allocation queue
+  // until a new accountant is assigned; everything already recorded against the
+  // client (emails, WhatsApp, notes, calls…) stays and is visible to whoever
+  // is assigned next.
+  needsReallocation?: boolean;
+  releasedAt?: Date;
+  formerAssignees?: IFormerAssignee[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -58,6 +75,16 @@ const SalesStageEntrySchema = new Schema<ISalesStageEntry>(
     note: { type: String, trim: true },
     changedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
     changedAt: { type: Date, default: Date.now },
+  },
+  { _id: false },
+);
+
+const FormerAssigneeSchema = new Schema<IFormerAssignee>(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    name: { type: String, required: true },
+    role: { type: String },
+    releasedAt: { type: Date, default: Date.now },
   },
   { _id: false },
 );
@@ -81,6 +108,9 @@ const ClientSchema = new Schema<IClient>(
     allocatedAccountant: { type: Schema.Types.ObjectId, ref: "User" },
     allocatedAt: { type: Date },
     allocatedBy: { type: Schema.Types.ObjectId, ref: "User" },
+    needsReallocation: { type: Boolean, default: false },
+    releasedAt: { type: Date },
+    formerAssignees: { type: [FormerAssigneeSchema], default: undefined },
   },
   { timestamps: true },
 );
@@ -89,6 +119,7 @@ ClientSchema.index({ createdBy: 1 });
 ClientSchema.index({ assignedTo: 1 });
 ClientSchema.index({ isSalesLead: 1, salesStage: 1 });
 ClientSchema.index({ salesStage: 1, allocatedAccountant: 1 });
+ClientSchema.index({ needsReallocation: 1 });
 ClientSchema.index({ name: "text", company: "text", email: "text" });
 
 export const ClientModel = mongoose.model<IClient>("Client", ClientSchema);

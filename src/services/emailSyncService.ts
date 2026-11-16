@@ -52,6 +52,37 @@ function extractCounterpartEmail(raw: string): string {
   return (match ? match[1] : raw).trim().toLowerCase();
 }
 
+/** Every address in a header like `"A" <a@x.com>, b@y.com` (lower-cased). */
+function extractAllEmails(raw: string): string[] {
+  return [
+    ...new Set(
+      (raw.match(/[a-z0-9._%+'-]+@[a-z0-9.-]+\.[a-z]{2,}/gi) ?? []).map((e) =>
+        e.toLowerCase(),
+      ),
+    ),
+  ];
+}
+
+/** Content fingerprint for a CLIENT email. The same message reaches every
+ *  connected mailbox it was addressed to (e.g. a client replying to one
+ *  accountant with two colleagues Cc'd) under a different provider message id
+ *  in each, so this — not the provider id — is what keeps it logged once.
+ *  Rounded to the minute because the copies' receive times can differ slightly. */
+function computeClientDedupeKey(
+  clientId: unknown,
+  direction: "inbound" | "outbound",
+  subject: string,
+  epochMs: number,
+): string {
+  const normalized = [
+    String(clientId),
+    direction,
+    subject.trim().toLowerCase(),
+    Math.floor(epochMs / 60000),
+  ].join("::");
+  return crypto.createHash("sha256").update(normalized).digest("hex");
+}
+
 /** Content fingerprint used to dedupe an internal staff-to-staff email
  *  that may get synced independently from both participants' mailboxes.
  *  Rounds the timestamp to the minute since the two copies of the same
@@ -163,9 +194,22 @@ async function syncOneMailbox(
     }
 
     for (const msg of messages) {
-      const counterpart = extractCounterpartEmail(
-        target.direction === "inbound" ? msg.fromAddress : msg.toAddress,
-      );
+      // An outgoing email can have several recipients (To + Cc) and the
+      // client may be any of them — not just the first. Look at all of them,
+      // preferring a client over a colleague, so no client email is missed.
+      const candidates =
+        target.direction === "inbound"
+          ? extractAllEmails(msg.fromAddress)
+          : [
+              ...extractAllEmails(msg.toAddress),
+              ...extractAllEmails(msg.ccAddress ?? ""),
+            ];
+      const counterpart =
+        candidates.find((a) => clientByEmail.has(a)) ??
+        candidates.find((a) => staffByEmail.has(a)) ??
+        extractCounterpartEmail(
+          target.direction === "inbound" ? msg.fromAddress : msg.toAddress,
+        );
 
       const clientId = clientByEmail.get(counterpart);
       const staffUserId = staffByEmail.get(counterpart);
@@ -385,8 +429,14 @@ async function syncClientMessage(
   // Idempotency: skip if we've already logged this exact message
   // (unique index also protects against a race, this just avoids
   // the extra failed insert + noisy error log).
+  const dedupeKey = computeClientDedupeKey(
+    clientId,
+    direction,
+    msg.subject,
+    Number(msg.receivedTime),
+  );
   const exists = await ClientEmailModel.exists({
-    externalMessageId: msg.messageId,
+    $or: [{ externalMessageId: msg.messageId }, { dedupeKey }],
   });
   if (exists) return false;
 
@@ -429,6 +479,7 @@ async function syncClientMessage(
       source: "external_sync",
       externalMessageId: msg.messageId,
       syncedFromUserId: integration.userId,
+      dedupeKey,
     });
     return true;
   } catch (err: any) {

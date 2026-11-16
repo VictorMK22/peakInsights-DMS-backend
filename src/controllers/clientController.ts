@@ -4,6 +4,7 @@ import { ClientModel, SALES_STAGES, SalesStage } from "../models/Client";
 import {
   ClientEmailModel,
   IClientEmailAttachment,
+  IClientEmailCc,
 } from "../models/ClientEmail";
 import { DocumentModel } from "../models/Document";
 import { User } from "../models/User";
@@ -13,6 +14,7 @@ import {
   sendDirectUserEmail,
 } from "../services/emailService";
 import { getLocalFileUrl } from "../middleware/upload";
+import { withAuthorFallback } from "../services/departedStaffService";
 import { createNotification } from "../services/notificationService";
 import { syncMyMailbox } from "../services/emailSyncService";
 import { EmailIntegrationModel } from "../models/EmailIntegration";
@@ -73,6 +75,23 @@ const emailAssignee = async (
     console.error("❌ client assignment email failed:", err);
   }
 };
+
+/** ccIds can arrive as an array (JSON), a JSON string, or one id (multipart). */
+const parseIdList = (v: unknown): string[] => {
+  if (Array.isArray(v)) return v.map(String);
+  if (typeof v === "string" && v.trim()) {
+    try {
+      const parsed = JSON.parse(v);
+      return Array.isArray(parsed) ? parsed.map(String) : [String(parsed)];
+    } catch {
+      return [v];
+    }
+  }
+  return [];
+};
+
+/** Most colleagues one client email may copy (same cap as internal email). */
+const MAX_CLIENT_EMAIL_CC = 10;
 
 /** Attach fresh short-lived signed URLs to a set of stored attachments. */
 const withSignedAttachmentUrls = (attachments: IClientEmailAttachment[] = []) =>
@@ -879,6 +898,10 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
         $set: {
           assignedTo: userIds.map((id) => new mongoose.Types.ObjectId(id)),
           assignedAt: new Date(),
+          // Putting someone on the client answers the "accountant left" queue.
+          ...(!prospect && userIds.length > 0
+            ? { needsReallocation: false }
+            : {}),
         },
       },
       { new: true },
@@ -968,7 +991,7 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
 
     const [clients, people, supervisorIds] = await Promise.all([
       ClientModel.find({ _id: { $in: uniqueClientIds } }).select(
-        "name assignedTo isSalesLead salesStage allocatedAccountant",
+        "name assignedTo isSalesLead salesStage allocatedAccountant needsReallocation",
       ),
       User.find({ _id: { $in: uniqueUserIds } })
         .select("name email role isActive")
@@ -1013,13 +1036,14 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
       const added = uniqueUserIds.filter((id) => !have.has(id));
       const needsAllocation =
         !!c.isSalesLead && c.salesStage === "won" && !c.allocatedAccountant;
-      if (added.length === 0 && !needsAllocation) {
+      if (added.length === 0 && !needsAllocation && !c.needsReallocation) {
         alreadyAssigned += 1;
         continue;
       }
 
       const $set: Record<string, unknown> = {};
       if (added.length > 0) $set.assignedAt = now;
+      if (c.needsReallocation) $set.needsReallocation = false;
       if (needsAllocation) {
         $set.allocatedAccountant = toObjectId(primaryId);
         $set.allocatedAt = now;
@@ -1081,7 +1105,8 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
 // WON CLIENTS → CEO ALLOCATES AN ACCOUNTANT
 // ═══════════════════════════════════════════════════════════════
 
-// GET /clients/awaiting-allocation — won leads that have no accountant yet.
+// GET /clients/awaiting-allocation — won leads that have no accountant yet,
+// plus clients whose accountant has left the company (needsReallocation).
 // CEO only. (A won client that already has an accountant among its
 // assignees — e.g. assigned by hand before this flow existed — is not
 // listed, so old data doesn't show up as pending.)
@@ -1095,9 +1120,17 @@ export const getAwaitingAllocation = async (
       .json({ success: false, message: "Only the CEO can allocate accountants" });
   try {
     const clients = await ClientModel.find({
-      isSalesLead: true,
-      salesStage: "won",
-      allocatedAccountant: { $exists: false },
+      $or: [
+        // Won leads that were never given an accountant…
+        {
+          isSalesLead: true,
+          salesStage: "won",
+          allocatedAccountant: { $exists: false },
+        },
+        // …and clients whose accountant has left (deactivated / deleted).
+        // Their whole history stays on the client for the next accountant.
+        { needsReallocation: true },
+      ],
     })
       .populate("assignedTo", "name email role")
       .populate("createdBy", "name")
@@ -1144,7 +1177,7 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
     ]);
     if (!client)
       return res.status(404).json({ success: false, message: "Client not found" });
-    if (client.salesStage !== "won")
+    if (client.salesStage !== "won" && !client.needsReallocation)
       return res.status(400).json({
         success: false,
         message: "An accountant can only be allocated to a client that has been won",
@@ -1182,6 +1215,8 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
     client.allocatedAccountant = accountant._id as mongoose.Types.ObjectId;
     client.allocatedAt = new Date();
     client.allocatedBy = new mongoose.Types.ObjectId(req.user!.userId);
+    // A client whose accountant left is back in service.
+    client.needsReallocation = false;
     await client.save();
 
     // Tell the accountant, and the sales person who won the client.
@@ -1334,10 +1369,14 @@ export const getClientEmails = async (req: AuthRequest, res: Response) => {
     res.json({
       success: true,
       data: {
-        emails: emails.map((e) => ({
-          ...e,
-          attachments: withSignedAttachmentUrls(e.attachments),
-        })),
+        // withAuthorFallback: a former team member's emails stay in the thread
+        // (they belong to the client) and still show who wrote them.
+        emails: emails.map((e) =>
+          withAuthorFallback({
+            ...e,
+            attachments: withSignedAttachmentUrls(e.attachments),
+          }),
+        ),
       },
       pagination: {
         page: Number(page),
@@ -1446,6 +1485,43 @@ export const sendClientEmail = async (req: AuthRequest, res: Response) => {
         .status(400)
         .json({ success: false, message: "Body is required" });
 
+    // ── Cc: company team members ──────────────────────────────────
+    // Staff only (by id, never free-typed addresses): the client's email is
+    // the company's correspondence, and a Cc'd colleague gets a real copy in
+    // their own inbox. Anyone active with an address can be copied.
+    const ccRequested = [...new Set(parseIdList(req.body?.ccIds))].filter(
+      (id) => id !== req.user!.userId,
+    );
+    if (ccRequested.some((id) => !mongoose.Types.ObjectId.isValid(id)))
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid Cc recipient" });
+    if (ccRequested.length > MAX_CLIENT_EMAIL_CC)
+      return res.status(400).json({
+        success: false,
+        message: `You can Cc at most ${MAX_CLIENT_EMAIL_CC} people`,
+      });
+    const ccUsers = ccRequested.length
+      ? await User.find({
+          _id: { $in: ccRequested },
+          isActive: true,
+          email: { $exists: true, $ne: "" },
+        })
+          .select("name email")
+          .lean()
+      : [];
+    if (ccUsers.length !== ccRequested.length)
+      return res.status(400).json({
+        success: false,
+        message:
+          "One or more people you tried to Cc are no longer active or have no email address",
+      });
+    const cc: IClientEmailCc[] = ccUsers.map((u) => ({
+      userId: u._id as mongoose.Types.ObjectId,
+      name: u.name,
+      email: String(u.email).toLowerCase(),
+    }));
+
     const uploadedFiles =
       (req.files as Express.Multer.File[] | undefined) ?? [];
     const attachments: IClientEmailAttachment[] = uploadedFiles.map((f) => ({
@@ -1463,6 +1539,7 @@ export const sendClientEmail = async (req: AuthRequest, res: Response) => {
       subject: subject.trim(),
       body: body.trim(),
       toEmail: client.email,
+      cc: cc.length ? cc : undefined,
       attachments,
       status: "sent",
       sentAt: new Date(),
@@ -1473,6 +1550,7 @@ export const sendClientEmail = async (req: AuthRequest, res: Response) => {
     try {
       await sendDirectUserEmail({
         toEmail: client.email,
+        ccEmails: cc.length ? cc.map((c) => c.email) : undefined,
         subject: subject.trim(),
         body: body.trim(),
         fromName: sender?.name ?? "Account Manager",

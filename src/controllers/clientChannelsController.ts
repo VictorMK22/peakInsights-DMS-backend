@@ -10,6 +10,7 @@ import { redactDeclineReasons } from "../services/meetingRsvpService";
 import { ClientCallModel } from "../models/ClientCall";
 import { TaskModel } from "../models/Task";
 import { calculateTAT, formatTAT } from "../utils/tatCalculator";
+import { withAuthorFallback } from "../services/departedStaffService";
 
 /**
  * How long the lead has been idle waiting on this meeting: from when the
@@ -43,7 +44,10 @@ export const getClientNotes = async (req: AuthRequest, res: Response) => {
     .populate("authorId", "name role profilePicture")
     .sort({ createdAt: -1 })
     .lean();
-  return res.json({ success: true, data: { notes } });
+  return res.json({
+    success: true,
+    data: { notes: notes.map((n) => withAuthorFallback(n)) },
+  });
 };
 
 export const createClientNote = async (req: AuthRequest, res: Response) => {
@@ -97,7 +101,9 @@ export const getClientMeetings = async (req: AuthRequest, res: Response) => {
     .lean();
   return res.json({
     success: true,
-    data: { meetings: meetings.map(withIdleTime) },
+    data: {
+      meetings: meetings.map((m) => withIdleTime(withAuthorFallback(m))),
+    },
   });
 };
 
@@ -339,7 +345,10 @@ export const getClientCalls = async (req: AuthRequest, res: Response) => {
     .populate("authorId", "name role profilePicture")
     .sort({ calledAt: -1 })
     .lean();
-  return res.json({ success: true, data: { calls } });
+  return res.json({
+    success: true,
+    data: { calls: calls.map((c) => withAuthorFallback(c)) },
+  });
 };
 
 export const createClientCall = async (req: AuthRequest, res: Response) => {

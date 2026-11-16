@@ -7,6 +7,7 @@ import { FolderModel } from "../models/Folder";
 import { AuthRequest } from "../types/auth";
 import { generateToken } from "../services/authService";
 import { sendAccountCreatedByCEOEmail } from "../services/emailService";
+import { offboardStaff } from "../services/departedStaffService";
 import mongoose from "mongoose";
 import Notification from "../models/Notification";
 
@@ -565,6 +566,11 @@ export const updateUser = async (
       }
     }
 
+    // Switching someone to inactive from the edit form is the same as
+    // deactivating them: their clients go back to the CEO's allocation queue.
+    // Must run BEFORE the update (it needs to see them as they were).
+    if (updates.isActive === false) await offboardStaff(id);
+
     const user = await User.findByIdAndUpdate(id, updates, {
       new: true,
       runValidators: true,
@@ -586,6 +592,14 @@ export const deleteUser = async (
 ): Promise<void> => {
   try {
     const { id } = req.params as { id: string };
+    if (!(await User.exists({ _id: id }))) {
+      res.status(404).json({ success: false, message: "User not found" });
+      return;
+    }
+    // Hand their clients back to the CEO's allocation queue and cut off their
+    // mailbox BEFORE deactivating, while we can still see who they were. Their
+    // emails, notes, calls etc. stay with the client — nothing is deleted.
+    const offboarded = await offboardStaff(id);
     const user = await User.findByIdAndUpdate(
       id,
       { isActive: false },
@@ -599,7 +613,14 @@ export const deleteUser = async (
       { $or: [{ supervisorId: id }, { subordinateId: id }], status: "active" },
       { status: "historical", deactivationDate: new Date() },
     );
-    res.json({ success: true, message: "User deactivated successfully" });
+    res.json({
+      success: true,
+      message: "User deactivated successfully",
+      data: {
+        clientsReleased: offboarded.released,
+        clientsNeedingReallocation: offboarded.needReallocation,
+      },
+    });
   } catch (err) {
     next(err);
   }
@@ -629,6 +650,12 @@ export const deleteUser = async (
  * What DOES get cleaned up automatically: every SupervisorMapping row
  * referencing this user (as supervisor or subordinate, active or
  * historical) — those are meaningless once the account is gone.
+ *
+ * What also happens automatically (see services/departedStaffService.ts):
+ * their clients are taken off them and, where nobody else is serving, put in
+ * the CEO's allocation queue; their name is stamped on every client email,
+ * WhatsApp message, note, call and meeting they wrote so those stay readable;
+ * and their connected mailbox's tokens are erased.
  *
  * What deliberately does NOT get touched: tasks, messages, emails,
  * comments, and audit log entries authored by or referencing this
@@ -686,12 +713,25 @@ export const permanentlyDeleteUser = async (
       return;
     }
 
+    // Clients go back to the CEO's allocation queue and the person's name is
+    // stamped on everything they wrote, so the client's history (emails,
+    // WhatsApp, notes, calls, meetings) survives the account and is visible
+    // to whoever is assigned next. Their mailbox tokens are erased.
+    const offboarded = await offboardStaff(id, { erase: true });
+
     await SupervisorMapping.deleteMany({
       $or: [{ supervisorId: id }, { subordinateId: id }],
     });
     await user.deleteOne();
 
-    res.json({ success: true, message: "User permanently deleted" });
+    res.json({
+      success: true,
+      message: "User permanently deleted",
+      data: {
+        clientsReleased: offboarded.released,
+        clientsNeedingReallocation: offboarded.needReallocation,
+      },
+    });
   } catch (err) {
     next(err);
   }

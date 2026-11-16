@@ -6,12 +6,21 @@
 // Only the author/assigned user can create outbound records.
 
 import mongoose, { Schema, Document } from "mongoose";
+import { FormerAuthorSchema, IFormerAuthor } from "./shared/FormerAuthorSchema";
 
 export interface IClientEmailAttachment {
   filename: string; // original filename, for display
   fileKey: string; // stored UUID filename on disk (see middleware/upload.ts)
   size: number;
   mimeType: string;
+}
+
+// A company team member copied on an email. Stored as a snapshot (not just an
+// id) so the "Cc:" line still reads correctly after that person leaves.
+export interface IClientEmailCc {
+  userId: mongoose.Types.ObjectId;
+  name: string;
+  email: string;
 }
 
 export interface IClientEmail extends Document {
@@ -22,6 +31,11 @@ export interface IClientEmail extends Document {
   body: string;
   fromEmail?: string; // client's email (for inbound)
   toEmail?: string; // client's email (for outbound)
+  // Company staff copied on this email (outbound sends from the hub).
+  cc?: IClientEmailCc[];
+  // Set when the author's account is deactivated/deleted — see
+  // models/shared/FormerAuthorSchema.ts. Lets the thread outlive its author.
+  formerAuthor?: IFormerAuthor;
   attachments: IClientEmailAttachment[];
   status: "sent" | "received" | "draft" | "failed";
   sentAt?: Date;
@@ -32,6 +46,11 @@ export interface IClientEmail extends Document {
   source: "system" | "external_sync";
   externalMessageId?: string; // provider's message ID, for de-duplication
   syncedFromUserId?: mongoose.Types.ObjectId; // whose connected mailbox this came from
+  // Content fingerprint (client + direction + subject + send-minute) for synced
+  // mail. The SAME client email shows up in every connected mailbox it reached
+  // (e.g. several teammates Cc'd) under a DIFFERENT provider message id each, so
+  // externalMessageId alone can't stop it being logged once per mailbox.
+  dedupeKey?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -46,6 +65,15 @@ const ClientEmailAttachmentSchema = new Schema<IClientEmailAttachment>(
   { _id: false },
 );
 
+const ClientEmailCcSchema = new Schema<IClientEmailCc>(
+  {
+    userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    name: { type: String, required: true },
+    email: { type: String, required: true },
+  },
+  { _id: false },
+);
+
 const ClientEmailSchema = new Schema<IClientEmail>(
   {
     clientId: { type: Schema.Types.ObjectId, ref: "Client", required: true },
@@ -55,6 +83,8 @@ const ClientEmailSchema = new Schema<IClientEmail>(
     body: { type: String, required: true },
     fromEmail: { type: String, trim: true },
     toEmail: { type: String, trim: true },
+    cc: { type: [ClientEmailCcSchema], default: undefined },
+    formerAuthor: { type: FormerAuthorSchema },
     attachments: { type: [ClientEmailAttachmentSchema], default: [] },
     // 'failed' = the record was saved but the actual SMTP delivery to the
     // client failed (e.g. SMTP not configured, bounced, network error).
@@ -73,6 +103,7 @@ const ClientEmailSchema = new Schema<IClientEmail>(
     },
     externalMessageId: { type: String, index: true, sparse: true },
     syncedFromUserId: { type: Schema.Types.ObjectId, ref: "User" },
+    dedupeKey: { type: String },
   },
   { timestamps: true },
 );
@@ -84,6 +115,9 @@ ClientEmailSchema.index(
   { externalMessageId: 1 },
   { unique: true, sparse: true },
 );
+
+// One logged copy per real-world message, however many mailboxes received it.
+ClientEmailSchema.index({ dedupeKey: 1 }, { unique: true, sparse: true });
 
 export const ClientEmailModel = mongoose.model<IClientEmail>(
   "ClientEmail",

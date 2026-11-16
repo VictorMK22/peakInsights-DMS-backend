@@ -1,8 +1,10 @@
 import mongoose, { Schema, Document } from "mongoose";
+import { FormerAuthorSchema, IFormerAuthor } from "./shared/FormerAuthorSchema";
 
 export interface IClientMeeting extends Document {
   clientId: mongoose.Types.ObjectId;
   authorId: mongoose.Types.ObjectId; // who logged the meeting
+  formerAuthor?: IFormerAuthor; // snapshot once the author's account is gone
   title: string;
   scheduledAt: Date;
   attendees: string[]; // free-text names (client-side people, not necessarily system users)
@@ -38,6 +40,7 @@ const ClientMeetingSchema = new Schema<IClientMeeting>(
   {
     clientId: { type: Schema.Types.ObjectId, ref: "Client", required: true },
     authorId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    formerAuthor: { type: FormerAuthorSchema },
     title: { type: String, required: true, trim: true },
     scheduledAt: { type: Date, required: true },
     attendees: { type: [String], default: [] },

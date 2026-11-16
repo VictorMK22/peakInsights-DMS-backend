@@ -3,6 +3,7 @@ import { AuthRequest } from "../types/auth";
 import { canAccess } from "./clientController";
 import { ClientModel } from "../models/Client";
 import { ClientWhatsappMessageModel } from "../models/ClientWhatsappMessage";
+import { withAuthorFallback } from "../services/departedStaffService";
 import {
   sendWhatsappTextMessage,
   verifyWebhookToken,
@@ -31,7 +32,15 @@ export const getClientWhatsappMessages = async (
     .lean();
   return res.json({
     success: true,
-    data: { messages, configured: whatsappIsConfigured() },
+    data: {
+      // An outbound message always had a staff author; if that account is
+      // gone, show the snapshot instead of an empty sender. (Inbound messages
+      // legitimately have no author.)
+      messages: messages.map((m) =>
+        withAuthorFallback(m, m.direction === "outbound"),
+      ),
+      configured: whatsappIsConfigured(),
+    },
   });
 };
 

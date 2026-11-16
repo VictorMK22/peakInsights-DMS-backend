@@ -134,6 +134,7 @@ export interface ZohoMessageSummary {
   subject: string;
   fromAddress: string;
   toAddress: string;
+  ccAddress?: string; // other recipients — a client can be on the Cc line
   receivedTime: string; // epoch millis as string
   hasAttachment: boolean;
 }
@@ -177,6 +178,7 @@ export async function listMessages(
       subject: m.subject || "(no subject)",
       fromAddress: (m.fromAddress || "").toLowerCase(),
       toAddress: (m.toAddress || "").toLowerCase(),
+      ccAddress: (m.ccAddress || "").toLowerCase(),
       receivedTime: String(m.receivedTime),
       hasAttachment: zohoFlag(m.hasAttachment),
     }));

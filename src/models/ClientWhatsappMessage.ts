@@ -1,8 +1,10 @@
 import mongoose, { Schema, Document } from "mongoose";
+import { FormerAuthorSchema, IFormerAuthor } from "./shared/FormerAuthorSchema";
 
 export interface IClientWhatsappMessage extends Document {
   clientId: mongoose.Types.ObjectId;
   authorId?: mongoose.Types.ObjectId; // staff member who sent it (outbound only)
+  formerAuthor?: IFormerAuthor; // snapshot once the author's account is gone
   direction: "outbound" | "inbound";
   messageType: string; // "text" | "image" | "document" | "audio" | "video" | "location" | "contacts" | "interactive" | "button" | "unknown"
   body: string;
@@ -28,6 +30,7 @@ const ClientWhatsappMessageSchema = new Schema<IClientWhatsappMessage>(
   {
     clientId: { type: Schema.Types.ObjectId, ref: "Client", required: true },
     authorId: { type: Schema.Types.ObjectId, ref: "User" },
+    formerAuthor: { type: FormerAuthorSchema },
     direction: { type: String, enum: ["outbound", "inbound"], required: true },
     messageType: { type: String, default: "text" },
     body: { type: String, required: true },
