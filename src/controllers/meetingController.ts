@@ -40,6 +40,10 @@ import {
   zohoMeetingJoinLink,
 } from "../services/zohoCalendarService";
 import { formatEatDateTime, formatEatTime } from "../utils/eatTime";
+import {
+  isVirtualLocation,
+  VIRTUAL_MEETING_LINK_REQUIRED_MESSAGE,
+} from "../utils/virtualMeeting";
 
 // A recurring series is capped so "invite everyone, repeat forever"
 // can't silently generate an unbounded number of documents — see
@@ -194,6 +198,16 @@ export const createMeeting = async (
       res.status(400).json({
         success: false,
         message: "endTime must be after startTime",
+      });
+      return;
+    }
+
+    // A virtual meeting must come with a join link — otherwise invitees
+    // would receive an invitation they can't act on.
+    if (isVirtualLocation(location) && !meetingLink?.trim()) {
+      res.status(400).json({
+        success: false,
+        message: VIRTUAL_MEETING_LINK_REQUIRED_MESSAGE,
       });
       return;
     }
@@ -837,6 +851,24 @@ export const updateMeeting = async (
         res.status(400).json({
           success: false,
           message: "A comment explaining the date change is required",
+        });
+        return;
+      }
+    }
+
+    // Same rule as creation, checked against what the meeting will look
+    // like after this edit. Skipped when the edit touches neither field,
+    // so older meetings can still be rescheduled.
+    if (
+      !salesLeadRestricted &&
+      (location !== undefined || meetingLink !== undefined)
+    ) {
+      const nextLocation = location !== undefined ? location : meeting.location;
+      const nextLink = meetingLink !== undefined ? meetingLink : meeting.meetingLink;
+      if (isVirtualLocation(nextLocation) && !nextLink?.trim()) {
+        res.status(400).json({
+          success: false,
+          message: VIRTUAL_MEETING_LINK_REQUIRED_MESSAGE,
         });
         return;
       }
