@@ -10,7 +10,8 @@
     "start": "node dist/index.js",
     "lint": "eslint src --ext .ts",
     "pretest": "node -e \"const {MongoMemoryServer}=require('mongodb-memory-server');(async()=>{console.log('Ensuring MongoDB test binary is downloaded (one-time, no timeout)...');const s=await MongoMemoryServer.create();await s.stop();console.log('MongoDB test binary ready.');})();\"",
-    "test": "jest"
+    "test": "jest",
+    "backfill:former-authors": "ts-node src/scripts/backfillFormerAuthors.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1009.0",
