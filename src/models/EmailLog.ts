@@ -29,6 +29,18 @@ export interface IEmailLog extends Document {
   ccIds?: mongoose.Types.ObjectId[];
   ccEmails?: string[];
 
+  // Which CC'd users have opened this email. CC'd people are not the
+  // `receiverId`, so `isRead` can't track them — this does. Never sent to
+  // the client (it would expose read receipts); the API turns it into a
+  // plain `isRead` for whoever is asking.
+  ccReadBy?: mongoose.Types.ObjectId[];
+
+  // ROOT emails only: everyone who is part of the conversation — the
+  // sender, the recipient, every CC, and anyone added to the CC of a later
+  // reply. This is what lets a person who was CC'd (or added mid-thread)
+  // open the thread, follow it, get it in their inbox and reply.
+  threadParticipantIds?: mongoose.Types.ObjectId[];
+
   subject: string;
   body: string;
   bodyPreview: string;
@@ -136,6 +148,16 @@ const EmailLogSchema = new Schema<IEmailLog>(
       default: undefined,
     },
 
+    ccReadBy: {
+      type: [{ type: Schema.Types.ObjectId, ref: "User" }],
+      default: undefined,
+    },
+
+    threadParticipantIds: {
+      type: [{ type: Schema.Types.ObjectId, ref: "User" }],
+      default: undefined,
+    },
+
     subject: {
       type: String,
       required: true,
@@ -231,6 +253,8 @@ EmailLogSchema.index({ receiverId: 1, parentId: 1, lastMessageAt: -1 });
 EmailLogSchema.index({ senderId: 1, parentId: 1, lastMessageAt: -1 });
 EmailLogSchema.index({ parentId: 1, createdAt: 1 });
 EmailLogSchema.index({ ccIds: 1, parentId: 1, lastMessageAt: -1 });
+EmailLogSchema.index({ threadParticipantIds: 1, parentId: 1, lastMessageAt: -1 });
+EmailLogSchema.index({ ccIds: 1, ccReadBy: 1 });
 EmailLogSchema.index({ broadcastId: 1, status: 1 });
 // Prevents the same staff-to-staff email being logged twice when both
 // participants have their mailbox connected and synced independently.

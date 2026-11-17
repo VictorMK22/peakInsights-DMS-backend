@@ -3,6 +3,7 @@ import { EmailLog, IEmailAttachment } from "../models/EmailLog";
 import { getDefaultFromAddress, sendDirectUserEmail } from "./emailService";
 import { AuditLog } from "../models/AuditLog";
 import { MailAttachment } from "./emailAttachmentService";
+import { addThreadParticipants } from "./emailThreadService";
 
 // Recipients per message for announcements. Providers cap recipients per
 // message, so a big announcement is split into several BCC batches.
@@ -23,6 +24,7 @@ export async function sendTrackedEmail({
   userAgent,
   supervisorId,
   parentId,
+  replyToEmailId,
   attachments,
   mailAttachments,
 }: any) {
@@ -38,8 +40,11 @@ export async function sendTrackedEmail({
   let references: string[] | undefined;
   let quoted: { fromName: string; date: string; body: string } | undefined;
 
+  // `parentId` is the thread's root; `replyToEmailId` is the email being
+  // answered (the latest one in the thread) — that is the one we quote and
+  // chain the References headers from. Defaults to the root.
   if (parentId) {
-    const parent = await EmailLog.findById(parentId)
+    const parent = await EmailLog.findById(replyToEmailId || parentId)
       .populate("senderId", "name")
       .select("senderId subject body messageId references createdAt");
 
@@ -73,6 +78,11 @@ export async function sendTrackedEmail({
     parentId: parentId || undefined,
     lastMessageAt: now,
     attachments: attachments?.length ? attachments : undefined,
+    // A new conversation starts with everyone on it as a participant, so
+    // CC'd people can follow it from their inbox right away.
+    threadParticipantIds: parentId
+      ? undefined
+      : [senderId, receiverId, ...cc.map((c) => c._id)],
   });
 
   // A reply landed — bump the root thread's lastMessageAt so the
@@ -83,6 +93,12 @@ export async function sendTrackedEmail({
       lastMessageAt: now,
       hasReplies: true,
     });
+    // Anyone newly added to the CC of this reply joins the conversation.
+    await addThreadParticipants(parentId, [
+      String(senderId),
+      String(receiverId),
+      ...cc.map((c) => c._id),
+    ]);
   }
 
   try {

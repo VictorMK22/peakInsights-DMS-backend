@@ -26,6 +26,16 @@ import { EmailLog } from "../models/EmailLog";
 import { sendDirectUserEmail } from "../services/emailService";
 import { syncMyMailbox } from "../services/emailSyncService";
 import { getTeamMembers } from "../utils/team";
+import {
+  idOf,
+  isThreadParticipant,
+  participantIdsOf,
+  resolveReplyRecipients,
+} from "../services/emailThreadService";
+
+// Most people who can be on the Cc of one thread (replies inherit the whole
+// thread's Cc list, so this also bounds how large a thread's audience grows).
+const MAX_THREAD_CC = 30;
 
 // Anyone can send to everyone (the hourly cap below still applies).
 const canBroadcast = (_role: string) => true;
@@ -105,11 +115,30 @@ const notBroadcastDuplicate = {
 };
 
 /** Shapes an email for the API. Thread views get signed URLs + resolved inline images. */
-const serializeEmail = (e: any, full = false) => {
-  const obj = typeof e.toObject === "function" ? e.toObject() : e;
+const serializeEmail = (e: any, full = false, viewerId?: string) => {
+  const raw = typeof e.toObject === "function" ? e.toObject() : e;
+  // Read receipts and the stored participant list stay server-side.
+  const { ccReadBy, threadParticipantIds: _participants, ...obj } = raw;
+
+  // `isRead` is the RECIPIENT's read state. For someone who only got this
+  // email as a Cc (or joined the thread later) it is their own state that
+  // matters, so report that instead.
+  let isRead = obj.isRead;
+  if (
+    viewerId &&
+    idOf(obj.receiverId) !== viewerId &&
+    idOf(obj.senderId) !== viewerId
+  ) {
+    const isCc = (obj.ccIds ?? []).some((c: any) => idOf(c) === viewerId);
+    isRead = isCc
+      ? (ccReadBy ?? []).some((r: any) => String(r) === viewerId)
+      : true;
+  }
+
   const attachments = presentAttachments(obj.attachments, obj.body);
   return {
     ...obj,
+    isRead,
     body: full ? resolveCidImages(obj.body, obj.attachments) : obj.body,
     attachments: full
       ? attachments
@@ -172,24 +201,39 @@ export const sendEmailDirect = async (
     // already follows for Messages.
     let receiverId = bodyReceiverId;
 
+    // Replies work like "reply all": anyone on the thread (sender,
+    // recipient or anyone Cc'd) can reply. The reply goes To the person who
+    // wrote the last email and Cc's everyone else on the thread, so the
+    // whole conversation stays together.
+    let threadRootId: string | undefined;
+    let replyToEmailId: string | undefined;
+    let inheritedCcIds: string[] = [];
+
     if (parentId) {
-      const parent = await EmailLog.findById(parentId).select(
-        "senderId receiverId",
-      );
+      if (!mongoose.Types.ObjectId.isValid(String(parentId))) {
+        return bail(404, "Parent email not found");
+      }
+      const threadFields =
+        "senderId receiverId ccIds threadParticipantIds parentId";
+      const parent = await EmailLog.findById(parentId).select(threadFields);
       if (!parent) {
         return bail(404, "Parent email not found");
       }
-      const isParticipant =
-        parent.senderId.toString() === senderId ||
-        parent.receiverId.toString() === senderId;
-      if (!isParticipant) {
+      // Replies always hang off the thread's root.
+      const root = parent.parentId
+        ? await EmailLog.findById(parent.parentId).select(threadFields)
+        : parent;
+      if (!root) {
+        return bail(404, "Parent email not found");
+      }
+      if (!isThreadParticipant(root, senderId)) {
         return bail(403, "Not part of this conversation");
       }
-      receiverId = (
-        parent.senderId.toString() === senderId
-          ? parent.receiverId
-          : parent.senderId
-      ).toString();
+      const resolved = await resolveReplyRecipients(root, senderId);
+      receiverId = resolved.toId;
+      inheritedCcIds = resolved.ccIds;
+      threadRootId = String(root._id);
+      replyToEmailId = resolved.replyToEmailId;
     } else {
       if (!receiverId) {
         return bail(400, "receiverId and body required");
@@ -214,6 +258,10 @@ export const sendEmailDirect = async (
     // ── CC ────────────────────────────────────────────────────────
     // Every CC'd person goes through the SAME canSendTo gate as the
     // main recipient — CC must not become a way around the RBAC rules.
+    // On a reply, everyone already on the thread is Cc'd automatically
+    // (they were let in when the thread started, so they are not re-gated).
+    // Only people the sender ADDS now go through canSendTo.
+    const inheritedSet = new Set(inheritedCcIds);
     const rawCc: string[] = Array.isArray(bodyCcIds)
       ? [...new Set(bodyCcIds.map(String))]
       : [];
@@ -221,10 +269,11 @@ export const sendEmailDirect = async (
       (id) =>
         mongoose.Types.ObjectId.isValid(id) &&
         id !== senderId &&
-        id !== String(receiverId),
+        id !== String(receiverId) &&
+        !inheritedSet.has(id),
     );
     if (ccFiltered.length > 10) {
-      return bail(400, "You can CC at most 10 people");
+      return bail(400, "You can add at most 10 people to the Cc at once");
     }
     for (const ccId of ccFiltered) {
       const { allowed, message } = await canEmail(senderId, senderRole, ccId);
@@ -232,13 +281,21 @@ export const sendEmailDirect = async (
         return bail(403, `Cannot CC this person: ${message}`);
       }
     }
-    const ccUsers = ccFiltered.length
+    const allCcIds = [...inheritedCcIds, ...ccFiltered];
+    if (allCcIds.length > MAX_THREAD_CC) {
+      return bail(
+        400,
+        `A conversation can have at most ${MAX_THREAD_CC} people on Cc`,
+      );
+    }
+    const ccUsers = allCcIds.length
       ? (
-          await User.find({ _id: { $in: ccFiltered } })
-            .select("name email")
+          await User.find({ _id: { $in: allCcIds } })
+            .select("name email isActive")
             .lean()
         )
-          .filter((u) => !!u.email)
+          // Deactivated colleagues drop off the thread's Cc automatically.
+          .filter((u) => !!u.email && (u as any).isActive !== false)
           .map((u) => ({ _id: String(u._id), email: u.email as string }))
       : [];
 
@@ -268,7 +325,8 @@ export const sendEmailDirect = async (
         ipAddress: req.ip,
         userAgent: req.headers["user-agent"],
         supervisorId: sender?.supervisorId,
-        parentId: parentId || undefined,
+        parentId: threadRootId,
+        replyToEmailId,
         attachments,
         mailAttachments,
       });
@@ -335,7 +393,7 @@ export const getSentEmails = async (
 
     res.json({
       success: true,
-      data: { emails: emails.map((e) => serializeEmail(e)) },
+      data: { emails: emails.map((e) => serializeEmail(e, false, userId)) },
       pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
     });
   } catch (err) {
@@ -377,6 +435,14 @@ export const getInboxEmails = async (
           ],
         },
         { ccIds: userId, parentId: null },
+        // Anyone else on the thread — e.g. added to the Cc of a later
+        // reply — sees the conversation in their inbox too.
+        {
+          threadParticipantIds: userId,
+          parentId: null,
+          senderId: { $ne: userId },
+          receiverId: { $ne: userId },
+        },
       ],
     };
 
@@ -392,13 +458,17 @@ export const getInboxEmails = async (
     ]);
 
     const threadIds = emails.map((e) => e._id);
+    const me = new mongoose.Types.ObjectId(userId);
     const unreadReplyCounts = threadIds.length
       ? await EmailLog.aggregate([
           {
             $match: {
               parentId: { $in: threadIds },
-              receiverId: new mongoose.Types.ObjectId(userId),
-              isRead: false,
+              // Unread for me as the recipient, or as someone Cc'd.
+              $or: [
+                { receiverId: me, isRead: false },
+                { ccIds: me, ccReadBy: { $ne: me } },
+              ],
             },
           },
           { $group: { _id: "$parentId", count: { $sum: 1 } } },
@@ -408,7 +478,7 @@ export const getInboxEmails = async (
       unreadReplyCounts.map((r) => [r._id.toString(), r.count]),
     );
     const emailsWithUnread = emails.map((e) => ({
-      ...serializeEmail(e),
+      ...serializeEmail(e, false, userId),
       hasUnreadReplies: (unreadByThread.get(e._id.toString()) ?? 0) > 0,
     }));
 
@@ -449,13 +519,8 @@ export const getEmailThread = async (
         .json({ success: false, message: "Email not found" });
     }
 
-    const isParticipant =
-      (parent.senderId as any)._id.toString() === userId ||
-      (parent.receiverId as any)._id.toString() === userId ||
-      ((parent.ccIds as any[]) ?? []).some(
-        (c) => String(c?._id ?? c) === userId,
-      );
-    if (!isParticipant) {
+    // Sender, recipient, anyone Cc'd, or anyone added to the thread later.
+    if (!isThreadParticipant(parent, userId)) {
       return res
         .status(403)
         .json({ success: false, message: "Not part of this conversation" });
@@ -472,11 +537,31 @@ export const getEmailThread = async (
       EmailLog.countDocuments({ parentId: id }),
     ]);
 
+    // Everyone in the conversation, and exactly who a reply from this
+    // person would go To / Cc — so the UI can show it before they send.
+    const reply = await resolveReplyRecipients(parent, userId);
+    const people = await User.find({
+      _id: { $in: [...new Set([...participantIdsOf(parent), reply.toId])] },
+    })
+      .select("name email role")
+      .lean();
+    const byId = new Map(people.map((u) => [String(u._id), u]));
+    const pick = (uid: string) => byId.get(uid);
+
     res.json({
       success: true,
       data: {
-        parent: serializeEmail(parent, true),
-        replies: replies.map((r) => serializeEmail(r, true)),
+        parent: serializeEmail(parent, true, userId),
+        replies: replies.map((r) => serializeEmail(r, true, userId)),
+        participants: participantIdsOf(parent)
+          .map(pick)
+          .filter((u): u is NonNullable<typeof u> => !!u),
+        replyTo: {
+          to: pick(reply.toId) ?? null,
+          cc: reply.ccIds
+            .map(pick)
+            .filter((u): u is NonNullable<typeof u> => !!u),
+        },
       },
       pagination: {
         page,
@@ -506,13 +591,28 @@ export const markEmailRead = async (
     const userId = req.user!.userId;
 
     const email = await EmailLog.findById(id).select(
-      "receiverId isRead readAt",
+      "receiverId ccIds isRead readAt",
     );
     if (!email) {
       return res
         .status(404)
         .json({ success: false, message: "Email not found" });
     }
+
+    // Someone who was only Cc'd keeps their own read state, separate from
+    // the recipient's — opening the email must not mark it read for them.
+    if (
+      email.receiverId.toString() !== userId &&
+      (email.ccIds ?? []).some((c) => String(c) === userId)
+    ) {
+      await EmailLog.updateOne(
+        { _id: email._id },
+        { $addToSet: { ccReadBy: userId } },
+      );
+      res.json({ success: true });
+      return;
+    }
+
     if (email.receiverId.toString() !== userId) {
       return res
         .status(403)
@@ -542,11 +642,13 @@ export const getUnreadEmailCount = async (
   next: NextFunction,
 ) => {
   try {
-    const count = await EmailLog.countDocuments({
-      receiverId: req.user!.userId,
-      isRead: false,
-    });
-    res.json({ success: true, data: { unreadCount: count } });
+    const userId = req.user!.userId;
+    // Emails addressed to me, plus emails I'm Cc'd on and haven't opened.
+    const [addressed, copied] = await Promise.all([
+      EmailLog.countDocuments({ receiverId: userId, isRead: false }),
+      EmailLog.countDocuments({ ccIds: userId, ccReadBy: { $ne: userId } }),
+    ]);
+    res.json({ success: true, data: { unreadCount: addressed + copied } });
   } catch (err) {
     next(err);
   }
