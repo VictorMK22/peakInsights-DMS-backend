@@ -357,6 +357,105 @@ const parsePage = (q: Record<string, string>) => ({
   limit: Math.min(50, parseInt(q.limit ?? "20", 10)),
 });
 
+// ── Email search ────────────────────────────────────────────────────
+// Optional query params on /emails/inbox and /emails/sent:
+//   q       free text — matches subject, preview, addresses, and the names or
+//           emails of the people on the email
+//   from/to ISO dates — when the email was sent/received (inclusive)
+// The inbox also takes unread=1 (see getInboxEmails).
+// A match anywhere in a thread (a reply, not just the first email) brings
+// that whole thread up, and the user's normal access rules still apply.
+const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+interface EmailSearch {
+  q?: string;
+  from?: Date;
+  to?: Date;
+}
+
+const parseEmailSearch = (query: Record<string, unknown>): EmailSearch | null => {
+  const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  const date = (v: unknown) => {
+    const s = str(v);
+    if (!s) return undefined;
+    const d = new Date(s);
+    return Number.isNaN(d.getTime()) ? undefined : d;
+  };
+  const q = str(query.q).slice(0, 100);
+  const from = date(query.from);
+  const to = date(query.to);
+  if (!q && !from && !to) return null;
+  return { q: q || undefined, from, to };
+};
+
+/**
+ * Narrows a list's root filter to the threads that match the search.
+ * rootFilter is applied first, so search can never reveal anything the
+ * user couldn't already see in that list.
+ */
+const withEmailSearch = async (
+  rootFilter: Record<string, unknown>,
+  search: EmailSearch | null,
+): Promise<Record<string, unknown>> => {
+  if (!search) return rootFilter;
+
+  const rootIds = await EmailLog.find(rootFilter).distinct("_id");
+  const conditions: Record<string, unknown>[] = [];
+
+  if (search.q) {
+    const rx = new RegExp(escapeRegex(search.q), "i");
+    const people = await User.find({ $or: [{ name: rx }, { email: rx }] })
+      .select("_id")
+      .limit(100)
+      .lean();
+    const personIds = people.map((p) => p._id);
+    conditions.push({
+      $or: [
+        { subject: rx },
+        { bodyPreview: rx },
+        { toEmail: rx },
+        { ccEmails: rx },
+        ...(personIds.length
+          ? [
+              { senderId: { $in: personIds } },
+              { receiverId: { $in: personIds } },
+              { ccIds: { $in: personIds } },
+            ]
+          : []),
+      ],
+    });
+  }
+
+  if (search.from || search.to) {
+    const range = {
+      ...(search.from && { $gte: search.from }),
+      ...(search.to && { $lte: search.to }),
+    };
+    // sentAt is the real send/receive time (synced emails get their original
+    // one); createdAt is the fallback for anything not delivered yet.
+    conditions.push({
+      $or: [
+        { sentAt: range },
+        { sentAt: { $exists: false }, createdAt: range },
+      ],
+    });
+  }
+
+  const matches = await EmailLog.find({
+    $and: [
+      { $or: [{ _id: { $in: rootIds } }, { parentId: { $in: rootIds } }] },
+      ...conditions,
+    ],
+  })
+    .select("_id parentId")
+    .lean();
+
+  const matchedRootIds = [
+    ...new Set(matches.map((m) => String(m.parentId ?? m._id))),
+  ];
+  return { $and: [rootFilter, { _id: { $in: matchedRootIds } }] };
+};
+
 export const getSentEmails = async (
   req: AuthRequest,
   res: Response,
@@ -367,11 +466,15 @@ export const getSentEmails = async (
     const { page, limit } = parsePage(req.query as Record<string, string>);
     const skip = (page - 1) * limit;
 
-    const rootFilter = {
+    const baseFilter = {
       senderId: userId,
       parentId: null,
       ...notBroadcastDuplicate,
     };
+    const rootFilter = await withEmailSearch(
+      baseFilter,
+      parseEmailSearch(req.query),
+    );
 
     const [emails, total] = await Promise.all([
       EmailLog.find(rootFilter)
@@ -419,7 +522,7 @@ export const getInboxEmails = async (
     const { page, limit } = parsePage(req.query as Record<string, string>);
     const skip = (page - 1) * limit;
 
-    const rootFilter = {
+    const baseFilter = {
       $or: [
         { receiverId: userId, parentId: null },
         // Own sent mail shows up here too — but an announcement only once
@@ -445,6 +548,29 @@ export const getInboxEmails = async (
         },
       ],
     };
+    // ?unread=1 — only conversations with something I haven't opened: an
+    // email addressed to me, one I'm Cc'd on, or a thread with an unread reply.
+    let visibleFilter: Record<string, unknown> = baseFilter;
+    if (req.query.unread === "1") {
+      const unreadForMe = [
+        { receiverId: userId, isRead: false },
+        { ccIds: userId, ccReadBy: { $ne: userId } },
+      ];
+      const threadsWithUnreadReplies = await EmailLog.distinct("parentId", {
+        parentId: { $ne: null },
+        $or: unreadForMe,
+      });
+      visibleFilter = {
+        $and: [
+          baseFilter,
+          { $or: [...unreadForMe, { _id: { $in: threadsWithUnreadReplies } }] },
+        ],
+      };
+    }
+    const rootFilter = await withEmailSearch(
+      visibleFilter,
+      parseEmailSearch(req.query),
+    );
 
     const [emails, total] = await Promise.all([
       EmailLog.find(rootFilter)

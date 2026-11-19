@@ -136,8 +136,24 @@ export interface ZohoMessageSummary {
   toAddress: string;
   ccAddress?: string; // other recipients — a client can be on the Cc line
   receivedTime: string; // epoch millis as string
+  /** When the sender actually sent it (same in every recipient's copy), epoch millis as string. */
+  sentTime?: string;
+  /** Whether the mailbox owner has opened it in Zoho. undefined = Zoho didn't say. */
+  isRead?: boolean;
   hasAttachment: boolean;
 }
+
+/**
+ * Zoho reports read state as "1"/"0" on the list endpoint and "read"/"unread"
+ * on the search endpoint. Anything else (missing, "") means we don't know —
+ * callers must treat that as "not known to be read", never as read.
+ */
+export const parseZohoRead = (v: unknown): boolean | undefined => {
+  const s = String(v ?? "").trim().toLowerCase();
+  if (s === "1" || s === "read" || s === "true") return true;
+  if (s === "0" || s === "unread" || s === "false") return false;
+  return undefined;
+};
 
 /**
  * Zoho sends flags as the STRINGS "0"/"1", and Boolean("0") is true — which
@@ -180,6 +196,8 @@ export async function listMessages(
       toAddress: (m.toAddress || "").toLowerCase(),
       ccAddress: (m.ccAddress || "").toLowerCase(),
       receivedTime: String(m.receivedTime),
+      sentTime: m.sentDateInGMT ? String(m.sentDateInGMT) : undefined,
+      isRead: parseZohoRead(m.status),
       hasAttachment: zohoFlag(m.hasAttachment),
     }));
 }

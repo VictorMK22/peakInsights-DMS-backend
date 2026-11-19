@@ -141,6 +141,10 @@ export interface IMeeting extends Document {
 
   clientId?: mongoose.Types.ObjectId; // optional link to a CRM client
 
+  // Set when an external client booked this through a public booking link
+  // (see models/BookingLink.ts); used to cap bookings per email address.
+  bookingLinkId?: mongoose.Types.ObjectId;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -239,6 +243,7 @@ const MeetingSchema = new Schema<IMeeting>(
     reminderSent: { type: Boolean, default: false },
 
     clientId: { type: Schema.Types.ObjectId, ref: "Client" },
+    bookingLinkId: { type: Schema.Types.ObjectId, ref: "BookingLink" },
   },
   { timestamps: true },
 );
@@ -247,6 +252,7 @@ MeetingSchema.index({ organizer: 1, startTime: -1 });
 MeetingSchema.index({ "attendees.userId": 1, startTime: -1 });
 MeetingSchema.index({ startTime: 1, endTime: 1, status: 1 });
 MeetingSchema.index({ seriesId: 1 });
+MeetingSchema.index({ bookingLinkId: 1, startTime: 1 });
 MeetingSchema.index({ status: 1, reminderSent: 1, startTime: 1 });
 
 export const MeetingModel = mongoose.model<IMeeting>("Meeting", MeetingSchema);

@@ -738,6 +738,32 @@ const formatMeetingWindow = (start: Date, end: Date) =>
   formatEatWindow(start, end);
 
 /**
+ * Meeting emails drop names, titles and locations straight into HTML. Those
+ * are staff-typed for ordinary meetings, but a booking-link meeting carries
+ * text typed into a PUBLIC form (the client's name becomes part of the
+ * title) — so anyone could book under a victim's email address and have
+ * this system send them an email containing the attacker's HTML or links.
+ * Every free-text field is therefore escaped here, and a meeting link is
+ * only kept when it is a plain http(s) URL (blocks javascript: and the like).
+ * Use the result for the email BODY only — subjects are plain text.
+ */
+const escMeeting = <T extends MeetingEmailData & { reason?: string }>(
+  data: T,
+): T =>
+  ({
+    ...data,
+    toName: esc(data.toName),
+    title: esc(data.title),
+    organizerName: esc(data.organizerName),
+    location: data.location ? esc(data.location) : data.location,
+    meetingLink:
+      data.meetingLink && /^https?:\/\//i.test(data.meetingLink)
+        ? esc(data.meetingLink)
+        : undefined,
+    reason: data.reason ? esc(data.reason) : data.reason,
+  }) as T;
+
+/**
  * Where the Accept / Decline buttons lead: the public response page in the
  * web app. Opening the page records nothing — the person confirms there
  * (and, for Decline, gives a reason) — so mail scanners that pre-fetch
@@ -764,6 +790,7 @@ export async function sendMeetingInviteEmail(
   data: MeetingEmailData,
   fromEmail?: string,
 ): Promise<void> {
+  const d = escMeeting(data);
   await send(
     data.toEmail,
     `📅 You're invited: "${data.title}"`,
@@ -771,12 +798,12 @@ export async function sendMeetingInviteEmail(
       "Meeting Invitation",
       `
       ${h1("Meeting Invitation")}
-      ${p("Hi " + data.toName + ", " + data.organizerName + " has invited you to a meeting.")}
-      ${info("Title", data.title)}
+      ${p("Hi " + d.toName + ", " + d.organizerName + " has invited you to a meeting.")}
+      ${info("Title", d.title)}
       ${info("When", formatMeetingWindow(data.startTime, data.endTime) + (data.isRecurring ? " (recurring)" : ""))}
-      ${data.location ? info("Location", data.location) : ""}
-      ${data.meetingLink ? info("Meeting link", `<a href="${data.meetingLink}">${data.meetingLink}</a>`) : ""}
-      ${data.rsvpToken ? p("<strong>Will you be there?</strong> Please let " + esc(data.organizerName) + " know:") + rsvpBlock(data.rsvpToken) : ""}
+      ${d.location ? info("Location", d.location) : ""}
+      ${d.meetingLink ? info("Meeting link", `<a href="${d.meetingLink}">${d.meetingLink}</a>`) : ""}
+      ${data.rsvpToken ? p("<strong>Will you be there?</strong> Please let " + d.organizerName + " know:") + rsvpBlock(data.rsvpToken) : ""}
       ${
         data.isExternal
           ? highlight(
@@ -797,6 +824,7 @@ export async function sendMeetingUpdatedEmail(
   data: MeetingEmailData,
   fromEmail?: string,
 ): Promise<void> {
+  const d = escMeeting(data);
   await send(
     data.toEmail,
     `🔄 Updated: "${data.title}"`,
@@ -804,11 +832,11 @@ export async function sendMeetingUpdatedEmail(
       "Meeting Updated",
       `
       ${h1("Meeting Updated")}
-      ${p("Hi " + data.toName + ", " + data.organizerName + " updated the meeting details.")}
-      ${info("Title", data.title)}
+      ${p("Hi " + d.toName + ", " + d.organizerName + " updated the meeting details.")}
+      ${info("Title", d.title)}
       ${info("New time", formatMeetingWindow(data.startTime, data.endTime))}
-      ${data.location ? info("Location", data.location) : ""}
-      ${data.meetingLink ? info("Meeting link", `<a href="${data.meetingLink}">${data.meetingLink}</a>`) : ""}
+      ${d.location ? info("Location", d.location) : ""}
+      ${d.meetingLink ? info("Meeting link", `<a href="${d.meetingLink}">${d.meetingLink}</a>`) : ""}
       ${data.rsvpToken ? p("Your earlier response was cleared because the time changed. <strong>Can you still make it?</strong>") + rsvpBlock(data.rsvpToken) : ""}
       ${
         data.isExternal
@@ -828,6 +856,7 @@ export async function sendMeetingPostponedEmail(
   data: MeetingEmailData & { postponedTo?: Date; reason?: string },
   fromEmail?: string,
 ): Promise<void> {
+  const d = escMeeting(data);
   await send(
     data.toEmail,
     `⏸️ Postponed: "${data.title}"`,
@@ -835,8 +864,8 @@ export async function sendMeetingPostponedEmail(
       "Meeting Postponed",
       `
       ${h1("Meeting Postponed")}
-      ${p("Hi " + data.toName + ", " + data.organizerName + " postponed this meeting.")}
-      ${info("Title", data.title)}
+      ${p("Hi " + d.toName + ", " + d.organizerName + " postponed this meeting.")}
+      ${info("Title", d.title)}
       ${info("Was scheduled for", formatMeetingWindow(data.startTime, data.endTime))}
       ${
         data.postponedTo
@@ -846,7 +875,7 @@ export async function sendMeetingPostponedEmail(
             )
           : info("Postponed to", "New date to be confirmed")
       }
-      ${data.reason ? info("Reason", data.reason) : ""}
+      ${d.reason ? info("Reason", d.reason) : ""}
       ${
         data.isExternal
           ? highlight("Please update your own calendar once a new time is confirmed.")
@@ -863,6 +892,7 @@ export async function sendMeetingCancelledEmail(
   data: MeetingEmailData & { reason?: string },
   fromEmail?: string,
 ): Promise<void> {
+  const d = escMeeting(data);
   await send(
     data.toEmail,
     `❌ Cancelled: "${data.title}"`,
@@ -870,16 +900,105 @@ export async function sendMeetingCancelledEmail(
       "Meeting Cancelled",
       `
       ${h1("Meeting Cancelled")}
-      ${p("Hi " + data.toName + ", " + data.organizerName + " cancelled this meeting.")}
-      ${info("Title", data.title)}
+      ${p("Hi " + d.toName + ", " + d.organizerName + " cancelled this meeting.")}
+      ${info("Title", d.title)}
       ${info("Was scheduled for", formatMeetingWindow(data.startTime, data.endTime))}
-      ${data.reason ? info("Reason", data.reason) : ""}
+      ${d.reason ? info("Reason", d.reason) : ""}
     `,
     ),
     fromEmail,
   );
 }
 
+
+// ═════════════════════════════════════════════════════════════════
+// BOOKING LINKS — requests that wait for the host's approval
+// Everything below is typed by the public (client name, topic, reason),
+// so every value is escaped.
+// ═════════════════════════════════════════════════════════════════
+
+/** To a client right after they ask for a time that needs the host's OK. */
+export async function sendBookingRequestReceivedEmail(data: {
+  toEmail: string;
+  toName: string;
+  hostName: string;
+  title: string;
+  startTime: Date;
+  endTime: Date;
+}): Promise<void> {
+  await send(
+    data.toEmail,
+    `🕓 Request received: "${data.title}"`,
+    wrap(
+      "Booking Request Received",
+      `
+      ${h1("Request received")}
+      ${p("Hi " + esc(data.toName) + ", thanks — " + esc(data.hostName) + " will review your request and confirm by email.")}
+      ${info("Meeting", esc(data.title))}
+      ${info("Requested time", formatMeetingWindow(data.startTime, data.endTime))}
+      ${highlight("Nothing is confirmed yet. You'll receive a calendar invitation as soon as it's approved.")}
+    `,
+    ),
+  );
+}
+
+/** To a client whose request the host couldn't accept. */
+export async function sendBookingRequestDeclinedEmail(data: {
+  toEmail: string;
+  toName: string;
+  hostName: string;
+  title: string;
+  startTime: Date;
+  endTime: Date;
+  reason?: string;
+  rebookUrl?: string;
+}): Promise<void> {
+  await send(
+    data.toEmail,
+    `Update on your booking request: "${data.title}"`,
+    wrap(
+      "Booking Request Update",
+      `
+      ${h1("Your request couldn't be confirmed")}
+      ${p("Hi " + esc(data.toName) + ", " + esc(data.hostName) + " isn't able to take this meeting at the time you asked for.")}
+      ${info("Meeting", esc(data.title))}
+      ${info("Requested time", formatMeetingWindow(data.startTime, data.endTime))}
+      ${data.reason ? info("Note from " + esc(data.hostName), esc(data.reason)) : ""}
+      ${data.rebookUrl ? p("You're welcome to choose another time:") + btn("Pick another time", esc(data.rebookUrl)) : ""}
+    `,
+    ),
+  );
+}
+
+/** To the host so a waiting request doesn't go unnoticed. */
+export async function sendBookingRequestOwnerEmail(data: {
+  toEmail: string;
+  ownerName: string;
+  clientName: string;
+  clientEmail: string;
+  title: string;
+  startTime: Date;
+  endTime: Date;
+  topic?: string;
+}): Promise<void> {
+  await send(
+    data.toEmail,
+    `🕓 Booking request: ${data.clientName}`,
+    wrap(
+      "Booking Request",
+      `
+      ${h1("New booking request")}
+      ${p("Hi " + esc(data.ownerName) + ", " + esc(data.clientName) + " asked to book a time with you. Nothing is confirmed until you approve it.")}
+      ${info("Meeting", esc(data.title))}
+      ${info("From", esc(data.clientName) + " (" + esc(data.clientEmail) + ")")}
+      ${info("Requested time", formatMeetingWindow(data.startTime, data.endTime))}
+      ${data.topic ? info("Topic", esc(data.topic)) : ""}
+      ${btn("Review request", `${APP_URL}/meetings`)}
+      ${p("Open Meetings → Booking links to approve or decline.")}
+    `,
+    ),
+  );
+}
 
 // ═════════════════════════════════════════════════════════════════
 // SALES — weekly activity report (sent to the CEO by the weekly cron)

@@ -103,6 +103,29 @@ function computeInternalDedupeKey(
   return crypto.createHash("sha256").update(normalized).digest("hex");
 }
 
+/** Content fingerprint that identifies the MESSAGE itself, not whose mailbox it
+ *  was read from. An email sent to a company/group address lands in every
+ *  member's mailbox under a different provider id, but with the same sender,
+ *  recipients, subject and send time — so all those copies share this key and
+ *  are logged once instead of once per member. (The pair-based key above
+ *  includes the mailbox owner, which is what used to split one group email
+ *  into one row per recipient.) */
+function computeMessageDedupeKey(msg: ZohoMessageSummary): string {
+  const recipients = new Set([
+    ...extractAllEmails(msg.toAddress),
+    ...extractAllEmails(msg.ccAddress ?? ""),
+  ]);
+  const normalized = [
+    extractAllEmails(msg.fromAddress).join("|"),
+    [...recipients].sort().join("|"),
+    msg.subject.trim().toLowerCase(),
+    // sentTime is the sender's own timestamp, identical in every copy;
+    // receivedTime can differ slightly per mailbox, hence the minute rounding.
+    Math.floor(Number(msg.sentTime ?? msg.receivedTime) / 60000),
+  ].join("::");
+  return crypto.createHash("sha256").update(`msg::${normalized}`).digest("hex");
+}
+
 /** Plain-text preview of an HTML email body: drops <style>/<script>/<head>,
  *  strips tags, decodes common entities, collapses whitespace. */
 function htmlToPreview(html: string, max = 200): string {
@@ -243,6 +266,18 @@ async function syncOneMailbox(
       if (wasLogged) messagesSynced++;
 
       newestSeen = Math.max(newestSeen, Number(msg.receivedTime));
+    }
+  }
+
+  // Keep read state and the real To line in step with Zoho. Best-effort.
+  if (inbox) {
+    try {
+      await reconcileInboxState(integration, accessToken, accountId, inbox.folderId);
+    } catch (err) {
+      console.error(
+        `Zoho sync: inbox state sync failed for ${integration.emailAddress}:`,
+        err,
+      );
     }
   }
 
@@ -494,6 +529,144 @@ async function syncClientMessage(
   }
 }
 
+type LoggedEmailRef = {
+  _id: unknown;
+  senderId: unknown;
+  receiverId: unknown;
+  isRead?: boolean;
+};
+
+/**
+ * An email we already have just turned up in another mailbox. Record what that
+ * mailbox's owner adds: that they've read it, or that they're one more person
+ * who received it (company/group address, extra To/Cc).
+ */
+async function recordMailboxOwner(
+  log: LoggedEmailRef,
+  userId: unknown,
+  readInZoho: boolean,
+): Promise<void> {
+  const uid = String(userId);
+  // Their own sent copy — nothing to add.
+  if (String(log.senderId) === uid) return;
+
+  // The recipient we logged it for: only their read state lives on isRead.
+  if (String(log.receiverId) === uid) {
+    if (readInZoho && !log.isRead) {
+      await EmailLog.updateOne(
+        { _id: log._id, isRead: false },
+        { $set: { isRead: true, readAt: new Date() } },
+      );
+    }
+    return;
+  }
+
+  // Another recipient of the same message. They go on the Cc list, which is
+  // what gives each person their own inbox row and their own read state
+  // (ccReadBy) without creating a second copy of the email.
+  await EmailLog.updateOne({ _id: log._id } as any, {
+    $addToSet: {
+      ccIds: userId,
+      ...(readInZoho ? { ccReadBy: userId } : {}),
+    },
+  } as any);
+}
+
+/**
+ * Keeps emails already in the hub in step with the mailbox, from the newest
+ * inbox messages (one API call per sync, skipped when there's nothing to do):
+ *  - mail already opened in Zoho is marked read for this mailbox's owner (it
+ *    only ever goes read-ward, never back to unread);
+ *  - emails saved before we kept the real To line get it filled in.
+ */
+async function reconcileInboxState(
+  integration: IEmailIntegration,
+  accessToken: string,
+  accountId: string,
+  inboxFolderId: string,
+): Promise<number> {
+  const uid = integration.userId;
+  const recent = new Date(Date.now() - 45 * 24 * 60 * 60 * 1000);
+  const [needsRead, needsTo] = await Promise.all([
+    EmailLog.exists({
+      source: "external_sync",
+      $or: [
+        { receiverId: uid, isRead: false },
+        { ccIds: uid, ccReadBy: { $ne: uid } },
+      ],
+    }),
+    EmailLog.exists({
+      source: "external_sync",
+      toAddresses: { $exists: false },
+      sentAt: { $gte: recent },
+      $or: [{ receiverId: uid }, { ccIds: uid }],
+    }),
+  ]);
+  if (!needsRead && !needsTo) return 0;
+
+  const messages = await listMessages(
+    accessToken,
+    accountId,
+    inboxFolderId,
+    0, // no "since" cut-off: this is about older mail, too
+    200,
+  );
+
+  // Emails logged before the message-level key existed carry the old
+  // pair-based key, so index every message under both.
+  const byKey = new Map<string, ZohoMessageSummary>();
+  for (const msg of messages) {
+    byKey.set(computeMessageDedupeKey(msg), msg);
+    byKey.set(
+      computeInternalDedupeKey(
+        [integration.emailAddress, extractCounterpartEmail(msg.fromAddress)],
+        msg.subject,
+        Number(msg.receivedTime),
+      ),
+      msg,
+    );
+  }
+  if (!byKey.size) return 0;
+
+  const logs = await EmailLog.find({
+    source: "external_sync",
+    dedupeKey: { $in: [...byKey.keys()] },
+  }).select("receiverId ccIds ccReadBy isRead dedupeKey toAddresses");
+
+  const me = String(uid);
+  const ops: any[] = [];
+  for (const log of logs) {
+    const msg = byKey.get(String(log.dedupeKey));
+    if (!msg) continue;
+    const set: Record<string, unknown> = {};
+    const addToSet: Record<string, unknown> = {};
+
+    if (log.toAddresses == null) set.toAddresses = extractAllEmails(msg.toAddress);
+
+    if (msg.isRead === true) {
+      if (String(log.receiverId) === me) {
+        if (!log.isRead) {
+          set.isRead = true;
+          set.readAt = new Date();
+        }
+      } else if (
+        (log.ccIds ?? []).some((c) => String(c) === me) &&
+        !(log.ccReadBy ?? []).some((c) => String(c) === me)
+      ) {
+        addToSet.ccReadBy = uid;
+      }
+    }
+
+    const update: Record<string, unknown> = {};
+    if (Object.keys(set).length) update.$set = set;
+    if (Object.keys(addToSet).length) update.$addToSet = addToSet;
+    if (Object.keys(update).length)
+      ops.push({ updateOne: { filter: { _id: log._id }, update } });
+  }
+  if (ops.length) await EmailLog.bulkWrite(ops);
+  return ops.length;
+}
+
 async function syncInternalMessage(
   integration: IEmailIntegration,
   direction: "inbound" | "outbound",
@@ -505,14 +678,25 @@ async function syncInternalMessage(
   accountId: string,
 ): Promise<boolean> {
   const epochMs = Number(msg.receivedTime);
-  const dedupeKey = computeInternalDedupeKey(
+  const sentMs = Number(msg.sentTime ?? msg.receivedTime);
+  const dedupeKey = computeMessageDedupeKey(msg);
+  // Emails logged before the message-level key existed use the pair-based one.
+  const legacyKey = computeInternalDedupeKey(
     [integration.emailAddress, counterpart],
     msg.subject,
     epochMs,
   );
+  // Only a mailbox's owner can say whether THEY have read it, so Zoho's flag
+  // counts for the inbox side. (Their Sent copy is always "read".)
+  const readInZoho = direction === "inbound" && msg.isRead === true;
 
-  const exists = await EmailLog.exists({ dedupeKey });
-  if (exists) return false;
+  const existing = await EmailLog.findOne({
+    dedupeKey: { $in: [dedupeKey, legacyKey] },
+  }).select("senderId receiverId isRead");
+  if (existing) {
+    await recordMailboxOwner(existing, integration.userId, readInZoho);
+    return false;
+  }
 
   let body = "";
   try {
@@ -542,12 +726,15 @@ async function syncInternalMessage(
       receiverId: direction === "inbound" ? integration.userId : otherUserId,
       toEmail:
         direction === "outbound" ? counterpart : integration.emailAddress,
+      toAddresses: extractAllEmails(msg.toAddress),
       subject: msg.subject,
       body: body || "(no content)",
       bodyPreview: htmlToPreview(body || "(no content)"),
       status: "sent",
-      sentAt: new Date(epochMs),
-      lastMessageAt: new Date(epochMs),
+      isRead: readInZoho,
+      readAt: readInZoho ? new Date() : undefined,
+      sentAt: new Date(sentMs),
+      lastMessageAt: new Date(sentMs),
       parentId: null,
       source: "external_sync",
       dedupeKey,
@@ -555,9 +742,14 @@ async function syncInternalMessage(
     });
     return true;
   } catch (err: any) {
-    // Duplicate key race (unique index) — safe to ignore, this is the
-    // expected outcome when the other participant's sync already logged it
-    if (err?.code !== 11000) {
+    if (err?.code === 11000) {
+      // Another mailbox's sync logged the same message a moment ago (the
+      // unique index caught the race). Join it instead of dropping out.
+      const winner = await EmailLog.findOne({ dedupeKey }).select(
+        "senderId receiverId isRead",
+      );
+      if (winner) await recordMailboxOwner(winner, integration.userId, readInZoho);
+    } else {
       console.error(
         `Zoho sync: failed to save internal message ${msg.messageId}:`,
         err,

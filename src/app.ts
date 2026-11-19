@@ -30,6 +30,8 @@ import meetingRsvpRoutes from "./routes/meetingRsvp";
 import notificationRoutes from "./routes/notifications";
 import presenceRoutes from "./routes/presence";
 import calendarBlockRoutes from "./routes/calendarBlocks";
+import bookingLinkRoutes from "./routes/bookingLinks";
+import publicBookingRoutes from "./routes/publicBooking";
 import todoRoutes from "./routes/todos";
 
 // ── ICT workspace routes ────────────────────────────────────────
@@ -166,6 +168,10 @@ app.use("/api/meetings", meetingRoutes);
 // Public — token-authorised Accept / Decline links from invitation emails
 // (external invitees have no account, so this must not require auth).
 app.use("/api/meeting-rsvp", meetingRsvpRoutes);
+// Booking links: owners manage theirs behind auth; the public routes are for
+// clients with no account (own rate limits — see routes/publicBooking.ts).
+app.use("/api/booking-links", bookingLinkRoutes);
+app.use("/api/public/booking", publicBookingRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/presence", presenceRoutes);
 app.use("/api/calendar-blocks", calendarBlockRoutes);
