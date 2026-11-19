@@ -573,6 +573,57 @@ async function recordMailboxOwner(
 }
 
 /**
+ * Matches messages from a mailbox to the emails we already logged (by dedupe
+ * key) and brings those up to date: fills in the real To line where it's
+ * missing and — for inbox messages only, since a Sent copy is always "read" —
+ * marks mail already opened in Zoho as read for the mailbox's owner. Only ever
+ * goes read-ward. Returns how many emails changed.
+ */
+async function applyMailboxStateToLogs(
+  uid: unknown,
+  byKey: Map<string, ZohoMessageSummary>,
+  isInbox: boolean,
+): Promise<number> {
+  const logs = await EmailLog.find({
+    source: "external_sync",
+    dedupeKey: { $in: [...byKey.keys()] },
+  }).select("receiverId ccIds ccReadBy isRead dedupeKey toAddresses");
+
+  const me = String(uid);
+  const ops: any[] = [];
+  for (const log of logs) {
+    const msg = byKey.get(String(log.dedupeKey));
+    if (!msg) continue;
+    const set: Record<string, unknown> = {};
+    const addToSet: Record<string, unknown> = {};
+
+    if (log.toAddresses == null) set.toAddresses = extractAllEmails(msg.toAddress);
+
+    if (isInbox && msg.isRead === true) {
+      if (String(log.receiverId) === me) {
+        if (!log.isRead) {
+          set.isRead = true;
+          set.readAt = new Date();
+        }
+      } else if (
+        (log.ccIds ?? []).some((c) => String(c) === me) &&
+        !(log.ccReadBy ?? []).some((c) => String(c) === me)
+      ) {
+        addToSet.ccReadBy = uid;
+      }
+    }
+
+    const update: Record<string, unknown> = {};
+    if (Object.keys(set).length) update.$set = set;
+    if (Object.keys(addToSet).length) update.$addToSet = addToSet;
+    if (Object.keys(update).length)
+      ops.push({ updateOne: { filter: { _id: log._id }, update } });
+  }
+  if (ops.length) await EmailLog.bulkWrite(ops);
+  return ops.length;
+}
+
+/**
  * Keeps emails already in the hub in step with the mailbox, from the newest
  * inbox messages (one API call per sync, skipped when there's nothing to do):
  *  - mail already opened in Zoho is marked read for this mailbox's owner (it
@@ -628,43 +679,7 @@ async function reconcileInboxState(
   }
   if (!byKey.size) return 0;
 
-  const logs = await EmailLog.find({
-    source: "external_sync",
-    dedupeKey: { $in: [...byKey.keys()] },
-  }).select("receiverId ccIds ccReadBy isRead dedupeKey toAddresses");
-
-  const me = String(uid);
-  const ops: any[] = [];
-  for (const log of logs) {
-    const msg = byKey.get(String(log.dedupeKey));
-    if (!msg) continue;
-    const set: Record<string, unknown> = {};
-    const addToSet: Record<string, unknown> = {};
-
-    if (log.toAddresses == null) set.toAddresses = extractAllEmails(msg.toAddress);
-
-    if (msg.isRead === true) {
-      if (String(log.receiverId) === me) {
-        if (!log.isRead) {
-          set.isRead = true;
-          set.readAt = new Date();
-        }
-      } else if (
-        (log.ccIds ?? []).some((c) => String(c) === me) &&
-        !(log.ccReadBy ?? []).some((c) => String(c) === me)
-      ) {
-        addToSet.ccReadBy = uid;
-      }
-    }
-
-    const update: Record<string, unknown> = {};
-    if (Object.keys(set).length) update.$set = set;
-    if (Object.keys(addToSet).length) update.$addToSet = addToSet;
-    if (Object.keys(update).length)
-      ops.push({ updateOne: { filter: { _id: log._id }, update } });
-  }
-  if (ops.length) await EmailLog.bulkWrite(ops);
-  return ops.length;
+  return applyMailboxStateToLogs(uid, byKey, true);
 }
 
 async function syncInternalMessage(
@@ -824,6 +839,109 @@ async function syncAttachments(
     );
     return [];
   }
+}
+
+/**
+ * One-off catch-up for emails older than the regular sync looks at (it only
+ * checks the newest 200 inbox messages): pages back through each connected
+ * mailbox's Inbox and Sent folders and fills in the real To line and read
+ * state on emails already in the hub. Safe to re-run — it only fills gaps and
+ * never creates, deletes or un-reads anything. Run from
+ * scripts/backfillOldEmails.ts, not from the request/cron path.
+ */
+export async function backfillOldEmails(
+  opts: { days?: number; maxPagesPerFolder?: number } = {},
+): Promise<{
+  mailboxes: number;
+  failed: number;
+  messagesScanned: number;
+  emailsUpdated: number;
+}> {
+  const cutoff = Date.now() - (opts.days ?? 120) * 24 * 60 * 60 * 1000;
+  const maxPages = opts.maxPagesPerFolder ?? 30; // 200 messages per page
+  const integrations = await EmailIntegrationModel.find({
+    status: { $ne: "disconnected" },
+  });
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  let failed = 0;
+  let messagesScanned = 0;
+  let emailsUpdated = 0;
+
+  for (const integration of integrations) {
+    try {
+      const accessToken = await ensureFreshToken(integration);
+      const accountId = integration.providerAccountId;
+      const folders = await listFolders(accessToken, accountId);
+      const inbox = folders.find((f) =>
+        /inbox/i.test(f.folderType || f.folderName),
+      );
+      const sent = folders.find((f) =>
+        /sent/i.test(f.folderType || f.folderName),
+      );
+      const targets = [
+        ...(inbox ? [{ folder: inbox, isInbox: true }] : []),
+        ...(sent ? [{ folder: sent, isInbox: false }] : []),
+      ];
+
+      for (const { folder, isInbox } of targets) {
+        for (let page = 0; page < maxPages; page++) {
+          const messages = await listMessages(
+            accessToken,
+            accountId,
+            folder.folderId,
+            0,
+            200,
+            1 + page * 200,
+          );
+          if (!messages.length) break;
+          messagesScanned += messages.length;
+
+          // Index each message under the message-level key and under every
+          // pair-based key the older sync could have used for it.
+          const byKey = new Map<string, ZohoMessageSummary>();
+          for (const msg of messages) {
+            byKey.set(computeMessageDedupeKey(msg), msg);
+            const others = isInbox
+              ? [extractCounterpartEmail(msg.fromAddress)]
+              : [
+                  ...extractAllEmails(msg.toAddress),
+                  ...extractAllEmails(msg.ccAddress ?? ""),
+                ];
+            for (const other of others) {
+              byKey.set(
+                computeInternalDedupeKey(
+                  [integration.emailAddress, other],
+                  msg.subject,
+                  Number(msg.receivedTime),
+                ),
+                msg,
+              );
+            }
+          }
+          emailsUpdated += await applyMailboxStateToLogs(
+            integration.userId,
+            byKey,
+            isInbox,
+          );
+
+          const oldest = Math.min(...messages.map((m) => Number(m.receivedTime)));
+          if (messages.length < 200 || oldest < cutoff) break;
+          await sleep(300); // stay well inside Zoho's rate limits
+        }
+      }
+    } catch (err) {
+      failed++;
+      console.error(`Backfill failed for ${integration.emailAddress}:`, err);
+    }
+  }
+
+  return {
+    mailboxes: integrations.length,
+    failed,
+    messagesScanned,
+    emailsUpdated,
+  };
 }
 
 /** Entry point called by the scheduled job (queue-backed or setInterval fallback). */

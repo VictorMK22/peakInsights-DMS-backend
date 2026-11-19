@@ -23,6 +23,11 @@ export interface IEmailLog extends Document {
 
   toEmail: string;
 
+  // The addresses on the email's real To line, for emails synced from a
+  // mailbox. For mail sent to a company/group address this is that address —
+  // receiverId is just whichever member's mailbox synced it first.
+  toAddresses?: string[];
+
   // Carbon-copy recipients (staff users). CC'd users can see the email
   // in their inbox and open the thread, but replies still go to the
   // original sender/receiver pair.
@@ -136,6 +141,11 @@ const EmailLogSchema = new Schema<IEmailLog>(
       required: true,
       lowercase: true,
       trim: true,
+    },
+
+    toAddresses: {
+      type: [String],
+      default: undefined,
     },
 
     ccIds: {
