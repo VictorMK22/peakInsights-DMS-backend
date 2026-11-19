@@ -264,7 +264,9 @@ EmailLogSchema.index({ senderId: 1, parentId: 1, lastMessageAt: -1 });
 EmailLogSchema.index({ parentId: 1, createdAt: 1 });
 EmailLogSchema.index({ ccIds: 1, parentId: 1, lastMessageAt: -1 });
 EmailLogSchema.index({ threadParticipantIds: 1, parentId: 1, lastMessageAt: -1 });
-EmailLogSchema.index({ ccIds: 1, ccReadBy: 1 });
+// NOTE: no { ccIds, ccReadBy } index. MongoDB can't index two array fields
+// together ("cannot index parallel arrays"), so any email with both a Cc list
+// and a read-by list failed to save. ccIds is already covered by the index above.
 EmailLogSchema.index({ broadcastId: 1, status: 1 });
 // Prevents the same staff-to-staff email being logged twice when both
 // participants have their mailbox connected and synced independently.

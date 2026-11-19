@@ -61,6 +61,23 @@ async function main(): Promise<void> {
   if (!uri) throw new Error("MONGODB_URI is missing (set it in .env)");
   await mongoose.connect(uri, { serverSelectionTimeoutMS: 10000 });
 
+  // An old schema built a { ccIds, ccReadBy } index. MongoDB can't index two
+  // array fields together, so saving an email that has both fails ("cannot
+  // index parallel arrays"). Drop it first (deploy the updated EmailLog model
+  // before running this, or the app recreates it on its next start).
+  const BAD_INDEX = "ccIds_1_ccReadBy_1";
+  const hasBadIndex = (await EmailLog.collection.indexes()).some(
+    (i) => i.name === BAD_INDEX,
+  );
+  if (hasBadIndex) {
+    if (EXECUTE) {
+      await EmailLog.collection.dropIndex(BAD_INDEX);
+      console.log(`Dropped index ${BAD_INDEX}.\n`);
+    } else {
+      console.log(`Would drop index ${BAD_INDEX} (it blocks the merge).\n`);
+    }
+  }
+
   const rows = (await EmailLog.find({
     source: "external_sync",
     parentId: null,
