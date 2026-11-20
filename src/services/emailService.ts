@@ -952,6 +952,8 @@ export async function sendBookingRequestDeclinedEmail(data: {
   endTime: Date;
   reason?: string;
   rebookUrl?: string;
+  /** Times the host offered instead; each link confirms that time in one click. */
+  alternatives?: { label: string; url: string }[];
 }): Promise<void> {
   await send(
     data.toEmail,
@@ -964,7 +966,16 @@ export async function sendBookingRequestDeclinedEmail(data: {
       ${info("Meeting", esc(data.title))}
       ${info("Requested time", formatMeetingWindow(data.startTime, data.endTime))}
       ${data.reason ? info("Note from " + esc(data.hostName), esc(data.reason)) : ""}
-      ${data.rebookUrl ? p("You're welcome to choose another time:") + btn("Pick another time", esc(data.rebookUrl)) : ""}
+      ${
+        data.alternatives?.length
+          ? p(esc(data.hostName) + " suggested these times instead. Pick one to confirm it right away:") +
+            data.alternatives.map((a) => btn(esc(a.label), esc(a.url))).join("") +
+            p("These times are open now but not reserved for you, so please book soon.") +
+            (data.rebookUrl ? p("None of them suit you?") + btn("Choose a different time", esc(data.rebookUrl)) : "")
+          : data.rebookUrl
+            ? p("You're welcome to choose another time:") + btn("Pick another time", esc(data.rebookUrl))
+            : ""
+      }
     `,
     ),
   );
@@ -995,6 +1006,61 @@ export async function sendBookingRequestOwnerEmail(data: {
       ${data.topic ? info("Topic", esc(data.topic)) : ""}
       ${btn("Review request", `${APP_URL}/meetings`)}
       ${p("Open Meetings → Booking links to approve or decline.")}
+    `,
+    ),
+  );
+}
+
+/** To a client whose request lapsed because the host didn't answer in time. */
+export async function sendBookingRequestExpiredEmail(data: {
+  toEmail: string;
+  toName: string;
+  hostName: string;
+  title: string;
+  startTime: Date;
+  endTime: Date;
+  rebookUrl?: string;
+}): Promise<void> {
+  await send(
+    data.toEmail,
+    `Your booking request has expired: "${data.title}"`,
+    wrap(
+      "Booking Request Expired",
+      `
+      ${h1("Your request wasn't confirmed in time")}
+      ${p("Hi " + esc(data.toName) + ", " + esc(data.hostName) + " wasn't able to respond to your request in time, so the time you asked for has been released. Nothing has been booked.")}
+      ${info("Meeting", esc(data.title))}
+      ${info("Requested time", formatMeetingWindow(data.startTime, data.endTime))}
+      ${data.rebookUrl ? p("You're welcome to request another time:") + btn("Choose a time", esc(data.rebookUrl)) : ""}
+    `,
+    ),
+  );
+}
+
+/** To the host when a request has been waiting a while and will soon lapse. */
+export async function sendBookingRequestReminderEmail(data: {
+  toEmail: string;
+  ownerName: string;
+  clientName: string;
+  clientEmail: string;
+  title: string;
+  startTime: Date;
+  endTime: Date;
+  expiresAt: Date;
+}): Promise<void> {
+  await send(
+    data.toEmail,
+    `⏰ Booking request still waiting: ${data.clientName}`,
+    wrap(
+      "Booking Request Reminder",
+      `
+      ${h1("A booking request is still waiting")}
+      ${p("Hi " + esc(data.ownerName) + ", " + esc(data.clientName) + " is still waiting to hear back. If nobody replies, the request lapses and the time is released.")}
+      ${info("Meeting", esc(data.title))}
+      ${info("From", esc(data.clientName) + " (" + esc(data.clientEmail) + ")")}
+      ${info("Requested time", formatMeetingWindow(data.startTime, data.endTime))}
+      ${info("Lapses at", formatEatDateTime(data.expiresAt))}
+      ${btn("Review request", `${APP_URL}/meetings`)}
     `,
     ),
   );

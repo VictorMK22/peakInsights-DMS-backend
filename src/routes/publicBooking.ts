@@ -3,6 +3,7 @@ import rateLimit from "express-rate-limit";
 import {
   getPublicBookingLink,
   getPublicSlots,
+  getPublicOffer,
   submitBooking,
 } from "../controllers/bookingController";
 
@@ -13,6 +14,7 @@ import {
  *
  *   GET  /:slug         The page's title, host name, length, location
  *   GET  /:slug/slots   Open time slots only (never what is busy, or why)
+ *   GET  /:slug/offer   Details of a "pick another time" offer (token required)
  *   POST /:slug/book    Book a slot
  */
 const router = Router();
@@ -41,6 +43,7 @@ const bookLimiter = limited(
 
 router.get("/:slug", browseLimiter, getPublicBookingLink);
 router.get("/:slug/slots", browseLimiter, getPublicSlots);
+router.get("/:slug/offer", browseLimiter, getPublicOffer);
 router.post("/:slug/book", bookLimiter, submitBooking);
 
 export default router;

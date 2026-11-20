@@ -17,11 +17,14 @@ import {
   sendBookingRequestReceivedEmail,
   sendBookingRequestDeclinedEmail,
   sendBookingRequestOwnerEmail,
+  sendBookingRequestExpiredEmail,
+  sendBookingRequestReminderEmail,
 } from "./emailService";
 import { withBookingLock, BookingLockTimeout } from "./bookingLock";
 import { createNotification } from "./notificationService";
 import { logMeetingActivity } from "./meetingActivityService";
 import { createRsvpToken } from "../utils/meetingRsvpToken";
+import { createOfferToken, verifyOfferToken } from "../utils/bookingOfferToken";
 import { formatEatDateTime } from "../utils/eatTime";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -68,6 +71,30 @@ const slotCache = new Map<string, { at: number; slots: Slot[] }>();
  * Times held by requests still waiting for this owner's approval. They count
  * as busy so two clients are never promised the same slot.
  */
+/**
+ * Requests that are still waiting AND haven't lapsed. Lapsing is judged
+ * here, at read time, so a slot is released the instant a request's
+ * expiresAt passes — even if the periodic sweep that emails people is late.
+ * (Records from before expiresAt existed fall back to the meeting's end.)
+ */
+const liveRequestFilter = (now: Date) => ({
+  status: "pending" as const,
+  $or: [{ expiresAt: { $gt: now } }, { expiresAt: null, endTime: { $gt: now } }],
+});
+
+/** A pending request past its expiry: no longer holds the slot, can't be approved. */
+const isLapsed = (r: { expiresAt?: Date | null; endTime: Date }) =>
+  (r.expiresAt ?? r.endTime).getTime() <= Date.now();
+
+/** When a new request stops holding its slot: after the link's window, but never later than the requested time. */
+const requestExpiry = (windowHours: number, createdAt: Date, start: Date): Date =>
+  new Date(
+    Math.min(
+      windowHours > 0 ? createdAt.getTime() + windowHours * 3_600_000 : Infinity,
+      start.getTime(),
+    ),
+  );
+
 async function pendingRequestIntervals(
   ownerId: string,
   from: Date,
@@ -76,7 +103,7 @@ async function pendingRequestIntervals(
 ): Promise<TimeInterval[]> {
   const rows = await BookingRequestModel.find({
     ownerId,
-    status: "pending",
+    ...liveRequestFilter(new Date()),
     ...(excludeRequestId ? { _id: { $ne: excludeRequestId } } : {}),
     startTime: { $lt: to },
     endTime: { $gt: from },
@@ -113,7 +140,7 @@ async function hasConflict(
 export async function getSlotsForLink(
   link: IBookingLink,
   range: { from?: Date; to?: Date } = {},
-  opts: { fresh?: boolean } = {},
+  opts: { fresh?: boolean; excludeRequestId?: string } = {},
 ): Promise<Slot[]> {
   const now = new Date();
   const windowEnd = new Date(now.getTime() + link.maxDaysAhead * DAY_MS);
@@ -138,7 +165,7 @@ export async function getSlotsForLink(
   const busyTo = new Date(to.getTime() + padMs + link.durationMinutes * 60_000);
   const busy = [
     ...(await getUserBusyIntervals(String(link.ownerId), busyFrom, busyTo)),
-    ...(await pendingRequestIntervals(String(link.ownerId), busyFrom, busyTo)),
+    ...(await pendingRequestIntervals(String(link.ownerId), busyFrom, busyTo, opts.excludeRequestId)),
   ];
 
   const slots = computeSlots(toSlotConfig(link), busy, now, { from, to });
@@ -181,6 +208,8 @@ export interface BookingResult {
   hostName: string;
   meetingId?: string;
   requestId?: string;
+  /** For "pending": when the request lapses if the host hasn't answered. */
+  expiresAt?: Date;
   location?: string;
   meetingLink?: string;
 }
@@ -322,6 +351,7 @@ const toResult = (
     endTime: Date;
     meetingId?: string;
     requestId?: string;
+    expiresAt?: Date;
     location?: string;
     meetingLink?: string;
   },
@@ -341,6 +371,8 @@ const toResult = (
 export async function createBookingForLink(
   link: IBookingLink,
   input: BookingInput,
+  /** The `o` token from a "pick another time" email, when the client came from one. */
+  offerToken?: string,
 ): Promise<BookingResult> {
   const ownerId = String(link.ownerId);
   const owner = await User.findById(ownerId).select("name email isActive").lean();
@@ -354,6 +386,20 @@ export async function createBookingForLink(
   const email = input.email.toLowerCase();
   const now = new Date();
 
+  // A time the host offered after declining: confirm it straight away, even
+  // on an approval link. Anything that doesn't check out is just ignored and
+  // the booking proceeds as an ordinary one.
+  if (offerToken) {
+    const offer = await findUsableOffer(link, offerToken);
+    if (
+      offer &&
+      offer.email === email &&
+      offer.alternatives.some((a) => a.getTime() === start.getTime())
+    ) {
+      return bookViaOffer(link, input, offer, hostName);
+    }
+  }
+
   // Stops one person hoarding the calendar — counts confirmed bookings AND
   // requests still waiting for approval.
   const [upcomingMeetings, upcomingRequests] = await Promise.all([
@@ -365,8 +411,7 @@ export async function createBookingForLink(
     }),
     BookingRequestModel.countDocuments({
       linkId: link._id,
-      status: "pending",
-      endTime: { $gt: now },
+      ...liveRequestFilter(now),
       email,
     }),
   ]);
@@ -381,8 +426,7 @@ export async function createBookingForLink(
     // Every pending request holds a slot, so cap how many can wait at once.
     const waiting = await BookingRequestModel.countDocuments({
       linkId: link._id,
-      status: "pending",
-      endTime: { $gt: now },
+      ...liveRequestFilter(now),
     });
     if (waiting >= BOOKING_LIMITS.maxPendingPerLink) {
       throw new BookingError(
@@ -421,6 +465,7 @@ export async function createBookingForLink(
         );
       }
       if (link.requireApproval) {
+        const expiresAt = requestExpiry(link.approvalWindowHours, now, start);
         const request = await BookingRequestModel.create({
           linkId: link._id,
           ownerId: link.ownerId,
@@ -430,6 +475,9 @@ export async function createBookingForLink(
           name: input.name,
           email,
           topic: input.topic || undefined,
+          expiresAt,
+          // Nudge the host halfway to the deadline.
+          reminderAt: new Date(now.getTime() + (expiresAt.getTime() - now.getTime()) / 2),
         });
         return { request };
       }
@@ -494,6 +542,7 @@ export async function createBookingForLink(
       startTime: start,
       endTime: end,
       requestId: String(req._id),
+      expiresAt: req.expiresAt,
     });
   }
 
@@ -527,9 +576,6 @@ export async function createBookingForLink(
 // Approving and declining requests
 // ─────────────────────────────────────────────────────────────────
 
-/** A request that has been waiting past its own start time can no longer be approved. */
-const isExpired = (r: { endTime: Date }) => r.endTime.getTime() <= Date.now();
-
 const loadOwnRequest = async (requestId: string, ownerId: string) => {
   // Anything that isn't a valid id is simply "not found".
   const req = /^[a-f0-9]{24}$/i.test(requestId)
@@ -549,16 +595,20 @@ export interface PendingRequestView {
   startTime: Date;
   endTime: Date;
   createdAt: Date;
-  /** True once the requested time has passed without a decision: it can only be declined now. */
-  expired: boolean;
+  /** When it lapses if nobody answers. */
+  expiresAt: Date;
 }
 
-/** The owner's requests that still need a decision (recently-expired ones included so they can be closed out). */
+/** The owner's requests that still need a decision. */
 export async function listPendingRequests(ownerId: string): Promise<PendingRequestView[]> {
+  // Catch up on anything that lapsed since the last scheduled sweep, so the
+  // client hears about it even if the scheduler is late (or not set up).
+  await sweepBookingRequests({ ownerId }).catch((err) =>
+    console.error("Booking request sweep (on list) failed:", err),
+  );
   const rows = await BookingRequestModel.find({
     ownerId,
-    status: "pending",
-    endTime: { $gt: new Date(Date.now() - 14 * 24 * 60 * 60 * 1000) },
+    ...liveRequestFilter(new Date()),
   }).sort({ startTime: 1 });
   return rows.map((r) => ({
     _id: String(r._id),
@@ -570,7 +620,7 @@ export async function listPendingRequests(ownerId: string): Promise<PendingReque
     startTime: r.startTime,
     endTime: r.endTime,
     createdAt: r.createdAt,
-    expired: isExpired(r),
+    expiresAt: r.expiresAt ?? r.endTime,
   }));
 }
 
@@ -586,11 +636,11 @@ export async function approveBookingRequest(
   if (req.status !== "pending") {
     throw new BookingError(409, "ALREADY_DECIDED", `This request was already ${req.status}.`);
   }
-  if (isExpired(req)) {
+  if (isLapsed(req)) {
     throw new BookingError(
       409,
       "EXPIRED",
-      "The requested time has already passed. Decline it to let the client know.",
+      "This request has expired, so its time was released. The client is told to request another time.",
     );
   }
 
@@ -685,25 +735,106 @@ export async function approveBookingRequest(
   });
 }
 
-/** Owner declines: the slot is freed and the client is told, with an optional note. */
+/**
+ * Checks that every alternative the host wants to offer is genuinely
+ * bookable right now (so a client is never sent to a taken time), and
+ * returns them de-duplicated and sorted.
+ */
+async function validateAlternatives(
+  req: IBookingRequest,
+  alternatives: Date[],
+): Promise<{ link: IBookingLink; times: Date[] }> {
+  const unique = [...new Map(alternatives.map((d) => [d.getTime(), d])).values()].sort(
+    (a, b) => a.getTime() - b.getTime(),
+  );
+  if (unique.length > BOOKING_LIMITS.maxAlternatives) {
+    throw new BookingError(
+      400,
+      "TOO_MANY_ALTERNATIVES",
+      `You can offer up to ${BOOKING_LIMITS.maxAlternatives} alternative times.`,
+    );
+  }
+  const link = await BookingLinkModel.findOne({ _id: req.linkId, isActive: true });
+  if (!link) {
+    throw new BookingError(
+      400,
+      "NO_LINK",
+      "This booking link is paused or deleted, so other times can't be offered. Decline without offering times, or turn the link back on.",
+    );
+  }
+  if (unique.some((d) => d.getTime() <= Date.now())) {
+    throw new BookingError(400, "INVALID", "Alternative times must be in the future.");
+  }
+  // Live availability, with this request's own held slot counted as free
+  // (it is about to be released).
+  const open = await getSlotsForLink(
+    link,
+    {
+      from: unique[0],
+      to: new Date(unique[unique.length - 1].getTime() + 1),
+    },
+    { fresh: true, excludeRequestId: String(req._id) },
+  );
+  const openAt = new Set(open.map((o) => o.start.getTime()));
+  if (!unique.every((d) => openAt.has(d.getTime()))) {
+    throw new BookingError(
+      409,
+      "SLOT_TAKEN",
+      "One of those times is no longer free. Please pick again.",
+    );
+  }
+  return { link, times: unique };
+}
+
+/**
+ * Owner declines: the slot is freed and the client is told, with an
+ * optional note and optionally up to a few alternative times they can
+ * confirm with one click.
+ */
 export async function declineBookingRequest(
   requestId: string,
   ownerId: string,
-  reason?: string,
+  opts: { reason?: string; alternatives?: Date[] } = {},
 ): Promise<void> {
   const existing = await loadOwnRequest(requestId, ownerId);
+  if (existing.status !== "pending") {
+    throw new BookingError(409, "ALREADY_DECIDED", `This request was already ${existing.status}.`);
+  }
+
+  // Validate BEFORE changing anything, so a bad choice leaves it pending.
+  const offer = opts.alternatives?.length
+    ? await validateAlternatives(existing, opts.alternatives)
+    : null;
+
+  const now = new Date();
   const declined = await BookingRequestModel.findOneAndUpdate(
     { _id: existing._id, ownerId, status: "pending" },
-    { status: "declined", decidedAt: new Date(), declineReason: reason || undefined },
+    {
+      status: "declined",
+      decidedAt: now,
+      declineReason: opts.reason || undefined,
+      ...(offer
+        ? {
+            alternatives: offer.times,
+            offerExpiresAt: new Date(
+              now.getTime() + BOOKING_LIMITS.offerValidDays * 24 * 60 * 60 * 1000,
+            ),
+          }
+        : {}),
+    },
     { new: true },
   );
   if (!declined) {
-    throw new BookingError(409, "ALREADY_DECIDED", `This request was already ${existing.status}.`);
+    throw new BookingError(409, "ALREADY_DECIDED", "This request was already handled.");
   }
   slotCache.clear();
 
   const owner = await User.findById(ownerId).select("name").lean();
-  const link = await BookingLinkModel.findOne({ _id: declined.linkId, isActive: true }).select("slug");
+  const link =
+    offer?.link ?? (await BookingLinkModel.findOne({ _id: declined.linkId, isActive: true }));
+  const pageUrl = link ? bookingUrl(link.slug) : undefined;
+  const token = offer ? createOfferToken(String(declined._id)) : undefined;
+
   await sendBookingRequestDeclinedEmail({
     toEmail: declined.email,
     toName: declined.name,
@@ -711,7 +842,275 @@ export async function declineBookingRequest(
     title: declined.linkTitle,
     startTime: declined.startTime,
     endTime: declined.endTime,
-    reason,
-    rebookUrl: link ? bookingUrl(link.slug) : undefined,
+    reason: opts.reason,
+    rebookUrl: pageUrl,
+    alternatives:
+      offer && pageUrl && token
+        ? offer.times.map((t) => ({
+            label: `${formatEatDateTime(t)} (East Africa Time)`,
+            url: `${pageUrl}?t=${encodeURIComponent(t.toISOString())}&o=${encodeURIComponent(token)}`,
+          }))
+        : undefined,
   }).catch((err) => console.error("Booking request declined email failed:", err));
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Taking a time the host offered
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * The declined request behind an offer token, if the offer is still good:
+ * genuine token, for THIS link, host really offered times, not used yet,
+ * not past its deadline. (Which time, and whose email, the caller checks.)
+ */
+async function findUsableOffer(
+  link: IBookingLink,
+  token: unknown,
+): Promise<IBookingRequest | null> {
+  const requestId = verifyOfferToken(token);
+  if (!requestId) return null;
+  const req = await BookingRequestModel.findById(requestId);
+  if (
+    !req ||
+    req.status !== "declined" ||
+    String(req.linkId) !== String(link._id) ||
+    req.offerAcceptedAt ||
+    !req.offerExpiresAt ||
+    req.offerExpiresAt.getTime() <= Date.now() ||
+    req.alternatives.length === 0
+  ) {
+    return null;
+  }
+  return req;
+}
+
+export interface OfferInfo {
+  valid: boolean;
+  name?: string;
+  email?: string;
+  topic?: string;
+  /** The offered times still in the future, ISO strings. */
+  times?: string[];
+}
+
+/** For the booking page, so it can pre-fill the form and show the offered times. */
+export async function getOfferInfo(link: IBookingLink, token: unknown): Promise<OfferInfo> {
+  const req = await findUsableOffer(link, token);
+  const times = req?.alternatives.filter((a) => a.getTime() > Date.now()) ?? [];
+  if (!req || times.length === 0) return { valid: false };
+  return {
+    valid: true,
+    name: req.name,
+    email: req.email,
+    topic: req.topic ?? "",
+    times: times.map((t) => t.toISOString()),
+  };
+}
+
+/**
+ * The client takes one of the offered times: confirmed immediately, no
+ * second approval (the host already chose it). The offer is single use.
+ *
+ * Only a real clash can refuse it — the notice period and booking window
+ * are not re-applied, because they were satisfied when the host picked the
+ * time and the client may be answering later.
+ */
+async function bookViaOffer(
+  link: IBookingLink,
+  input: BookingInput,
+  offer: IBookingRequest,
+  hostName: string,
+): Promise<BookingResult> {
+  const ownerId = String(link.ownerId);
+  const start = input.start;
+  const end = new Date(start.getTime() + link.durationMinutes * 60_000);
+  const email = input.email.toLowerCase();
+  const title = `${offer.linkTitle} – ${input.name}`;
+  const knownClient = await ClientModel.findOne({ email }).select("_id").lean();
+
+  let meeting: IMeeting;
+  try {
+    meeting = await withBookingLock(lockKey(ownerId), async () => {
+      const claimed = await BookingRequestModel.findOneAndUpdate(
+        { _id: offer._id, status: "declined", offerAcceptedAt: null },
+        { offerAcceptedAt: new Date() },
+        { new: true },
+      );
+      if (!claimed) {
+        throw new BookingError(409, "OFFER_USED", "This offer has already been used.");
+      }
+      try {
+        if (await hasConflict(ownerId, start, end)) {
+          throw new BookingError(
+            409,
+            "SLOT_TAKEN",
+            "Sorry, that time was just taken. Please pick another of the offered times.",
+          );
+        }
+        const m = await MeetingModel.create({
+          title,
+          description: `Booked through the booking link "${offer.linkTitle}" by ${input.name} (${email}), at a time ${hostName} offered after declining the original request.`,
+          agenda: input.topic || offer.topic || undefined,
+          organizer: link.ownerId,
+          attendees: [],
+          externalAttendees: [{ email, name: input.name, status: "pending" }],
+          startTime: start,
+          endTime: end,
+          location: link.location || undefined,
+          meetingLink: link.meetingLink || undefined,
+          conferenceProvider: link.meetingLink ? "custom" : undefined,
+          status: "scheduled",
+          reminderMinutesBefore: 15,
+          clientId: knownClient?._id,
+          bookingLinkId: link._id,
+        });
+        await BookingRequestModel.updateOne({ _id: offer._id }, { meetingId: m._id });
+        return m;
+      } catch (err) {
+        // Free the offer so they can try another of the offered times.
+        await BookingRequestModel.updateOne(
+          { _id: offer._id },
+          { $unset: { offerAcceptedAt: 1, meetingId: 1 } },
+        );
+        throw err;
+      }
+    });
+  } catch (err) {
+    if (err instanceof BookingLockTimeout) throw busyError();
+    throw err;
+  }
+  slotCache.clear();
+
+  await finishConfirmedMeeting({
+    meeting,
+    ownerId,
+    ownerName: hostName,
+    linkTitle: offer.linkTitle,
+    autoZohoMeeting: link.autoZohoMeeting,
+    clientName: input.name,
+    clientEmail: email,
+    clientId: knownClient?._id,
+    notifyOwner: true,
+    activityMessage: `${input.name} took the time ${hostName} offered instead (${formatEatDateTime(start)})`,
+    linkId: String(link._id),
+  });
+
+  return toResult("confirmed", hostName, {
+    title,
+    startTime: start,
+    endTime: end,
+    meetingId: String(meeting._id),
+    location: meeting.location,
+    meetingLink: meeting.meetingLink,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Scheduled sweep: reminders and expiry
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * Run every few minutes (POST /api/cron/booking-requests) and also on
+ * demand when an owner opens their queue.
+ *
+ *  - Expiry: a request past its expiresAt is closed; the client is told the
+ *    time was released and can ask again. (The slot itself was already free
+ *    the moment expiresAt passed — see liveRequestFilter.)
+ *  - Reminder: halfway to that deadline the host gets one nudge.
+ *
+ * Every action first CLAIMS the request with an atomic update, so two
+ * overlapping runs (scheduler + a page load) never double-send.
+ */
+export async function sweepBookingRequests(
+  opts: { ownerId?: string } = {},
+): Promise<{ expired: number; reminded: number }> {
+  const now = new Date();
+  const scope = opts.ownerId ? { ownerId: opts.ownerId } : {};
+  let expired = 0;
+  let reminded = 0;
+
+  // 1. Lapsed requests
+  const lapsed = await BookingRequestModel.find({
+    ...scope,
+    status: "pending",
+    $or: [{ expiresAt: { $lte: now } }, { expiresAt: null, endTime: { $lte: now } }],
+  }).limit(200);
+
+  for (const r of lapsed) {
+    const claimed = await BookingRequestModel.findOneAndUpdate(
+      { _id: r._id, status: "pending" },
+      { status: "expired", decidedAt: now },
+      { new: true },
+    );
+    if (!claimed) continue; // answered, or swept by another run, meanwhile
+    expired++;
+    slotCache.clear();
+    try {
+      const [owner, link] = await Promise.all([
+        User.findById(claimed.ownerId).select("name").lean(),
+        BookingLinkModel.findOne({ _id: claimed.linkId, isActive: true }).select("slug"),
+      ]);
+      await sendBookingRequestExpiredEmail({
+        toEmail: claimed.email,
+        toName: claimed.name,
+        hostName: owner?.name ?? "Your host",
+        title: claimed.linkTitle,
+        startTime: claimed.startTime,
+        endTime: claimed.endTime,
+        rebookUrl: link ? bookingUrl(link.slug) : undefined,
+      });
+      await createNotification(
+        String(claimed.ownerId),
+        `${claimed.name}'s request for "${claimed.linkTitle}" (${formatEatDateTime(claimed.startTime)}) expired because it wasn't answered. They've been told to pick another time.`,
+        "meeting_booking_request",
+        { title: claimed.linkTitle, clientName: claimed.name, clientEmail: claimed.email },
+      );
+    } catch (err) {
+      console.error("Booking request expiry notifications failed:", err);
+    }
+  }
+
+  // 2. Reminders for requests that are still alive
+  const due = await BookingRequestModel.find({
+    ...scope,
+    ...liveRequestFilter(now),
+    reminderSent: false,
+    reminderAt: { $lte: now },
+  }).limit(200);
+
+  for (const r of due) {
+    const claimed = await BookingRequestModel.findOneAndUpdate(
+      { _id: r._id, status: "pending", reminderSent: false },
+      { reminderSent: true },
+      { new: true },
+    );
+    if (!claimed) continue;
+    reminded++;
+    try {
+      const owner = await User.findById(claimed.ownerId).select("name email").lean();
+      const lapsesAt = claimed.expiresAt ?? claimed.endTime;
+      await createNotification(
+        String(claimed.ownerId),
+        `${claimed.name} is still waiting for an answer to their request for "${claimed.linkTitle}" (${formatEatDateTime(claimed.startTime)}). It lapses at ${formatEatDateTime(lapsesAt)}.`,
+        "meeting_booking_request",
+        { title: claimed.linkTitle, clientName: claimed.name, clientEmail: claimed.email },
+      );
+      if (owner?.email) {
+        await sendBookingRequestReminderEmail({
+          toEmail: owner.email,
+          ownerName: owner.name ?? "there",
+          clientName: claimed.name,
+          clientEmail: claimed.email,
+          title: claimed.linkTitle,
+          startTime: claimed.startTime,
+          endTime: claimed.endTime,
+          expiresAt: lapsesAt,
+        });
+      }
+    } catch (err) {
+      console.error("Booking request reminder failed:", err);
+    }
+  }
+
+  return { expired, reminded };
 }

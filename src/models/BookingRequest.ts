@@ -12,12 +12,17 @@ import mongoose, { Document, Schema } from "mongoose";
  * While "pending" it HOLDS its time slot — the booking page treats it as
  * busy — so two clients can't both be promised the same time.
  *
- * A pending request whose time has already passed is treated as expired
- * (it no longer holds anything and can't be approved); the status field
- * is left alone, and callers compare endTime with now.
+ * A pending request also LAPSES on its own: expiresAt is when it stops
+ * holding the slot. The booking page honors expiresAt immediately (so a
+ * late scheduler can't leave a slot blocked), and the periodic sweep then
+ * marks the request "expired" and tells the client.
+ *
+ * A declined request can carry alternative times the host offered. The
+ * client's emailed links let them book exactly those times, once, without
+ * going through approval again (the host already said yes to them).
  */
 
-export type BookingRequestStatus = "pending" | "approved" | "declined";
+export type BookingRequestStatus = "pending" | "approved" | "declined" | "expired";
 
 export interface IBookingRequest extends Document {
   _id: mongoose.Types.ObjectId;
@@ -31,10 +36,20 @@ export interface IBookingRequest extends Document {
   email: string;
   topic?: string;
   status: BookingRequestStatus;
-  /** The Meeting created on approval. */
+  /** When this stops holding the slot. Absent on old records: treat as endTime. */
+  expiresAt?: Date;
+  /** When to nudge the host about it (halfway to expiry). */
+  reminderAt?: Date;
+  reminderSent: boolean;
+  /** The Meeting created on approval, or from an accepted offer. */
   meetingId?: mongoose.Types.ObjectId;
   decidedAt?: Date;
   declineReason?: string;
+  /** Times the host offered when declining. */
+  alternatives: Date[];
+  offerExpiresAt?: Date;
+  /** Set the moment the client takes one of the offered times (single use). */
+  offerAcceptedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -51,12 +66,18 @@ const BookingRequestSchema = new Schema<IBookingRequest>(
     topic: { type: String, trim: true, maxlength: 1000 },
     status: {
       type: String,
-      enum: ["pending", "approved", "declined"],
+      enum: ["pending", "approved", "declined", "expired"],
       default: "pending",
     },
+    expiresAt: { type: Date },
+    reminderAt: { type: Date },
+    reminderSent: { type: Boolean, default: false },
     meetingId: { type: Schema.Types.ObjectId, ref: "Meeting" },
     decidedAt: { type: Date },
     declineReason: { type: String, trim: true, maxlength: 500 },
+    alternatives: { type: [Date], default: [] },
+    offerExpiresAt: { type: Date },
+    offerAcceptedAt: { type: Date },
   },
   { timestamps: true },
 );
@@ -64,6 +85,8 @@ const BookingRequestSchema = new Schema<IBookingRequest>(
 // "What is the owner holding / waiting on right now?"
 BookingRequestSchema.index({ ownerId: 1, status: 1, endTime: 1 });
 BookingRequestSchema.index({ linkId: 1, status: 1 });
+// The periodic sweep: "what has lapsed / is due a reminder?"
+BookingRequestSchema.index({ status: 1, expiresAt: 1 });
 
 export const BookingRequestModel = mongoose.model<IBookingRequest>(
   "BookingRequest",

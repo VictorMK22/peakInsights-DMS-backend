@@ -30,6 +30,12 @@ export const BOOKING_LIMITS = {
    * a slot, so this stops someone filling the calendar with fake requests.
    */
   maxPendingPerLink: 20,
+  /** Longest an approval request may wait before it lapses on its own (a week). */
+  maxApprovalWindowHours: 168,
+  /** Alternative times a host may offer when declining a request. */
+  maxAlternatives: 3,
+  /** How long the "pick another time" links in a decline email stay valid. */
+  offerValidDays: 7,
 } as const;
 
 export interface IBookingLink extends Document {
@@ -63,6 +69,12 @@ export interface IBookingLink extends Document {
    *         approves (then it is confirmed) or declines (slot freed).
    */
   requireApproval: boolean;
+  /**
+   * Only with requireApproval: how long a request may wait for an answer
+   * before it lapses — the slot is released and the client is told. 0 means
+   * "until the requested time itself". Never longer than that anyway.
+   */
+  approvalWindowHours: number;
   isActive: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -91,6 +103,12 @@ const BookingLinkSchema = new Schema<IBookingLink>(
     meetingLink: { type: String, trim: true, maxlength: 500 },
     autoZohoMeeting: { type: Boolean, default: true },
     requireApproval: { type: Boolean, default: false },
+    approvalWindowHours: {
+      type: Number,
+      default: 48,
+      min: 0,
+      max: BOOKING_LIMITS.maxApprovalWindowHours,
+    },
     isActive: { type: Boolean, default: true },
   },
   { timestamps: true },

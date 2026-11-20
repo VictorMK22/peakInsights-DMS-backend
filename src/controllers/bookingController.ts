@@ -17,6 +17,7 @@ import {
   listPendingRequests,
   approveBookingRequest,
   declineBookingRequest,
+  getOfferInfo,
 } from "../services/bookingService";
 import { EAT_TIMEZONE } from "../utils/eatTime";
 
@@ -49,6 +50,7 @@ type LinkFields = Partial<
     | "meetingLink"
     | "autoZohoMeeting"
     | "requireApproval"
+    | "approvalWindowHours"
     | "isActive"
     | "slug"
   >
@@ -138,6 +140,11 @@ const parseLinkFields = (
     if (typeof body.requireApproval !== "boolean") return { error: "requireApproval must be true or false." };
     out.requireApproval = body.requireApproval;
   }
+  if (body.approvalWindowHours !== undefined) {
+    if (!inRange(body.approvalWindowHours, 0, BOOKING_LIMITS.maxApprovalWindowHours))
+      return { error: `Reply window must be 0–${BOOKING_LIMITS.maxApprovalWindowHours} hours (0 = until the requested time).` };
+    out.approvalWindowHours = body.approvalWindowHours;
+  }
   if (body.isActive !== undefined) {
     if (typeof body.isActive !== "boolean") return { error: "isActive must be true or false." };
     out.isActive = body.isActive;
@@ -180,6 +187,7 @@ const present = (l: IBookingLink) => ({
   meetingLink: l.meetingLink ?? "",
   autoZohoMeeting: l.autoZohoMeeting,
   requireApproval: l.requireApproval,
+  approvalWindowHours: l.approvalWindowHours,
   isActive: l.isActive,
   createdAt: l.createdAt,
 });
@@ -376,9 +384,30 @@ export const declineBookingRequestHandler = async (
   next: NextFunction,
 ): Promise<void> => {
   try {
-    const raw = (req.body ?? {}).reason;
-    const reason = typeof raw === "string" ? raw.trim().slice(0, 500) : "";
-    await declineBookingRequest(req.params.id, req.user!.userId, reason || undefined);
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const reason = typeof body.reason === "string" ? body.reason.trim().slice(0, 500) : "";
+
+    // Optional: times to offer the client instead. Shape is checked here;
+    // whether each is genuinely free is checked by the service.
+    let alternatives: Date[] | undefined;
+    if (body.alternatives !== undefined) {
+      const raw = body.alternatives;
+      if (!Array.isArray(raw) || raw.length > 20) {
+        throw new BookingError(400, "INVALID", "Alternative times must be a short list of dates.");
+      }
+      alternatives = raw.map((v) => {
+        const d = typeof v === "string" ? new Date(v) : new Date(NaN);
+        if (Number.isNaN(d.getTime())) {
+          throw new BookingError(400, "INVALID", "One of the alternative times isn't a valid date.");
+        }
+        return d;
+      });
+    }
+
+    await declineBookingRequest(req.params.id, req.user!.userId, {
+      reason: reason || undefined,
+      alternatives,
+    });
     res.json({ success: true });
   } catch (err) {
     sendOwnerError(err, res, next);
@@ -445,6 +474,25 @@ const parseDateParam = (v: unknown): Date | undefined => {
   return Number.isNaN(d.getTime()) ? undefined : d;
 };
 
+/**
+ * For a client arriving from a "pick another time" email: whether their
+ * offer is still good, plus their details to pre-fill the form and the
+ * times the host offered. The token (only ever in their email) is what
+ * authorises this — nobody else can read someone's name and email here.
+ */
+export const getPublicOffer = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const link = await loadActiveLink(req.params.slug);
+    res.json({ success: true, data: await getOfferInfo(link, req.query.token) });
+  } catch (err) {
+    sendError(err, res, next);
+  }
+};
+
 /** Open slots only. `from` / `to` are optional ISO dates narrowing the window. */
 export const getPublicSlots = async (
   req: Request,
@@ -509,7 +557,8 @@ export const submitBooking = async (
     }
 
     const link = await loadActiveLink(req.params.slug);
-    const result = await createBookingForLink(link, { start, name, email, topic });
+    const offer = typeof body.offer === "string" ? body.offer : undefined;
+    const result = await createBookingForLink(link, { start, name, email, topic }, offer);
     res.status(201).json({ success: true, data: result });
   } catch (err) {
     sendError(err, res, next);

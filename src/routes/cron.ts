@@ -5,6 +5,7 @@ import {
   runDocumentRetrySweep,
   runMeetingReminders,
   runTaskReminders,
+  runBookingRequestSweep,
   runSalesWeeklyReport,
 } from "../controllers/cronController";
 
@@ -15,6 +16,7 @@ router.post("/sync-emails", runEmailSync);
 router.post("/process-documents", runDocumentRetrySweep);
 router.post("/meeting-reminders", runMeetingReminders);
 router.post("/task-reminders", runTaskReminders);
+router.post("/booking-requests", runBookingRequestSweep);
 router.post("/sales-weekly-report", runSalesWeeklyReport);
 
 export default router;

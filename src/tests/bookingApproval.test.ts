@@ -248,7 +248,8 @@ describe("a request waiting for approval", () => {
     await book(link.slug, { ...jane(), startTime: slotAt().toISOString() });
     const mine = await listRequests(token);
     expect(mine.body.data).toHaveLength(1);
-    expect(mine.body.data[0]).toMatchObject({ name: "Jane Client", email: "jane@client.com", topic: "Annual audit", expired: false });
+    expect(mine.body.data[0]).toMatchObject({ name: "Jane Client", email: "jane@client.com", topic: "Annual audit" });
+    expect(mine.body.data[0].expiresAt).toBeDefined(); // when it lapses if unanswered
 
     const { token: other } = await createUserWithToken("ceo");
     expect((await listRequests(other)).body.data).toEqual([]);
@@ -368,21 +369,23 @@ describe("approving a request", () => {
     expect(await MeetingModel.countDocuments({})).toBe(1);
   });
 
-  it("can't approve a request whose time has already passed", async () => {
+  it("closes a request whose time has already passed, and tells the client", async () => {
+    // An old record (from before requests had an expiry): it lapses at its own end time.
     const { ceo, token, link } = await setup();
     const past = await BookingRequestModel.create({
       linkId: link._id, ownerId: ceo._id, linkTitle: "Intro call",
       startTime: new Date(Date.now() - 3 * HOUR), endTime: new Date(Date.now() - 2 * HOUR),
       name: "Old Request", email: "old@client.com",
     });
-    const listed = await listRequests(token);
-    expect(listed.body.data[0]).toMatchObject({ name: "Old Request", expired: true });
+    // Opening the queue catches up: it is closed, not listed, and the client hears.
+    expect((await listRequests(token)).body.data).toEqual([]);
+    expect((await BookingRequestModel.findById(past._id))!.status).toBe("expired");
+    expect(mailsTo("old@client.com")).toHaveLength(1);
+    // Nothing more can be done with it.
     const res = await approve(token, String(past._id));
     expect(res.status).toBe(409);
-    expect(res.body.code).toBe("EXPIRED");
-    // It can still be closed out, which also lets the client know.
-    expect((await decline(token, String(past._id))).status).toBe(200);
-    expect(mailsTo("old@client.com")).toHaveLength(1);
+    expect(res.body.code).toBe("ALREADY_DECIDED");
+    expect((await decline(token, String(past._id))).status).toBe(409);
   });
 });
 

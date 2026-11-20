@@ -17,6 +17,7 @@ import {
   formatPeriodLabel,
 } from "../services/salesReportService";
 import { sendSalesWeeklyReportEmail } from "../services/emailService";
+import { sweepBookingRequests } from "../services/bookingService";
 
 // ═════════════════════════════════════════════════════════════════
 // These two endpoints replace the BullMQ-queued background jobs used
@@ -132,6 +133,28 @@ export const runMeetingReminders = async (_req: Request, res: Response) => {
     res
       .status(500)
       .json({ success: false, message: "Meeting reminder sweep failed" });
+  }
+};
+
+/**
+ * POST /api/cron/booking-requests — call every ~5 minutes.
+ * Booking links that need the host's approval: nudges the host about
+ * requests that have been waiting a while, and closes requests nobody
+ * answered in time (telling the client). See
+ * services/bookingService.sweepBookingRequests.
+ */
+export const runBookingRequestSweep = async (_req: Request, res: Response) => {
+  try {
+    const { expired, reminded } = await sweepBookingRequests();
+    res.json({
+      success: true,
+      message: `Booking requests: sent ${reminded} reminder(s), expired ${expired} request(s)`,
+    });
+  } catch (err) {
+    console.error("Cron booking request sweep failed:", err);
+    res
+      .status(500)
+      .json({ success: false, message: "Booking request sweep failed" });
   }
 };
 
