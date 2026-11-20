@@ -141,6 +141,11 @@ export interface IMeeting extends Document {
 
   clientId?: mongoose.Types.ObjectId; // optional link to a CRM client
 
+  // Password to join the meeting link (Zoho Meeting asks guests for one).
+  // Set when it could be fetched from Zoho; shown to attendees and sent in
+  // invitations alongside the link.
+  meetingPassword?: string;
+
   // Set when an external client booked this through a public booking link
   // (see models/BookingLink.ts); used to cap bookings per email address.
   bookingLinkId?: mongoose.Types.ObjectId;
@@ -211,6 +216,7 @@ const MeetingSchema = new Schema<IMeeting>(
 
     location: { type: String, trim: true },
     meetingLink: { type: String, trim: true },
+    meetingPassword: { type: String, trim: true, maxlength: 200 },
     conferenceProvider: {
       type: String,
       enum: ["custom", "zoho_meeting", "google_meet"],

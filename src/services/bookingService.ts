@@ -11,6 +11,7 @@ import {
   getZohoCalendarSession,
   createZohoEvent,
   zohoMeetingJoinLink,
+  fetchZohoMeetingPassword,
 } from "./zohoCalendarService";
 import {
   sendMeetingInviteEmail,
@@ -212,6 +213,8 @@ export interface BookingResult {
   expiresAt?: Date;
   location?: string;
   meetingLink?: string;
+  /** Password the client must enter to join the meeting link, when there is one. */
+  meetingPassword?: string;
 }
 
 const lockKey = (ownerId: string) => `owner:${ownerId}`;
@@ -254,6 +257,10 @@ async function finishConfirmedMeeting(c: ConfirmContext): Promise<void> {
   const start = meeting.startTime;
   const end = meeting.endTime;
 
+  // Why a Zoho Meeting password couldn't be fetched, if that happened. Zoho
+  // asks guests for it, so the host needs to know it's missing.
+  let passwordIssue: "needs_reconnect" | "masked" | "error" | undefined;
+
   if (c.autoZohoMeeting && !meeting.meetingLink) {
     try {
       const session = await getZohoCalendarSession(ownerId);
@@ -270,6 +277,18 @@ async function finishConfirmedMeeting(c: ConfirmContext): Promise<void> {
         if (ev.meetingKey) {
           meeting.meetingLink = zohoMeetingJoinLink(ev.meetingKey);
           meeting.conferenceProvider = "zoho_meeting";
+          // The join link doesn't contain the password, so a guest would be
+          // asked for one they were never given. Fetch it for the invitation.
+          if (ev.meetingPassword) {
+            meeting.meetingPassword = ev.meetingPassword;
+          } else {
+            const pw = await fetchZohoMeetingPassword(session, ev.meetingKey);
+            if (pw.status === "ok") {
+              if (pw.password) meeting.meetingPassword = pw.password;
+            } else {
+              passwordIssue = pw.reason;
+            }
+          }
         }
       }
     } catch (err: any) {
@@ -287,13 +306,31 @@ async function finishConfirmedMeeting(c: ConfirmContext): Promise<void> {
   await pushNewMeetingsToZoho([meeting], ownerId);
   slotCache.clear();
 
+  const passwordNote =
+    passwordIssue === "needs_reconnect"
+      ? "The Zoho Meeting password couldn't be retrieved, so the client may be asked for it. Reconnect Zoho Calendar (Meetings) so it can be, or turn off the meeting password in Zoho Meeting."
+      : passwordIssue
+        ? "The Zoho Meeting password couldn't be retrieved, so the client may be asked for it. Turn off the meeting password in Zoho Meeting, or send it to them yourself."
+        : "";
+
+  if (!c.notifyOwner && passwordNote) {
+    // An approved request doesn't ping the host about the booking itself,
+    // but a missing password still needs their attention.
+    await createNotification(
+      ownerId,
+      `${c.clientName}'s meeting on ${formatEatDateTime(start)} is confirmed. ${passwordNote}`,
+      "meeting_booked",
+      { meetingId: String(meeting._id), title: meeting.title, startTime: start, endTime: end },
+    ).catch((err) => console.error("Booking notification failed:", err));
+  }
+
   if (c.notifyOwner) {
     const missingLink = !meeting.meetingLink && c.autoZohoMeeting;
     await createNotification(
       ownerId,
       `${c.clientName} booked "${c.linkTitle}" for ${formatEatDateTime(start)}${
         missingLink ? ". No meeting link could be generated — add one before the call." : ""
-      }`,
+      }${passwordNote ? `. ${passwordNote}` : ""}`,
       "meeting_booked",
       {
         meetingId: String(meeting._id),
@@ -324,6 +361,7 @@ async function finishConfirmedMeeting(c: ConfirmContext): Promise<void> {
       endTime: end,
       location: meeting.location,
       meetingLink: meeting.meetingLink,
+      meetingPassword: meeting.meetingPassword,
       isRecurring: false,
       isExternal: true,
       rsvpToken,
@@ -354,6 +392,7 @@ const toResult = (
     expiresAt?: Date;
     location?: string;
     meetingLink?: string;
+    meetingPassword?: string;
   },
 ): BookingResult => ({ status, hostName, ...r });
 
@@ -569,6 +608,7 @@ export async function createBookingForLink(
     meetingId: String(meeting._id),
     location: meeting.location,
     meetingLink: meeting.meetingLink,
+    meetingPassword: meeting.meetingPassword,
   });
 }
 
@@ -732,6 +772,7 @@ export async function approveBookingRequest(
     requestId: String(req._id),
     location: meeting.location,
     meetingLink: meeting.meetingLink,
+    meetingPassword: meeting.meetingPassword,
   });
 }
 
@@ -1002,6 +1043,7 @@ async function bookViaOffer(
     meetingId: String(meeting._id),
     location: meeting.location,
     meetingLink: meeting.meetingLink,
+    meetingPassword: meeting.meetingPassword,
   });
 }
 

@@ -30,6 +30,8 @@ jest.mock("../services/zohoCalendarService", () => {
     getZohoBusyWindows: async () => [],
     createZohoEvent: (...a: any[]) => mockZoho.createZohoEvent(...a),
     updateZohoEvent: (...a: any[]) => mockZoho.updateZohoEvent(...a),
+    // These suites aren't about the meeting password: no password, no network.
+    fetchZohoMeetingPassword: async () => ({ status: "ok" as const }),
   };
 });
 

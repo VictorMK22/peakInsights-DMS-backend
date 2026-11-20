@@ -1065,6 +1065,7 @@ export const updateMeeting = async (
             endTime: meeting.endTime,
             location: meeting.location,
             meetingLink: meeting.meetingLink,
+            meetingPassword: meeting.meetingPassword,
             isExternal: r.isExternal,
           };
           if (r.isNew) {

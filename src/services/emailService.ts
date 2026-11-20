@@ -722,6 +722,8 @@ interface MeetingEmailData {
   endTime: Date;
   location?: string;
   meetingLink?: string;
+  /** Password for the meeting link (Zoho Meeting asks guests for one). */
+  meetingPassword?: string;
   isRecurring?: boolean;
   /** True when this recipient has no login (external attendee) — swaps the CTA button for a plain "add to calendar" note instead of a deep link. */
   isExternal?: boolean;
@@ -761,6 +763,7 @@ const escMeeting = <T extends MeetingEmailData & { reason?: string }>(
         ? esc(data.meetingLink)
         : undefined,
     reason: data.reason ? esc(data.reason) : data.reason,
+    meetingPassword: data.meetingPassword ? esc(data.meetingPassword) : undefined,
   }) as T;
 
 /**
@@ -803,6 +806,7 @@ export async function sendMeetingInviteEmail(
       ${info("When", formatMeetingWindow(data.startTime, data.endTime) + (data.isRecurring ? " (recurring)" : ""))}
       ${d.location ? info("Location", d.location) : ""}
       ${d.meetingLink ? info("Meeting link", `<a href="${d.meetingLink}">${d.meetingLink}</a>`) : ""}
+      ${d.meetingLink && d.meetingPassword ? info("Meeting password", d.meetingPassword) : ""}
       ${data.rsvpToken ? p("<strong>Will you be there?</strong> Please let " + d.organizerName + " know:") + rsvpBlock(data.rsvpToken) : ""}
       ${
         data.isExternal
@@ -837,6 +841,7 @@ export async function sendMeetingUpdatedEmail(
       ${info("New time", formatMeetingWindow(data.startTime, data.endTime))}
       ${d.location ? info("Location", d.location) : ""}
       ${d.meetingLink ? info("Meeting link", `<a href="${d.meetingLink}">${d.meetingLink}</a>`) : ""}
+      ${d.meetingLink && d.meetingPassword ? info("Meeting password", d.meetingPassword) : ""}
       ${data.rsvpToken ? p("Your earlier response was cleared because the time changed. <strong>Can you still make it?</strong>") + rsvpBlock(data.rsvpToken) : ""}
       ${
         data.isExternal

@@ -53,10 +53,16 @@ const READ_TIMEOUT_MS = 4000;
 
 // Calendar scopes + Zoho Meeting (needed to attach a meeting to an event)
 // + profile (to show which account is connected).
+// ZohoMeeting.manageOrg.READ lets us look up the Zoho Meeting organization
+// id, which Zoho's meeting API needs in its URLs — used only to read a new
+// meeting's password so guests can be given it (see fetchZohoMeetingPassword).
+// Accounts connected before this scope existed keep working; they just can't
+// have the password fetched until they reconnect.
 const SCOPES = [
   "ZohoCalendar.calendar.READ",
   "ZohoCalendar.event.ALL",
   "ZohoMeeting.meeting.ALL",
+  "ZohoMeeting.manageOrg.READ",
   "AaaServer.profile.READ",
 ].join(",");
 
@@ -350,6 +356,8 @@ export interface ZohoEventResult {
   viewUrl?: string;
   /** Zoho Meeting key, when the event has a meeting attached. */
   meetingKey?: string;
+  /** The meeting's password, when the event response already carried it in full. */
+  meetingPassword?: string;
 }
 
 /** The link attendees use to join a Zoho Meeting. (The link Zoho Calendar
@@ -357,16 +365,120 @@ export interface ZohoEventResult {
 export const zohoMeetingJoinLink = (meetingKey: string): string =>
   `https://${MEETING_DOMAIN}/join?key=${encodeURIComponent(meetingKey)}`;
 
+/**
+ * What a "password" value from Zoho means for a guest.
+ *  - none:   the meeting has no password (empty / missing)
+ *  - ok:     a full password a guest can type
+ *  - masked: Zoho hid part of it (e.g. "a***z") — useless to a guest
+ */
+export type ParsedMeetingPassword =
+  | { kind: "none" }
+  | { kind: "ok"; password: string }
+  | { kind: "masked" };
+
+export function interpretMeetingPassword(raw: unknown): ParsedMeetingPassword {
+  if (raw === undefined || raw === null) return { kind: "none" };
+  const value = String(raw).trim();
+  if (!value) return { kind: "none" };
+  return value.includes("*") ? { kind: "masked" } : { kind: "ok", password: value };
+}
+
 export function parseEventResult(ev: any): ZohoEventResult {
   if (!ev?.uid) throw new Error("Zoho Calendar returned no event");
   const md = ev.conference_data?.meetingdata;
   const key = md?.meeting_id ?? md?.zoho_meeting_id;
+  // Some responses already include the password; use it only when it is complete.
+  const inline = interpretMeetingPassword(md?.pwd ?? md?.password ?? md?.meeting_password);
   return {
     uid: String(ev.uid),
     etag: String(ev.etag ?? ""),
     viewUrl: ev.viewEventURL || undefined,
     meetingKey: key ? String(key) : undefined,
+    meetingPassword: inline.kind === "ok" ? inline.password : undefined,
   };
+}
+
+// ── Zoho Meeting password ───────────────────────────────────────
+
+/**
+ * Zoho Meeting protects meetings with a password by default, and the join
+ * link Zoho hands out doesn't contain it — so a guest who opens the link is
+ * asked for a password nobody gave them. These helpers fetch it so the Hub
+ * can put it in the invitation.
+ *
+ *  ok:          fetched. `password` is undefined when the meeting has none.
+ *  unavailable: couldn't be fetched; the reason says what to do about it.
+ */
+export type ZohoMeetingPasswordResult =
+  | { status: "ok"; password?: string }
+  | {
+      status: "unavailable";
+      /** needs_reconnect: connected before the extra permission existed. masked: Zoho only returns it partly hidden. error: anything else (network, Zoho down). */
+      reason: "needs_reconnect" | "masked" | "error";
+    };
+
+// Zoho Meeting organization id per connected calendar. It never changes, so
+// look it up once per server instance rather than on every booking.
+const meetingOrgIdCache = new Map<string, string>();
+
+const meetingApi = (path: string) => `https://${MEETING_DOMAIN}/api/v2/${path}`;
+const meetingHeaders = (accessToken: string) => ({
+  ...authHeader(accessToken),
+  // Zoho Meeting's API asks callers to identify themselves.
+  "X-ZSOURCE": "PeakInsightsHub",
+});
+
+/** Token lacks a permission, or Zoho says so in its error body. */
+const isScopeProblem = (err: any): boolean => {
+  const status = err?.response?.status;
+  const body = JSON.stringify(err?.response?.data ?? "").toLowerCase();
+  return status === 401 || status === 403 || body.includes("scope");
+};
+
+async function getMeetingOrgId(session: ZohoCalendarSession): Promise<string> {
+  const cached = meetingOrgIdCache.get(session.calendarUid);
+  if (cached) return cached;
+  const res = await axios.get(meetingApi("user.json"), {
+    headers: meetingHeaders(session.accessToken),
+    timeout: READ_TIMEOUT_MS,
+  });
+  const zsoid = res.data?.userDetails?.zsoid;
+  if (!zsoid) throw new Error("Zoho Meeting returned no organization id");
+  meetingOrgIdCache.set(session.calendarUid, String(zsoid));
+  return String(zsoid);
+}
+
+/** Never throws, and gives up after a few seconds: it runs while a client waits for their booking to confirm. */
+export async function fetchZohoMeetingPassword(
+  session: ZohoCalendarSession,
+  meetingKey: string,
+): Promise<ZohoMeetingPasswordResult> {
+  const work = async (): Promise<ZohoMeetingPasswordResult> => {
+    try {
+      const zsoid = await getMeetingOrgId(session);
+      const res = await axios.get(
+        meetingApi(`${encodeURIComponent(zsoid)}/sessions/${encodeURIComponent(meetingKey)}.json`),
+        { headers: meetingHeaders(session.accessToken), timeout: READ_TIMEOUT_MS },
+      );
+      const s = res.data?.session ?? res.data;
+      const parsed = interpretMeetingPassword(s?.pwd ?? s?.password);
+      if (parsed.kind === "masked") return { status: "unavailable", reason: "masked" };
+      return parsed.kind === "ok"
+        ? { status: "ok", password: parsed.password }
+        : { status: "ok" };
+    } catch (err: any) {
+      console.error(
+        "Zoho Meeting password lookup failed:",
+        err?.response?.status,
+        err?.response?.data || err?.message || err,
+      );
+      return { status: "unavailable", reason: isScopeProblem(err) ? "needs_reconnect" : "error" };
+    }
+  };
+  const giveUp = new Promise<ZohoMeetingPasswordResult>((resolve) =>
+    setTimeout(() => resolve({ status: "unavailable", reason: "error" }), 6000).unref?.(),
+  );
+  return Promise.race([work(), giveUp]);
 }
 
 const eventsUrl = (calendarUid: string, eventUid?: string) =>
