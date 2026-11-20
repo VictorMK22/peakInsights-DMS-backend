@@ -1,4 +1,5 @@
 import { Response, NextFunction } from "express";
+import { logClientActivity } from "../utils/clientAudit";
 import { AuthRequest } from "../types/auth";
 import { TaskModel, TaskStatus, ITask } from "../models/Task";
 import { SupervisorMapping } from "../models/SupervisorMapping";
@@ -188,6 +189,16 @@ export const createTask = async (
     });
 
     const assigner = await User.findById(actorId).select("name").lean();
+    if (clientId) {
+      const assignee = await User.findById(assignedTo).select("name").lean();
+      await logClientActivity(req, {
+        clientId,
+        category: "task",
+        action: "task_created",
+        summary: `Created task "${title}" for ${assignee?.name ?? "a team member"}`,
+        details: { taskId: task._id.toString(), priority: priority ?? "medium" },
+      });
+    }
 
     await createNotification(
       assignedTo,

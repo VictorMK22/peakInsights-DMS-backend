@@ -1,4 +1,5 @@
 import { Response } from "express";
+import { logClientActivity } from "../utils/clientAudit";
 import mongoose from "mongoose";
 import { AuthRequest } from "../types/auth";
 import { ClientModel } from "../models/Client";
@@ -150,6 +151,13 @@ export const createClientExtraField = async (
       isSecret,
       createdBy: req.user!.userId,
     });
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      category: "logins",
+      action: "login_added",
+      summary: `Added login detail "${created.label}"${created.isSecret ? " (secret)" : ""}`,
+      details: { label: created.label },
+    });
     return res.status(201).json({
       success: true,
       data: { field: serialize(created.toObject()) },
@@ -182,6 +190,7 @@ export const updateClientExtraField = async (
     if (!field) return res.status(404).json({ success: false });
 
     const { label, value } = cleanInput(req.body);
+    const oldLabel = field.label;
     const nextSecret =
       typeof req.body?.isSecret === "boolean"
         ? req.body.isSecret
@@ -211,6 +220,17 @@ export const updateClientExtraField = async (
     field.updatedBy = new mongoose.Types.ObjectId(req.user!.userId);
     await field.save();
 
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      category: "logins",
+      action: "login_updated",
+      summary:
+        oldLabel !== field.label
+          ? `Renamed login detail "${oldLabel}" → "${field.label}"`
+          : `Updated login detail "${field.label}"${req.body?.value !== undefined && value !== "" ? " (value changed)" : ""}`,
+      details: { label: field.label },
+    });
+
     return res.json({
       success: true,
       data: { field: serialize(field.toObject()) },
@@ -239,6 +259,13 @@ export const deleteClientExtraField = async (
       clientId: req.params.id,
     });
     if (!removed) return res.status(404).json({ success: false });
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      category: "logins",
+      action: "login_deleted",
+      summary: `Removed login detail "${removed.label}"`,
+      details: { label: removed.label },
+    });
     return res.json({ success: true });
   } catch {
     return res.status(500).json({ success: false });
@@ -267,6 +294,13 @@ export const revealClientExtraField = async (
     if (!field) return res.status(404).json({ success: false });
 
     res.setHeader("Cache-Control", "no-store");
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      category: "logins",
+      action: "login_revealed",
+      summary: `Viewed/copied login detail "${field.label}"`,
+      details: { label: field.label },
+    });
     return res.json({
       success: true,
       data: {

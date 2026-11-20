@@ -53,6 +53,8 @@ import {
   revealClientExtraField,
 } from "../controllers/clientExtraInfoController";
 
+import { getClientAuditTrail } from "../controllers/clientAuditController";
+
 const router = Router();
 
 // Spreadsheet imports are parsed in memory and never stored, so this uses
@@ -159,6 +161,10 @@ router.post("/:id/extra-info", createClientExtraField);
 router.put("/:id/extra-info/:fieldId", updateClientExtraField);
 router.delete("/:id/extra-info/:fieldId", deleteClientExtraField);
 router.get("/:id/extra-info/:fieldId/reveal", revealClientExtraField);
+
+// Audit trail — everything done under this client. CEO and Tech-department
+// supervisors only (enforced in the controller).
+router.get("/:id/audit-trail", getClientAuditTrail);
 
 // Linked working documents
 router.get("/:id/documents", getClientDocuments);

@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { logClientActivity } from "../utils/clientAudit";
 import { AuthRequest } from "../types/auth";
 import { canAccess } from "./clientController";
 import { ClientModel } from "../models/Client";
@@ -78,6 +79,12 @@ export const sendClientWhatsappMessage = async (
     timestamp: new Date(),
   });
 
+  await logClientActivity(req, {
+    clientId: req.params.id,
+    category: "whatsapp",
+    action: result.ok ? "whatsapp_sent" : "whatsapp_failed",
+    summary: `${result.ok ? "Sent" : "Failed to send"} WhatsApp message: "${body.trim().slice(0, 150)}"`,
+  });
   const populated = await record.populate(
     "authorId",
     "name role profilePicture",
@@ -169,6 +176,12 @@ export const editClientWhatsappMessage = async (
 
   message.body = body.trim();
   await message.save();
+  await logClientActivity(req, {
+    clientId: req.params.id,
+    category: "whatsapp",
+    action: "whatsapp_edited",
+    summary: `Edited WhatsApp message to: "${body.trim().slice(0, 150)}"`,
+  });
 
   const populated = await message.populate(
     "authorId",
@@ -223,6 +236,12 @@ export const resendClientWhatsappMessage = async (
   message.waError = result.error;
   message.timestamp = new Date();
   await message.save();
+  await logClientActivity(req, {
+    clientId: req.params.id,
+    category: "whatsapp",
+    action: result.ok ? "whatsapp_resent" : "whatsapp_failed",
+    summary: `${result.ok ? "Resent" : "Failed to resend"} WhatsApp message: "${message.body.slice(0, 150)}"`,
+  });
 
   const populated = await message.populate(
     "authorId",
@@ -267,6 +286,12 @@ export const deleteClientWhatsappMessage = async (
   }
 
   await message.deleteOne();
+  await logClientActivity(req, {
+    clientId: req.params.id,
+    category: "whatsapp",
+    action: "whatsapp_deleted",
+    summary: `Deleted ${message.direction} WhatsApp message: "${message.body.slice(0, 150)}"`,
+  });
   return res.json({ success: true, message: "Message deleted" });
 };
 

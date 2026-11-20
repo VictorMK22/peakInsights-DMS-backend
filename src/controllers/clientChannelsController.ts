@@ -2,6 +2,7 @@ import { Response } from "express";
 import mongoose from "mongoose";
 import { AuthRequest } from "../types/auth";
 import { canAccess } from "./clientController";
+import { logClientActivity } from "../utils/clientAudit";
 import { ClientNoteModel } from "../models/ClientNote";
 import { ClientMeetingModel } from "../models/ClientMeeting";
 import { MeetingModel } from "../models/Meeting";
@@ -63,6 +64,12 @@ export const createClientNote = async (req: AuthRequest, res: Response) => {
     authorId: req.user!.userId,
     body: body.trim(),
   });
+  await logClientActivity(req, {
+    clientId: req.params.id,
+    category: "note",
+    action: "note_added",
+    summary: `Added note: "${body.trim().slice(0, 200)}"`,
+  });
   const populated = await note.populate("authorId", "name role profilePicture");
   return res.status(201).json({ success: true, data: { note: populated } });
 };
@@ -70,10 +77,17 @@ export const createClientNote = async (req: AuthRequest, res: Response) => {
 export const deleteClientNote = async (req: AuthRequest, res: Response) => {
   if (!(await authorized(req)))
     return res.status(403).json({ success: false, message: "Access denied" });
-  await ClientNoteModel.findOneAndDelete({
+  const removedNote = await ClientNoteModel.findOneAndDelete({
     _id: req.params.noteId,
     clientId: req.params.id,
   });
+  if (removedNote)
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      category: "note",
+      action: "note_deleted",
+      summary: `Deleted note: "${String(removedNote.body).slice(0, 200)}"`,
+    });
   return res.json({ success: true });
 };
 
@@ -192,6 +206,13 @@ export const createClientMeeting = async (req: AuthRequest, res: Response) => {
     outcome,
     notes,
   });
+  await logClientActivity(req, {
+    clientId: req.params.id,
+    category: "meeting",
+    action: "meeting_logged",
+    summary: `Logged meeting "${title.trim()}" for ${new Date(scheduledAt).toISOString()}`,
+    details: { location, attendees: meeting.attendees },
+  });
   const populated = await meeting.populate(
     "authorId",
     "name role profilePicture",
@@ -282,6 +303,16 @@ export const updateClientMeeting = async (req: AuthRequest, res: Response) => {
     }
 
     await existing.save();
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      category: "meeting",
+      action: dateChanged ? "meeting_rescheduled" : body.status === "done" ? "meeting_done" : "meeting_commented",
+      summary: dateChanged
+        ? `Rescheduled meeting "${existing.title}" — reason: ${comment}`
+        : body.status === "done"
+          ? `Marked meeting "${existing.title}" as done`
+          : `Commented on meeting "${existing.title}": "${(comment ?? "").slice(0, 200)}"`,
+    });
     const populated = await existing.populate(
       "authorId",
       "name role profilePicture",
@@ -313,6 +344,12 @@ export const updateClientMeeting = async (req: AuthRequest, res: Response) => {
     { new: true, runValidators: true },
   ).populate("authorId", "name role profilePicture");
   if (!meeting) return res.status(404).json({ success: false });
+  await logClientActivity(req, {
+    clientId: req.params.id,
+    category: "meeting",
+    action: "meeting_updated",
+    summary: `Updated meeting "${meeting.title}" (${Object.keys(update).join(", ")})`,
+  });
   return res.json({ success: true, data: { meeting: withIdleTime(meeting) } });
 };
 
@@ -327,10 +364,17 @@ export const deleteClientMeeting = async (req: AuthRequest, res: Response) => {
       message:
         "Sales can't delete meetings once set — change the date and add a comment instead",
     });
-  await ClientMeetingModel.findOneAndDelete({
+  const removedMtg = await ClientMeetingModel.findOneAndDelete({
     _id: req.params.meetingId,
     clientId: req.params.id,
   });
+  if (removedMtg)
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      category: "meeting",
+      action: "meeting_deleted",
+      summary: `Deleted logged meeting "${removedMtg.title}"`,
+    });
   return res.json({ success: true });
 };
 
@@ -373,6 +417,12 @@ export const createClientCall = async (req: AuthRequest, res: Response) => {
     durationMinutes,
     summary: summary.trim(),
   });
+  await logClientActivity(req, {
+    clientId: req.params.id,
+    category: "call",
+    action: "call_logged",
+    summary: `Logged ${direction} call${durationMinutes ? ` (${durationMinutes} min)` : ""}: "${summary.trim().slice(0, 200)}"`,
+  });
   const populated = await call.populate("authorId", "name role profilePicture");
   return res.status(201).json({ success: true, data: { call: populated } });
 };
@@ -380,10 +430,17 @@ export const createClientCall = async (req: AuthRequest, res: Response) => {
 export const deleteClientCall = async (req: AuthRequest, res: Response) => {
   if (!(await authorized(req)))
     return res.status(403).json({ success: false, message: "Access denied" });
-  await ClientCallModel.findOneAndDelete({
+  const removedCall = await ClientCallModel.findOneAndDelete({
     _id: req.params.callId,
     clientId: req.params.id,
   });
+  if (removedCall)
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      category: "call",
+      action: "call_deleted",
+      summary: `Deleted logged ${removedCall.direction} call`,
+    });
   return res.json({ success: true });
 };
 

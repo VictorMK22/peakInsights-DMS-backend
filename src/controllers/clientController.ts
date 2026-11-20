@@ -20,6 +20,7 @@ import { syncMyMailbox } from "../services/emailSyncService";
 import { EmailIntegrationModel } from "../models/EmailIntegration";
 import { getAccountantSupervisorIds } from "../utils/accountantSupervisors";
 import mongoose from "mongoose";
+import { logClientActivity } from "../utils/clientAudit";
 import * as XLSX from "xlsx";
 
 // ── helpers ───────────────────────────────────────────────────────
@@ -201,6 +202,13 @@ export const createClient = async (req: AuthRequest, res: Response) => {
             },
           ]
         : [],
+    });
+    await logClientActivity(req, {
+      clientId: client._id as mongoose.Types.ObjectId,
+      clientName: client.name,
+      category: "client",
+      action: "client_created",
+      summary: `Created ${client.isSalesLead ? "lead" : "client"} "${client.name}"`,
     });
     res.status(201).json({ success: true, data: { client } });
     return;
@@ -405,7 +413,17 @@ export const importClients = async (req: AuthRequest, res: Response) => {
       });
     });
 
-    if (docs.length > 0) await ClientModel.insertMany(docs);
+    if (docs.length > 0) {
+      const inserted = await ClientModel.insertMany(docs);
+      for (const d of inserted)
+        await logClientActivity(req, {
+          clientId: d._id as mongoose.Types.ObjectId,
+          clientName: String(d.name),
+          category: "client",
+          action: "client_imported",
+          summary: `Imported client "${String(d.name)}" from spreadsheet`,
+        });
+    }
 
     res.status(201).json({
       success: true,
@@ -769,6 +787,10 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
   try {
     const { name, email, phone, company, industry, address, notes } = req.body;
 
+    const before = await ClientModel.findById(req.params.id)
+      .select("name email phone company industry address notes")
+      .lean();
+
     const client = await ClientModel.findByIdAndUpdate(
       req.params.id,
       {
@@ -785,6 +807,21 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
       { new: true, runValidators: true },
     ).populate("assignedTo", "name email role profilePicture");
     if (!client) return res.status(404).json({ success: false });
+    const changes: Record<string, { from: unknown; to: unknown }> = {};
+    for (const k of ["name", "email", "phone", "company", "industry", "address", "notes"] as const) {
+      const from = (before as any)?.[k] ?? "";
+      const to = (client as any)[k] ?? "";
+      if (String(from) !== String(to)) changes[k] = { from, to };
+    }
+    if (Object.keys(changes).length > 0)
+      await logClientActivity(req, {
+        clientId: client._id as mongoose.Types.ObjectId,
+        clientName: client.name,
+        category: "client",
+        action: "client_updated",
+        summary: `Updated client details: ${Object.keys(changes).join(", ")}`,
+        details: { changes },
+      });
     res.json({ success: true, data: { client } });
     return;
   } catch (err) {
@@ -804,7 +841,7 @@ export const deleteClient = async (req: AuthRequest, res: Response) => {
     });
   try {
     const client = await ClientModel.findById(req.params.id).select(
-      "createdBy salesStage",
+      "createdBy salesStage name",
     );
     if (!client)
       return res
@@ -826,6 +863,13 @@ export const deleteClient = async (req: AuthRequest, res: Response) => {
 
     await ClientModel.findByIdAndDelete(req.params.id);
     await ClientEmailModel.deleteMany({ clientId: req.params.id });
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      clientName: client.name,
+      category: "client",
+      action: "client_deleted",
+      summary: `Deleted client "${client.name}"`,
+    });
     res.json({ success: true });
     return;
   } catch (err) {
@@ -907,6 +951,20 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
       { new: true },
     ).populate("assignedTo", "name email role profilePicture");
     if (!client) return res.status(404).json({ success: false });
+
+    {
+      const names = (client.assignedTo as any[]).map((u) => u.name).filter(Boolean);
+      await logClientActivity(req, {
+        clientId: client._id as mongoose.Types.ObjectId,
+        clientName: client.name,
+        category: "assignment",
+        action: "client_assigned",
+        summary: names.length
+          ? `Set assigned team to: ${names.join(", ")}`
+          : "Removed all assigned team members",
+        details: { assignedTo: names },
+      });
+    }
 
     // Tell each newly added accountant / supervisor — in the app and by
     // email. (Done before responding so it isn't cut off on serverless.)
@@ -1029,6 +1087,7 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
     const primaryId = uniqueUserIds[0];
     const ops: mongoose.AnyBulkWriteOperation<any>[] = [];
     const newlyAssigned = new Map<string, { id: string; name: string }[]>();
+    const bulkAudit: { id: mongoose.Types.ObjectId; name?: string; added: string[] }[] = [];
     let alreadyAssigned = 0;
 
     for (const c of clients) {
@@ -1049,6 +1108,7 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
         $set.allocatedAt = now;
         $set.allocatedBy = toObjectId(req.user!.userId);
       }
+      bulkAudit.push({ id: c._id as mongoose.Types.ObjectId, name: (c as any).name, added });
       ops.push({
         updateOne: {
           filter: { _id: c._id },
@@ -1087,6 +1147,22 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
       // ...and one email per person, listing the clients they were given.
       const person = people.find((u) => String(u._id) === userId);
       if (person) await emailAssignee(person, req.user!.userId, assigned);
+    }
+
+    for (const a of bulkAudit) {
+      const who = a.added
+        .map((id) => people.find((u) => String(u._id) === id)?.name)
+        .filter(Boolean);
+      await logClientActivity(req, {
+        clientId: a.id,
+        clientName: a.name,
+        category: "assignment",
+        action: "client_bulk_assigned",
+        summary: who.length
+          ? `Assigned (bulk) to ${who.join(", ")}`
+          : "Updated allocation (bulk assign)",
+        details: { added: who },
+      });
     }
 
     res.json({
@@ -1247,6 +1323,14 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
       }
     }
 
+    await logClientActivity(req, {
+      clientId: client._id as mongoose.Types.ObjectId,
+      clientName: client.name,
+      category: "assignment",
+      action: previous && previous !== next ? "accountant_reallocated" : "accountant_allocated",
+      summary: `${previous && previous !== next ? "Reallocated" : "Allocated"} accountant: ${accountant.name}`,
+      details: { accountantId: next, previousAccountantId: previous },
+    });
     const populated = await client.populate([
       { path: "assignedTo", select: "name email role profilePicture" },
       { path: "allocatedAccountant", select: "name email" },
@@ -1292,6 +1376,7 @@ export const updateClientStage = async (req: AuthRequest, res: Response) => {
       });
 
     const justWon = stage === "won" && client.salesStage !== "won";
+    const prevStage = client.salesStage;
     client.salesStage = stage;
     if (justWon) client.wonAt = new Date();
     client.salesStageHistory.push({
@@ -1302,6 +1387,14 @@ export const updateClientStage = async (req: AuthRequest, res: Response) => {
     });
 
     await client.save();
+    await logClientActivity(req, {
+      clientId: client._id as mongoose.Types.ObjectId,
+      clientName: client.name,
+      category: "pipeline",
+      action: "stage_changed",
+      summary: `Sales stage: ${prevStage ?? "none"} → ${stage}${note?.trim() ? ` (note: ${note.trim().slice(0, 200)})` : ""}`,
+      details: { from: prevStage, to: stage },
+    });
 
     // A won lead moves to the CEO, who allocates an accountant to serve it.
     if (justWon && !client.allocatedAccountant) {
@@ -1449,6 +1542,14 @@ export const syncClientEmails = async (req: AuthRequest, res: Response) => {
         console.error("Client email sync failed for a mailbox:", r.reason);
     }
 
+    if (synced > 0)
+      await logClientActivity(req, {
+        clientId: req.params.id,
+        category: "email",
+        action: "emails_synced",
+        summary: `Synced mailbox — ${synced} new email${synced === 1 ? "" : "s"} pulled in`,
+        details: { synced },
+      });
     return res.json({ success: true, data: { synced, notConnected } });
   } catch (err) {
     return res.status(500).json({ success: false });
@@ -1570,6 +1671,14 @@ export const sendClientEmail = async (req: AuthRequest, res: Response) => {
       await record.save();
     }
 
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      clientName: client.name,
+      category: "email",
+      action: record.status === "failed" ? "email_failed" : "email_sent",
+      summary: `${record.status === "failed" ? "Failed to send" : "Sent"} email "${record.subject}" to ${client.email}`,
+      details: { subject: record.subject, to: client.email, attachments: attachments.length },
+    });
     const populated = await record.populate(
       "authorId",
       "name role email profilePicture",
@@ -1605,6 +1714,13 @@ export const deleteClientEmail = async (req: AuthRequest, res: Response) => {
     if (!isAuthor && !isCEO(req))
       return res.status(403).json({ success: false });
     await record.deleteOne();
+    await logClientActivity(req, {
+      clientId: req.params.id,
+      category: "email",
+      action: "email_deleted",
+      summary: `Deleted ${record.direction} email "${record.subject}"`,
+      details: { subject: record.subject, direction: record.direction },
+    });
     res.json({ success: true });
     return;
   } catch (err) {
