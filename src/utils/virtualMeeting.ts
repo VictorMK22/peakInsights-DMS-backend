@@ -14,3 +14,20 @@ export const isVirtualLocation = (location?: string | null): boolean =>
 
 export const VIRTUAL_MEETING_LINK_REQUIRED_MESSAGE =
   "A virtual meeting needs a meeting link. Generate a Zoho Meeting link, or paste the link if you created it elsewhere.";
+
+
+/**
+ * Make a user-typed meeting link safe to use as an <a href>.
+ *
+ * Links pasted as "meet.google.com/abc-defg-hij" have no scheme, so the browser
+ * resolves them relative to the current page (e.g. /sales/meet.google.com/...)
+ * and the SPA router then bounces the user to their dashboard. Prefix https://
+ * when no scheme is present.
+ */
+export const normalizeMeetingUrl = (raw?: string | null): string => {
+  const v = (raw ?? "").trim();
+  if (!v) return "";
+  if (/^[a-z][a-z0-9+.-]*:/i.test(v)) return v; // http:, https:, mailto:, etc.
+  if (v.startsWith("//")) return `https:${v}`;
+  return `https://${v.replace(/^\/+/, "")}`;
+};

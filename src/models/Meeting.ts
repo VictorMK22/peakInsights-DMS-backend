@@ -1,4 +1,5 @@
 import mongoose, { Document, Schema } from "mongoose";
+import { normalizeMeetingUrl } from "../utils/virtualMeeting";
 
 /**
  * Meeting & Calendar module.
@@ -215,7 +216,7 @@ const MeetingSchema = new Schema<IMeeting>(
     endTime: { type: Date, required: true },
 
     location: { type: String, trim: true },
-    meetingLink: { type: String, trim: true },
+    meetingLink: { type: String, trim: true, set: normalizeMeetingUrl },
     meetingPassword: { type: String, trim: true, maxlength: 200 },
     conferenceProvider: {
       type: String,
