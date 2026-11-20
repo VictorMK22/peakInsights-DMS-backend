@@ -247,7 +247,7 @@ export async function listMessageAttachments(
       a.contentType ||
       a.attachmentContentType ||
       guessMimeType(a.attachmentName || a.fileName || ""),
-    contentId: (a.cid || a.contentId || a.cId || undefined) as
+    contentId: (a.cid || a.contentId || a.contentID || a.cId || undefined) as
       | string
       | undefined,
   }));

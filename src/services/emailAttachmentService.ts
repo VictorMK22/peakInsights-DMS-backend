@@ -105,16 +105,43 @@ export function presentAttachments(
       mimeType: a.mimeType,
       size: a.size,
       isImage: (a.mimeType ?? "").startsWith("image/"),
-      inline: !!cid && lowerBody.includes(`cid:${cid}`),
+      inline:
+        (!!cid && lowerBody.includes(`cid:${cid}`)) ||
+        (/(imagedisplay|imagesignature|imagesign)/.test(lowerBody) &&
+          (a.mimeType ?? "").startsWith("image/") &&
+          !!a.filename &&
+          (lowerBody.includes(encodeURIComponent(a.filename).toLowerCase()) ||
+            lowerBody.includes(String(a.filename).toLowerCase()))),
       url: withParams(base, a.filename, false),
       downloadUrl: withParams(base, a.filename, true),
     };
   });
 }
 
+/** Safe decode — a stray "%" in a cid must never throw. */
+const safeDecode = (v: string) => {
+  try {
+    return decodeURIComponent(v);
+  } catch {
+    return v;
+  }
+};
+
+const norm = (v: string) =>
+  safeDecode(v).replace(/&amp;/gi, "&").replace(/^<|>$/g, "").trim().toLowerCase();
+
+/** Zoho's webmail hosts inline images/signatures behind URLs like /mail/ImageDisplay?...&f=Name.png&cid=... */
+const ZOHO_INLINE_SRC =
+  /(src\s*=\s*)(["'])([^"']*(?:ImageDisplay|ImageSignature|ImageSign)[^"']*)\2/gi;
+
+/** True when the HTML references inline images we would need to fetch (cid: or a Zoho-hosted image URL). */
+export const bodyHasInlineImageRefs = (body = ""): boolean =>
+  /cid:/i.test(body) || /(ImageDisplay|ImageSignature|ImageSign)/i.test(body);
+
 /**
- * Synced HTML emails reference embedded images as <img src="cid:abc123">,
- * which a browser can't load. Swap each one for a fresh signed URL of the
+ * Synced HTML emails reference embedded images as <img src="cid:abc123">
+ * (or as a Zoho-hosted /mail/ImageDisplay?... URL), neither of which a browser
+ * can load from our page. Swap each one for a fresh signed URL of the
  * matching stored attachment. The stored body is never modified — this runs
  * on the way out only, so URLs can't expire inside saved data.
  */
@@ -122,24 +149,45 @@ export function resolveCidImages(
   body: string,
   attachments: IEmailAttachment[] = [],
 ): string {
-  if (!body || !/cid:/i.test(body)) return body;
+  if (!body || !bodyHasInlineImageRefs(body)) return body;
+
   const byCid = new Map<string, string>();
+  const byName = new Map<string, string>();
   for (const a of attachments as any[]) {
-    if (a.contentId) {
-      byCid.set(
-        normalizeCid(a.contentId),
-        withParams(getLocalFileUrl(a.fileKey), a.filename, false),
-      );
-    }
+    const url = withParams(getLocalFileUrl(a.fileKey), a.filename, false);
+    if (a.contentId) byCid.set(norm(a.contentId), url);
+    if (a.filename) byName.set(norm(a.filename), url);
   }
-  if (byCid.size === 0) return body;
-  return body.replace(/cid:([^"'\s>)]+)/gi, (match, cid: string) => {
+  if (byCid.size === 0 && byName.size === 0) return body;
+
+  // 1) cid:xyz  — the id may contain spaces (e.g. "Signature Nixon.png"), so try
+  //    everything up to the closing quote first, then just the first word.
+  let out = body.replace(/cid:([^"'>)]+)/gi, (match, raw: string) => {
+    const full = norm(raw);
+    const firstWord = norm(raw.split(/\s+/)[0] ?? "");
+    const hit =
+      byCid.get(full) ?? byName.get(full) ?? byCid.get(firstWord) ?? byName.get(firstWord);
+    if (!hit) return match;
+    // If we matched only the first word, keep whatever followed it intact.
+    const consumed = byCid.has(full) || byName.has(full) ? "" : raw.slice(raw.split(/\s+/)[0].length);
+    return hit + consumed;
+  });
+
+  // 2) Zoho-hosted inline image URLs — match by cid= or by the file name (f= / fileName=).
+  out = out.replace(ZOHO_INLINE_SRC, (match, pre: string, q: string, url: string) => {
     try {
-      return byCid.get(normalizeCid(cid)) ?? match;
+      const qs = new URLSearchParams(url.replace(/&amp;/gi, "&").split("?")[1] ?? "");
+      const cid = qs.get("cid") ?? qs.get("contentId");
+      const name = qs.get("f") ?? qs.get("fileName") ?? qs.get("name");
+      const hit =
+        (cid && (byCid.get(norm(cid)) ?? byName.get(norm(cid)))) ||
+        (name && byName.get(norm(name)));
+      return hit ? `${pre}${q}${hit}${q}` : match;
     } catch {
       return match;
     }
   });
+  return out;
 }
 
 // ═════════════════════════════════════════════════════════════════

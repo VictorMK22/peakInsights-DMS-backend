@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { bodyHasInlineImageRefs } from "./emailAttachmentService";
 import {
   EmailIntegrationModel,
   IEmailIntegration,
@@ -495,6 +496,7 @@ async function syncClientMessage(
     accountId,
     folderId,
     msg,
+    body,
   );
 
   try {
@@ -733,6 +735,7 @@ async function syncInternalMessage(
     accountId,
     folderId,
     msg,
+    body,
   );
 
   try {
@@ -788,8 +791,12 @@ async function fetchAttachments(
   accountId: string,
   folderId: string,
   msg: ZohoMessageSummary,
+  body = "",
 ): Promise<SyncedAttachment[]> {
-  if (!msg.hasAttachment) return [];
+  // Zoho often reports hasAttachment=false for messages whose only "attachment"
+  // is an inline image (e.g. an email signature), so also look when the HTML
+  // body points at inline images.
+  if (!msg.hasAttachment && !bodyHasInlineImageRefs(body)) return [];
   const metas = await listMessageAttachments(
     accessToken,
     accountId,
@@ -829,9 +836,10 @@ async function syncAttachments(
   accountId: string,
   folderId: string,
   msg: ZohoMessageSummary,
+  body = "",
 ): Promise<SyncedAttachment[]> {
   try {
-    return await fetchAttachments(accessToken, accountId, folderId, msg);
+    return await fetchAttachments(accessToken, accountId, folderId, msg, body);
   } catch (err) {
     console.error(
       `Zoho sync: failed to sync attachments for message ${msg.messageId}:`,
