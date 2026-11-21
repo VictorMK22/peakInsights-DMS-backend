@@ -48,7 +48,9 @@ export interface ITaskCollaborator {
 }
 
 export interface IApprovalHistory {
-  action: "approved" | "rejected";
+  // "returned" = sent back to the assignee for rework with comments
+  // (reason holds the reviewer's comments).
+  action: "approved" | "rejected" | "returned";
   by: mongoose.Types.ObjectId;
   at: Date;
   reason?: string;
@@ -150,7 +152,11 @@ const TaskCollaboratorSchema = new Schema<ITaskCollaborator>(
 
 const ApprovalHistorySchema = new Schema<IApprovalHistory>(
   {
-    action: { type: String, enum: ["approved", "rejected"], required: true },
+    action: {
+      type: String,
+      enum: ["approved", "rejected", "returned"],
+      required: true,
+    },
     by: { type: Schema.Types.ObjectId, ref: "User", required: true },
     at: { type: Date, default: Date.now },
     reason: { type: String },

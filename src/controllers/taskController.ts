@@ -55,6 +55,40 @@ const isActiveCollaborator = (task: TaskAccessShape, userId: string): boolean =>
     (c) => idOf(c.userId) === userId && c.status === "active",
   );
 
+// Who may decide on a submitted task (approve it, or return it for rework):
+// CEO; tech only for tasks they assigned; a supervisor for tasks they assigned
+// or tasks of their active subordinates. Returns an error to send, or null.
+const reviewAccessError = async (
+  task: ITask,
+  userId: string,
+  role: string,
+  verb: "approve" | "return",
+): Promise<{ status: number; message: string } | null> => {
+  if (role !== "ceo" && role !== "tech" && role !== "supervisor") {
+    return {
+      status: 403,
+      message: `Only CEO, Tech, or Supervisor can ${verb} tasks`,
+    };
+  }
+  if (role === "tech" && task.assignedBy.toString() !== userId) {
+    return { status: 403, message: `You can only ${verb} tasks you assigned` };
+  }
+  if (role === "supervisor" && task.assignedBy.toString() !== userId) {
+    const inTeam = await SupervisorMapping.exists({
+      supervisorId: userId,
+      subordinateId: task.assignedTo,
+      status: "active",
+    });
+    if (!inTeam) {
+      return {
+        status: 403,
+        message: `You can only ${verb} tasks from your own team`,
+      };
+    }
+  }
+  return null;
+};
+
 // Shared "full detail" populate shape used by every endpoint that
 // returns a single task for display (review docs, approval trail,
 // collaborators, etc). Also re-signs file URLs on the populated
@@ -580,6 +614,7 @@ export const updateTaskStatus = async (
     else if (status === "submitted" && task.status === "in_progress") {
       task.status = "submitted";
       task.submittedAt = now;
+      task.rejectionReason = undefined; // a resubmission is no longer rejected
       if (submissionComment) task.submissionComment = submissionComment;
 
       // Attach documents the assignee is submitting as proof of work.
@@ -618,6 +653,7 @@ export const updateTaskStatus = async (
     else if (status === "completed" && task.status === "submitted") {
       task.completedAt = now;
       task.status = "completed";
+      task.rejectionReason = undefined;
 
       if (task.startedAt) {
         task.tatMinutes = calcTAT(task.startedAt, now);
@@ -1265,39 +1301,18 @@ export const approveTask = async (
     }
 
     const userId = req.user!.userId;
-    const role = req.user!.role;
 
-    if (role !== "ceo" && role !== "tech" && role !== "supervisor") {
-      res.status(403).json({
-        success: false,
-        message: "Only CEO, Tech, or Supervisor can approve tasks",
-      });
+    const denied = await reviewAccessError(
+      task,
+      userId,
+      req.user!.role,
+      "approve",
+    );
+    if (denied) {
+      res
+        .status(denied.status)
+        .json({ success: false, message: denied.message });
       return;
-    }
-
-    if (role === "tech" && task.assignedBy.toString() !== userId) {
-      res.status(403).json({
-        success: false,
-        message: "You can only approve tasks you assigned",
-      });
-      return;
-    }
-
-    // A supervisor approves only their own team's work: tasks they
-    // assigned, or tasks assigned to one of their active subordinates.
-    if (role === "supervisor" && task.assignedBy.toString() !== userId) {
-      const inTeam = await SupervisorMapping.exists({
-        supervisorId: userId,
-        subordinateId: task.assignedTo,
-        status: "active",
-      });
-      if (!inTeam) {
-        res.status(403).json({
-          success: false,
-          message: "You can only approve tasks from your own team",
-        });
-        return;
-      }
     }
 
     if (task.status !== "submitted") {
@@ -1311,6 +1326,7 @@ export const approveTask = async (
     const now = new Date();
     task.status = "completed";
     task.completedAt = now;
+    task.rejectionReason = undefined;
 
     if (task.startedAt) {
       task.tatMinutes = calcTAT(task.startedAt, now);
@@ -1357,6 +1373,102 @@ export const approveTask = async (
     res.json({
       success: true,
       message: "Task approved and completed",
+      data: { task: populated },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────
+// RETURN TASK  (PATCH /:id/return)
+// The reviewer sends a submitted task back to the assignee, with
+// comments, when the work doesn't meet the required standard. The task
+// goes back to in_progress (the TAT clock keeps running) so the assignee
+// can rework it and resubmit. Same access rules as approving.
+// The comments are kept in approvalHistory, which is the source of truth
+// for review feedback.
+// ─────────────────────────────────────────────────────────────────
+const MAX_RETURN_COMMENT_LENGTH = 2000;
+
+export const returnTask = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const task = await TaskModel.findById(req.params.id);
+    if (!task) {
+      res.status(404).json({ success: false, message: "Task not found" });
+      return;
+    }
+
+    const userId = req.user!.userId;
+
+    const denied = await reviewAccessError(
+      task,
+      userId,
+      req.user!.role,
+      "return",
+    );
+    if (denied) {
+      res
+        .status(denied.status)
+        .json({ success: false, message: denied.message });
+      return;
+    }
+
+    if (task.status !== "submitted") {
+      res.status(400).json({
+        success: false,
+        message: `Cannot return a task that is "${task.status}" — only submitted tasks can be returned`,
+      });
+      return;
+    }
+
+    const comments =
+      typeof req.body?.comments === "string" ? req.body.comments.trim() : "";
+    if (!comments) {
+      res.status(400).json({
+        success: false,
+        message: "Comments are required when returning a task",
+      });
+      return;
+    }
+    if (comments.length > MAX_RETURN_COMMENT_LENGTH) {
+      res.status(400).json({
+        success: false,
+        message: `Comments must be ${MAX_RETURN_COMMENT_LENGTH} characters or fewer`,
+      });
+      return;
+    }
+
+    const now = new Date();
+    task.status = "in_progress";
+    task.rejectionReason = undefined; // clear any legacy value
+    task.approvalHistory.push({
+      action: "returned",
+      by: new mongoose.Types.ObjectId(userId),
+      at: now,
+      reason: comments,
+    });
+
+    await task.save();
+
+    const preview =
+      comments.length > 140 ? `${comments.slice(0, 137)}...` : comments;
+    await createNotification(
+      task.assignedTo.toString(),
+      `Task "${task.title}" was returned for rework: ${preview}`,
+      "task_returned",
+      { taskId: task._id.toString(), taskTitle: task.title },
+    );
+
+    const populated = await populateTaskDetail(task._id);
+
+    res.json({
+      success: true,
+      message: "Task returned to the assignee",
       data: { task: populated },
     });
   } catch (err) {

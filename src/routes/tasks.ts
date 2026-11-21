@@ -9,6 +9,7 @@ import {
   updateTaskStatus,
   markTaskReviewed,
   approveTask,
+  returnTask,
   deleteTask,
   inviteTaskCollaborator,
   revokeTaskCollaborator,
@@ -36,6 +37,8 @@ import {
  *                           submitted → rejected    (approver rejects, back to in_progress)
  *                           any → cancelled
  *   PATCH  /:id/approve   Convenience shortcut: directly approve a submitted task
+ *   PATCH  /:id/return    Approver sends a submitted task back to the assignee
+ *                         with comments (body: { comments }) → in_progress
  */
 
 const router = Router();
@@ -65,6 +68,7 @@ router.put("/:id", updateTask);
 router.patch("/:id/review", markTaskReviewed);
 router.patch("/:id/status", updateTaskStatus);
 router.patch("/:id/approve", approveTask);
+router.patch("/:id/return", returnTask);
 router.delete("/:id", deleteTask);
 
 // ── Collaboration ─────────────────────────────────────────────────
