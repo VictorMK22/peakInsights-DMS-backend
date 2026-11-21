@@ -30,6 +30,9 @@ export interface IDocument extends Document {
   // to that client (CEO, assigned sales person/accountant, their supervisor)
   // can open it — see canAccess in documentController.
   clientId?: mongoose.Types.ObjectId;
+  // Folder inside that client's Documents tab (see ClientFolder). Unset =
+  // not in a folder. Independent of folderId, which is the owner's Drive folder.
+  clientFolderId?: mongoose.Types.ObjectId;
   targetCompletionTime?: Date;
   startTime?: Date;
   endTime?: Date;
@@ -106,6 +109,7 @@ const DocumentSchema = new Schema<IDocument>(
     departmentId: { type: String },
     supervisorId: { type: Schema.Types.ObjectId, ref: "User" },
     clientId: { type: Schema.Types.ObjectId, ref: "Client", index: true },
+    clientFolderId: { type: Schema.Types.ObjectId, ref: "ClientFolder" },
 
     targetCompletionTime: { type: Date },
     startTime: { type: Date },
@@ -131,6 +135,7 @@ const DocumentSchema = new Schema<IDocument>(
 );
 
 DocumentSchema.index({ folderId: 1, createdAt: -1 });
+DocumentSchema.index({ clientId: 1, clientFolderId: 1, createdAt: -1 });
 DocumentSchema.index({ ownerId: 1, status: 1 });
 DocumentSchema.index({ ownerId: 1, documentType: 1, createdAt: -1 });
 DocumentSchema.index({ supervisorId: 1, documentType: 1, createdAt: -1 });

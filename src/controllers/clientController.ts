@@ -1742,20 +1742,36 @@ export const getClientDocuments = async (req: AuthRequest, res: Response) => {
     if (!ok)
       return res.status(403).json({ success: false, message: "Access denied" });
 
-    const { page = "1", limit = "20" } = req.query as Record<string, string>;
+    const {
+      page = "1",
+      limit = "20",
+      // "all" (default) = every document of the client, "root" = only those
+      // not in a folder, or a client-folder id = only that folder's documents.
+      folderId = "all",
+    } = req.query as Record<string, string>;
     const skip = (Number(page) - 1) * Number(limit);
 
     // Documents uploaded against this client (POST /documents with
     // clientId). Everyone with access to the client sees the same list.
-    const filter = {
+    const filter: Record<string, any> = {
       clientId: new mongoose.Types.ObjectId(req.params.id),
       isDeleted: { $ne: true },
     };
+    if (folderId === "root") {
+      filter.clientFolderId = null; // matches unset as well
+    } else if (folderId !== "all") {
+      if (!mongoose.Types.ObjectId.isValid(folderId)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid folder" });
+      }
+      filter.clientFolderId = new mongoose.Types.ObjectId(folderId);
+    }
     const [documents, total] = await Promise.all([
       DocumentModel.find(filter)
         .populate("ownerId", "name email role")
         .select(
-          "title fileType fileName fileSize documentType createdAt description folderId ownerId",
+          "title fileType fileName fileSize documentType createdAt description folderId clientFolderId ownerId",
         )
         .sort({ createdAt: -1 })
         .skip(skip)

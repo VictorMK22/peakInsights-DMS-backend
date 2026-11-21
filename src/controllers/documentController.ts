@@ -41,6 +41,7 @@ import { DocumentModel } from "../models/Document";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { ClientModel } from "../models/Client";
 import { canAccess as canAccessClient } from "./clientController";
+import { ClientFolderModel } from "../models/ClientFolder";
 import { TaskModel } from "../models/Task";
 import { createAuditLog } from "../utils/auditLogger";
 import mongoose from "mongoose";
@@ -522,6 +523,34 @@ export const createDocument = async (
       if (documentType === "learning") documentType = "storage";
     }
 
+    // Optional: file the uploads inside one of that client's folders
+    // (the folders of the client's Documents tab, see ClientFolder).
+    const clientFolderIdRaw = req.body.clientFolderId as string | undefined;
+    let clientFolderObjectId: mongoose.Types.ObjectId | undefined;
+    if (clientFolderIdRaw) {
+      if (!clientObjectId) {
+        return res.status(400).json({
+          success: false,
+          message: "clientFolderId can only be used together with clientId",
+        });
+      }
+      if (!mongoose.Types.ObjectId.isValid(clientFolderIdRaw)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid client folder" });
+      }
+      const clientFolder = await ClientFolderModel.exists({
+        _id: clientFolderIdRaw,
+        clientId: clientObjectId,
+      });
+      if (!clientFolder) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Client folder not found" });
+      }
+      clientFolderObjectId = new mongoose.Types.ObjectId(clientFolderIdRaw);
+    }
+
     // Optional category — available for every document type. It must be a
     // category of the same type that this user can see (shared, or their own).
     if (categoryId) {
@@ -661,6 +690,7 @@ export const createDocument = async (
           ownerId: req.user!.userId,
           supervisorId: mapping?.supervisorId,
           clientId: clientObjectId,
+          clientFolderId: clientFolderObjectId,
           departmentId: department ?? mapping?.departmentName,
           tags: tags ? (Array.isArray(tags) ? tags : [tags]) : [],
           documentType: documentType ?? "working",

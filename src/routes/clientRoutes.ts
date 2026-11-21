@@ -24,6 +24,13 @@ import {
   getAssignableEmployees,
 } from "../controllers/clientController";
 import {
+  listClientFolders,
+  createClientFolder,
+  renameClientFolder,
+  deleteClientFolder,
+  moveClientDocument,
+} from "../controllers/clientFolderController";
+import {
   getClientNotes,
   createClientNote,
   deleteClientNote,
@@ -168,5 +175,12 @@ router.get("/:id/audit-trail", getClientAuditTrail);
 
 // Linked working documents
 router.get("/:id/documents", getClientDocuments);
+
+// Folders inside the client's Documents tab (shared by everyone with access)
+router.get("/:id/folders", listClientFolders);
+router.post("/:id/folders", createClientFolder);
+router.put("/:id/folders/:folderId", renameClientFolder);
+router.delete("/:id/folders/:folderId", deleteClientFolder);
+router.put("/:id/documents/:docId/folder", moveClientDocument);
 
 export default router;
