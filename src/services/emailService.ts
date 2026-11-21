@@ -724,6 +724,8 @@ interface MeetingEmailData {
   meetingLink?: string;
   /** Password for the meeting link (Zoho Meeting asks guests for one). */
   meetingPassword?: string;
+  /** "voice" = audio-only online meeting: the email says no camera is needed. */
+  callType?: "video" | "voice";
   isRecurring?: boolean;
   /** True when this recipient has no login (external attendee) — swaps the CTA button for a plain "add to calendar" note instead of a deep link. */
   isExternal?: boolean;
@@ -764,7 +766,11 @@ const escMeeting = <T extends MeetingEmailData & { reason?: string }>(
         : undefined,
     reason: data.reason ? esc(data.reason) : data.reason,
     meetingPassword: data.meetingPassword ? esc(data.meetingPassword) : undefined,
+    // Only the one known value is ever honoured, whatever was passed in.
+    callType: data.callType === "voice" ? "voice" : undefined,
   }) as T;
+
+const VOICE_CALL_NOTE = "Voice call (audio only, no camera needed)";
 
 /**
  * Where the Accept / Decline buttons lead: the public response page in the
@@ -807,6 +813,7 @@ export async function sendMeetingInviteEmail(
       ${d.location ? info("Location", d.location) : ""}
       ${d.meetingLink ? info("Meeting link", `<a href="${d.meetingLink}">${d.meetingLink}</a>`) : ""}
       ${d.meetingLink && d.meetingPassword ? info("Meeting password", d.meetingPassword) : ""}
+      ${d.callType === "voice" ? info("Call type", VOICE_CALL_NOTE) : ""}
       ${data.rsvpToken ? p("<strong>Will you be there?</strong> Please let " + d.organizerName + " know:") + rsvpBlock(data.rsvpToken) : ""}
       ${
         data.isExternal
@@ -842,6 +849,7 @@ export async function sendMeetingUpdatedEmail(
       ${d.location ? info("Location", d.location) : ""}
       ${d.meetingLink ? info("Meeting link", `<a href="${d.meetingLink}">${d.meetingLink}</a>`) : ""}
       ${d.meetingLink && d.meetingPassword ? info("Meeting password", d.meetingPassword) : ""}
+      ${d.callType === "voice" ? info("Call type", VOICE_CALL_NOTE) : ""}
       ${data.rsvpToken ? p("Your earlier response was cleared because the time changed. <strong>Can you still make it?</strong>") + rsvpBlock(data.rsvpToken) : ""}
       ${
         data.isExternal
@@ -930,6 +938,7 @@ export async function sendBookingRequestReceivedEmail(data: {
   title: string;
   startTime: Date;
   endTime: Date;
+  callType?: "video" | "voice";
 }): Promise<void> {
   await send(
     data.toEmail,
@@ -941,6 +950,7 @@ export async function sendBookingRequestReceivedEmail(data: {
       ${p("Hi " + esc(data.toName) + ", thanks — " + esc(data.hostName) + " will review your request and confirm by email.")}
       ${info("Meeting", esc(data.title))}
       ${info("Requested time", formatMeetingWindow(data.startTime, data.endTime))}
+      ${data.callType === "voice" ? info("Call type", VOICE_CALL_NOTE) : ""}
       ${highlight("Nothing is confirmed yet. You'll receive a calendar invitation as soon as it's approved.")}
     `,
     ),
@@ -996,6 +1006,7 @@ export async function sendBookingRequestOwnerEmail(data: {
   startTime: Date;
   endTime: Date;
   topic?: string;
+  callType?: "video" | "voice";
 }): Promise<void> {
   await send(
     data.toEmail,
@@ -1008,6 +1019,7 @@ export async function sendBookingRequestOwnerEmail(data: {
       ${info("Meeting", esc(data.title))}
       ${info("From", esc(data.clientName) + " (" + esc(data.clientEmail) + ")")}
       ${info("Requested time", formatMeetingWindow(data.startTime, data.endTime))}
+      ${data.callType === "voice" ? info("Call type", VOICE_CALL_NOTE) : ""}
       ${data.topic ? info("Topic", esc(data.topic)) : ""}
       ${btn("Review request", `${APP_URL}/meetings`)}
       ${p("Open Meetings → Booking links to approve or decline.")}

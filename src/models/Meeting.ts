@@ -1,5 +1,4 @@
 import mongoose, { Document, Schema } from "mongoose";
-import { normalizeMeetingUrl } from "../utils/virtualMeeting";
 
 /**
  * Meeting & Calendar module.
@@ -146,6 +145,8 @@ export interface IMeeting extends Document {
   // Set when it could be fetched from Zoho; shown to attendees and sent in
   // invitations alongside the link.
   meetingPassword?: string;
+  // "voice" = audio-only online meeting (no camera needed). Unset means video.
+  callType?: "video" | "voice";
 
   // Set when an external client booked this through a public booking link
   // (see models/BookingLink.ts); used to cap bookings per email address.
@@ -216,8 +217,9 @@ const MeetingSchema = new Schema<IMeeting>(
     endTime: { type: Date, required: true },
 
     location: { type: String, trim: true },
-    meetingLink: { type: String, trim: true, set: normalizeMeetingUrl },
+    meetingLink: { type: String, trim: true },
     meetingPassword: { type: String, trim: true, maxlength: 200 },
+    callType: { type: String, enum: ["video", "voice"] },
     conferenceProvider: {
       type: String,
       enum: ["custom", "zoho_meeting", "google_meet"],

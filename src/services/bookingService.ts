@@ -1,5 +1,11 @@
 import crypto from "crypto";
-import { BookingLinkModel, IBookingLink, BOOKING_LIMITS } from "../models/BookingLink";
+import {
+  BookingLinkModel,
+  IBookingLink,
+  BOOKING_LIMITS,
+  CallType,
+  callTypeTitleSuffix,
+} from "../models/BookingLink";
 import { BookingRequestModel, IBookingRequest } from "../models/BookingRequest";
 import { MeetingModel, IMeeting } from "../models/Meeting";
 import { ClientModel } from "../models/Client";
@@ -198,11 +204,14 @@ export interface BookingInput {
   name: string;
   email: string;
   topic?: string;
+  /** What the client chose. Omitted → the link's first allowed type. */
+  callType?: CallType;
 }
 
 export interface BookingResult {
   /** "confirmed": it is a meeting now. "pending": waiting for the host to approve. */
   status: "confirmed" | "pending";
+  callType: CallType;
   title: string;
   startTime: Date;
   endTime: Date;
@@ -218,6 +227,23 @@ export interface BookingResult {
 }
 
 const lockKey = (ownerId: string) => `owner:${ownerId}`;
+const callTypeSuffix = callTypeTitleSuffix;
+
+/**
+ * The fixed meeting link to use for a call type, if the link has one. A voice
+ * call prefers its own link (e.g. an audio-only room) and otherwise shares
+ * the video one. `link` may be missing (deleted since the request was made).
+ */
+const fixedLinkFor = (
+  link: { meetingLink?: string; voiceMeetingLink?: string } | null | undefined,
+  callType: CallType,
+): string | undefined =>
+  (callType === "voice" ? link?.voiceMeetingLink || link?.meetingLink : link?.meetingLink) ||
+  undefined;
+
+/** "Online" for video; says so for a voice call. */
+const onlineLocation = (callType: CallType) =>
+  callType === "voice" ? "Online (voice call)" : "Online";
 
 const busyError = () =>
   new BookingError(
@@ -234,6 +260,7 @@ interface ConfirmContext {
   /** Link title for notifications / the activity trail. */
   linkTitle: string;
   autoZohoMeeting: boolean;
+  callType: CallType;
   clientName: string;
   clientEmail: string;
   clientId?: unknown;
@@ -298,7 +325,7 @@ async function finishConfirmedMeeting(c: ConfirmContext): Promise<void> {
       );
     }
   }
-  if (!meeting.location && meeting.meetingLink) meeting.location = "Online";
+  if (!meeting.location && meeting.meetingLink) meeting.location = onlineLocation(c.callType);
   await meeting.save();
 
   // Full details onto the owner's Zoho Calendar (updates the event made
@@ -328,7 +355,7 @@ async function finishConfirmedMeeting(c: ConfirmContext): Promise<void> {
     const missingLink = !meeting.meetingLink && c.autoZohoMeeting;
     await createNotification(
       ownerId,
-      `${c.clientName} booked "${c.linkTitle}" for ${formatEatDateTime(start)}${
+      `${c.clientName} booked "${c.linkTitle}"${c.callType === "voice" ? " (voice call)" : ""} for ${formatEatDateTime(start)}${
         missingLink ? ". No meeting link could be generated — add one before the call." : ""
       }${passwordNote ? `. ${passwordNote}` : ""}`,
       "meeting_booked",
@@ -362,6 +389,7 @@ async function finishConfirmedMeeting(c: ConfirmContext): Promise<void> {
       location: meeting.location,
       meetingLink: meeting.meetingLink,
       meetingPassword: meeting.meetingPassword,
+      callType: c.callType,
       isRecurring: false,
       isExternal: true,
       rsvpToken,
@@ -384,6 +412,7 @@ const toResult = (
   status: BookingResult["status"],
   hostName: string,
   r: {
+    callType: CallType;
     title: string;
     startTime: Date;
     endTime: Date;
@@ -425,6 +454,11 @@ export async function createBookingForLink(
   const email = input.email.toLowerCase();
   const now = new Date();
 
+  // Which kind of call. When the host allows only one, that's it; when both,
+  // the client's pick (the first allowed if they somehow sent none).
+  const allowed: CallType[] = link.callTypes?.length ? link.callTypes : ["video"];
+  const callType: CallType = input.callType ?? allowed[0];
+
   // A time the host offered after declining: confirm it straight away, even
   // on an approval link. Anything that doesn't check out is just ignored and
   // the booking proceeds as an ordinary one.
@@ -437,6 +471,14 @@ export async function createBookingForLink(
     ) {
       return bookViaOffer(link, input, offer, hostName);
     }
+  }
+
+  if (!allowed.includes(callType)) {
+    throw new BookingError(
+      400,
+      "INVALID",
+      `${callType === "voice" ? "Voice" : "Video"} calls aren't available for this booking page.`,
+    );
   }
 
   // Stops one person hoarding the calendar — counts confirmed bookings AND
@@ -476,7 +518,7 @@ export async function createBookingForLink(
     }
   }
 
-  const title = `${link.title} – ${input.name}`;
+  const title = `${link.title} – ${input.name}${callTypeSuffix(callType)}`;
   // Tie a confirmed meeting to a CRM client when this email is already one.
   const knownClient = link.requireApproval
     ? null
@@ -514,6 +556,7 @@ export async function createBookingForLink(
           name: input.name,
           email,
           topic: input.topic || undefined,
+          callType,
           expiresAt,
           // Nudge the host halfway to the deadline.
           reminderAt: new Date(now.getTime() + (expiresAt.getTime() - now.getTime()) / 2),
@@ -530,8 +573,9 @@ export async function createBookingForLink(
         startTime: start,
         endTime: end,
         location: link.location || undefined,
-        meetingLink: link.meetingLink || undefined,
-        conferenceProvider: link.meetingLink ? "custom" : undefined,
+        meetingLink: fixedLinkFor(link, callType),
+        conferenceProvider: fixedLinkFor(link, callType) ? "custom" : undefined,
+        callType,
         status: "scheduled",
         reminderMinutesBefore: 15,
         clientId: knownClient?._id,
@@ -550,7 +594,7 @@ export async function createBookingForLink(
     const req = created.request;
     await createNotification(
       ownerId,
-      `${input.name} requested "${link.title}" for ${formatEatDateTime(start)}. Approve or decline it in Meetings → Booking links.`,
+      `${input.name} requested "${link.title}"${callType === "voice" ? " (voice call)" : ""} for ${formatEatDateTime(start)}. Approve or decline it in Meetings → Booking links.`,
       "meeting_booking_request",
       { title, startTime: start, endTime: end, clientName: input.name, clientEmail: email },
     ).catch((err) => console.error("Booking request notification failed:", err));
@@ -565,6 +609,7 @@ export async function createBookingForLink(
         startTime: start,
         endTime: end,
         topic: input.topic,
+        callType,
       }).catch((err) => console.error("Booking request owner email failed:", err));
     }
     await sendBookingRequestReceivedEmail({
@@ -574,9 +619,11 @@ export async function createBookingForLink(
       title: link.title,
       startTime: start,
       endTime: end,
+      callType,
     }).catch((err) => console.error("Booking request received email failed:", err));
 
     return toResult("pending", hostName, {
+      callType,
       title: link.title,
       startTime: start,
       endTime: end,
@@ -593,15 +640,17 @@ export async function createBookingForLink(
     ownerName: hostName,
     linkTitle: link.title,
     autoZohoMeeting: link.autoZohoMeeting,
+    callType,
     clientName: input.name,
     clientEmail: email,
     clientId: knownClient?._id,
     notifyOwner: true,
-    activityMessage: `${input.name} booked "${link.title}" through the booking link for ${formatEatDateTime(start)}`,
+    activityMessage: `${input.name} booked "${link.title}"${callType === "voice" ? " (voice call)" : ""} through the booking link for ${formatEatDateTime(start)}`,
     linkId: String(link._id),
   });
 
   return toResult("confirmed", hostName, {
+    callType,
     title,
     startTime: start,
     endTime: end,
@@ -632,6 +681,7 @@ export interface PendingRequestView {
   name: string;
   email: string;
   topic: string;
+  callType: CallType;
   startTime: Date;
   endTime: Date;
   createdAt: Date;
@@ -657,6 +707,7 @@ export async function listPendingRequests(ownerId: string): Promise<PendingReque
     name: r.name,
     email: r.email,
     topic: r.topic ?? "",
+    callType: r.callType ?? "video",
     startTime: r.startTime,
     endTime: r.endTime,
     createdAt: r.createdAt,
@@ -689,7 +740,8 @@ export async function approveBookingRequest(
   // The link may have been edited or deleted since the request was made.
   const link = await BookingLinkModel.findById(req.linkId);
   const knownClient = await ClientModel.findOne({ email: req.email }).select("_id").lean();
-  const title = `${req.linkTitle} – ${req.name}`;
+  const callType: CallType = req.callType ?? "video";
+  const title = `${req.linkTitle} – ${req.name}${callTypeSuffix(callType)}`;
 
   let meeting: IMeeting;
   try {
@@ -730,8 +782,9 @@ export async function approveBookingRequest(
           startTime: req.startTime,
           endTime: req.endTime,
           location: link?.location || undefined,
-          meetingLink: link?.meetingLink || undefined,
-          conferenceProvider: link?.meetingLink ? "custom" : undefined,
+          meetingLink: fixedLinkFor(link, callType),
+          conferenceProvider: fixedLinkFor(link, callType) ? "custom" : undefined,
+          callType,
           status: "scheduled",
           reminderMinutesBefore: 15,
           clientId: knownClient?._id,
@@ -756,6 +809,7 @@ export async function approveBookingRequest(
     linkTitle: req.linkTitle,
     // A deleted link has no settings left: default to making a video link.
     autoZohoMeeting: link ? link.autoZohoMeeting : true,
+    callType,
     clientName: req.name,
     clientEmail: req.email,
     clientId: knownClient?._id,
@@ -765,6 +819,7 @@ export async function approveBookingRequest(
   });
 
   return toResult("confirmed", hostName, {
+    callType,
     title,
     startTime: req.startTime,
     endTime: req.endTime,
@@ -927,6 +982,8 @@ async function findUsableOffer(
 
 export interface OfferInfo {
   valid: boolean;
+  /** The kind of call the original request was for; an accepted offer keeps it. */
+  callType?: CallType;
   name?: string;
   email?: string;
   topic?: string;
@@ -944,6 +1001,7 @@ export async function getOfferInfo(link: IBookingLink, token: unknown): Promise<
     name: req.name,
     email: req.email,
     topic: req.topic ?? "",
+    callType: req.callType ?? "video",
     times: times.map((t) => t.toISOString()),
   };
 }
@@ -966,7 +1024,9 @@ async function bookViaOffer(
   const start = input.start;
   const end = new Date(start.getTime() + link.durationMinutes * 60_000);
   const email = input.email.toLowerCase();
-  const title = `${offer.linkTitle} – ${input.name}`;
+  // An accepted offer keeps the kind of call the client originally asked for.
+  const callType: CallType = offer.callType ?? "video";
+  const title = `${offer.linkTitle} – ${input.name}${callTypeSuffix(callType)}`;
   const knownClient = await ClientModel.findOne({ email }).select("_id").lean();
 
   let meeting: IMeeting;
@@ -998,8 +1058,9 @@ async function bookViaOffer(
           startTime: start,
           endTime: end,
           location: link.location || undefined,
-          meetingLink: link.meetingLink || undefined,
-          conferenceProvider: link.meetingLink ? "custom" : undefined,
+          meetingLink: fixedLinkFor(link, callType),
+          conferenceProvider: fixedLinkFor(link, callType) ? "custom" : undefined,
+          callType,
           status: "scheduled",
           reminderMinutesBefore: 15,
           clientId: knownClient?._id,
@@ -1028,6 +1089,7 @@ async function bookViaOffer(
     ownerName: hostName,
     linkTitle: offer.linkTitle,
     autoZohoMeeting: link.autoZohoMeeting,
+    callType,
     clientName: input.name,
     clientEmail: email,
     clientId: knownClient?._id,
@@ -1037,6 +1099,7 @@ async function bookViaOffer(
   });
 
   return toResult("confirmed", hostName, {
+    callType,
     title,
     startTime: start,
     endTime: end,

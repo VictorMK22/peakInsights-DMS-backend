@@ -1,4 +1,5 @@
 import mongoose, { Document, Schema } from "mongoose";
+import { CALL_TYPES, CallType } from "./BookingLink";
 
 /**
  * A client's booking that is waiting for the link owner's decision (only
@@ -35,6 +36,8 @@ export interface IBookingRequest extends Document {
   name: string;
   email: string;
   topic?: string;
+  /** What the client asked for; carried onto the meeting when it is approved. */
+  callType: CallType;
   status: BookingRequestStatus;
   /** When this stops holding the slot. Absent on old records: treat as endTime. */
   expiresAt?: Date;
@@ -64,6 +67,7 @@ const BookingRequestSchema = new Schema<IBookingRequest>(
     name: { type: String, required: true, trim: true, maxlength: 100 },
     email: { type: String, required: true, trim: true, lowercase: true, maxlength: 254 },
     topic: { type: String, trim: true, maxlength: 1000 },
+    callType: { type: String, enum: CALL_TYPES, default: "video" },
     status: {
       type: String,
       enum: ["pending", "approved", "declined", "expired"],

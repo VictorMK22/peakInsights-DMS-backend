@@ -4,6 +4,8 @@ import {
   BookingLinkModel,
   IBookingLink,
   BOOKING_LIMITS,
+  CALL_TYPES,
+  CallType,
 } from "../models/BookingLink";
 import { MeetingModel } from "../models/Meeting";
 import { User } from "../models/User";
@@ -48,6 +50,8 @@ type LinkFields = Partial<
     | "slotStepMinutes"
     | "location"
     | "meetingLink"
+    | "voiceMeetingLink"
+    | "callTypes"
     | "autoZohoMeeting"
     | "requireApproval"
     | "approvalWindowHours"
@@ -132,6 +136,31 @@ const parseLinkFields = (
     }
     out.meetingLink = m;
   }
+  if (body.voiceMeetingLink !== undefined) {
+    const v = typeof body.voiceMeetingLink === "string" ? body.voiceMeetingLink.trim() : "";
+    if (v) {
+      let ok = false;
+      try {
+        ok = /^https?:$/.test(new URL(v).protocol);
+      } catch {
+        ok = false;
+      }
+      if (!ok || v.length > 500) return { error: "Voice call link must be a valid http(s) URL." };
+    }
+    out.voiceMeetingLink = v;
+  }
+  if (body.callTypes !== undefined) {
+    const raw = body.callTypes;
+    if (
+      !Array.isArray(raw) ||
+      raw.length === 0 ||
+      !raw.every((t) => (CALL_TYPES as readonly unknown[]).includes(t))
+    ) {
+      return { error: "Choose at least one call type: video, voice, or both." };
+    }
+    // De-duplicate, keeping video first so it is the default when none is chosen.
+    out.callTypes = CALL_TYPES.filter((t) => (raw as unknown[]).includes(t));
+  }
   if (body.autoZohoMeeting !== undefined) {
     if (typeof body.autoZohoMeeting !== "boolean") return { error: "autoZohoMeeting must be true or false." };
     out.autoZohoMeeting = body.autoZohoMeeting;
@@ -185,6 +214,8 @@ const present = (l: IBookingLink) => ({
   slotStepMinutes: l.slotStepMinutes,
   location: l.location ?? "",
   meetingLink: l.meetingLink ?? "",
+  voiceMeetingLink: l.voiceMeetingLink ?? "",
+  callTypes: l.callTypes?.length ? l.callTypes : ["video"],
   autoZohoMeeting: l.autoZohoMeeting,
   requireApproval: l.requireApproval,
   approvalWindowHours: l.approvalWindowHours,
@@ -457,7 +488,8 @@ export const getPublicBookingLink = async (
         durationMinutes: link.durationMinutes,
         hostName: owner.name,
         location: link.location ?? "",
-        isOnline: !!link.meetingLink || link.autoZohoMeeting,
+        isOnline: !!link.meetingLink || !!link.voiceMeetingLink || link.autoZohoMeeting,
+        callTypes: link.callTypes?.length ? link.callTypes : ["video"],
         requiresApproval: link.requireApproval,
         timezone: EAT_TIMEZONE,
         maxDaysAhead: link.maxDaysAhead,
@@ -558,7 +590,17 @@ export const submitBooking = async (
 
     const link = await loadActiveLink(req.params.slug);
     const offer = typeof body.offer === "string" ? body.offer : undefined;
-    const result = await createBookingForLink(link, { start, name, email, topic }, offer);
+
+    // The kind of call the client picked. Absent → the service uses the
+    // link's default; present but not one of the known values is an error.
+    let callType: CallType | undefined;
+    if (body.callType !== undefined && body.callType !== null && body.callType !== "") {
+      if (!(CALL_TYPES as readonly unknown[]).includes(body.callType)) {
+        throw new BookingError(400, "INVALID", "Please choose video or voice.");
+      }
+      callType = body.callType as CallType;
+    }
+    const result = await createBookingForLink(link, { start, name, email, topic, callType }, offer);
     res.status(201).json({ success: true, data: result });
   } catch (err) {
     sendError(err, res, next);

@@ -38,6 +38,19 @@ export const BOOKING_LIMITS = {
   offerValidDays: 7,
 } as const;
 
+/**
+ * How a meeting is held. "voice" is an audio-only ONLINE meeting: the same
+ * kind of meeting link as video, but the client is told it's a voice call
+ * and doesn't need a camera. (Zoho can't be asked to enforce audio-only, so
+ * this is a label everyone sees, not a technical restriction.)
+ */
+export const CALL_TYPES = ["video", "voice"] as const;
+export type CallType = (typeof CALL_TYPES)[number];
+
+/** Added to a meeting's title so a voice call stands out on every calendar. */
+export const callTypeTitleSuffix = (t: CallType | undefined): string =>
+  t === "voice" ? " (voice call)" : "";
+
 export interface IBookingLink extends Document {
   _id: mongoose.Types.ObjectId;
   ownerId: mongoose.Types.ObjectId;
@@ -61,6 +74,10 @@ export interface IBookingLink extends Document {
   location?: string;
   /** A fixed join link used for every booking. Wins over autoZohoMeeting. */
   meetingLink?: string;
+  /** Which kinds of call clients may choose. One → no choice shown; both → the client picks. */
+  callTypes: CallType[];
+  /** Optional separate fixed link for voice calls (e.g. an audio-only room). Falls back to meetingLink. */
+  voiceMeetingLink?: string;
   /** Create a fresh Zoho Meeting for each booking (needs Zoho Calendar). */
   autoZohoMeeting: boolean;
   /**
@@ -101,6 +118,12 @@ const BookingLinkSchema = new Schema<IBookingLink>(
     slotStepMinutes: { type: Number, default: 30 },
     location: { type: String, trim: true, maxlength: 255 },
     meetingLink: { type: String, trim: true, maxlength: 500 },
+    callTypes: {
+      type: [String],
+      enum: CALL_TYPES,
+      default: ["video"],
+    },
+    voiceMeetingLink: { type: String, trim: true, maxlength: 500 },
     autoZohoMeeting: { type: Boolean, default: true },
     requireApproval: { type: Boolean, default: false },
     approvalWindowHours: {
