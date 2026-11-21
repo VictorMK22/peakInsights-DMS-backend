@@ -54,6 +54,14 @@ const canServeClient = (
 ) => role === "accountant" || accountantSupervisorIds.has(id);
 
 /**
+ * How a client is named in notifications and emails to staff: the company
+ * (that is who the firm works for), falling back to the contact person's name
+ * for clients that have no company recorded.
+ */
+const clientLabel = (c: { name: string; company?: string | null }): string =>
+  c.company?.trim() || c.name;
+
+/**
  * Emails a newly assigned accountant / supervisor. Best-effort: a mail
  * problem must never fail (or roll back) the assignment itself.
  */
@@ -974,7 +982,7 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
         try {
           await createNotification(
             id,
-            `You have been allocated a new client: ${client.name}`,
+            `You have been allocated a new client: ${clientLabel(client)}`,
             "client_allocated",
             { clientId: String(client._id) },
           );
@@ -984,7 +992,7 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
         const person = found.find((f) => String(f._id) === id);
         if (person)
           await emailAssignee(person, req.user!.userId, [
-            { id: String(client._id), name: client.name },
+            { id: String(client._id), name: clientLabel(client) },
           ]);
       }
     }
@@ -1049,7 +1057,7 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
 
     const [clients, people, supervisorIds] = await Promise.all([
       ClientModel.find({ _id: { $in: uniqueClientIds } }).select(
-        "name assignedTo isSalesLead salesStage allocatedAccountant needsReallocation",
+        "name company assignedTo isSalesLead salesStage allocatedAccountant needsReallocation",
       ),
       User.find({ _id: { $in: uniqueUserIds } })
         .select("name email role isActive")
@@ -1121,7 +1129,7 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
       for (const id of added) {
         newlyAssigned.set(id, [
           ...(newlyAssigned.get(id) ?? []),
-          { id: String(c._id), name: c.name },
+          { id: String(c._id), name: clientLabel(c) },
         ]);
       }
     }
@@ -1301,19 +1309,19 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
         if (next !== req.user!.userId) {
           await createNotification(
             next,
-            `You have been allocated a new client: ${client.name}`,
+            `You have been allocated a new client: ${clientLabel(client)}`,
             "client_allocated",
             { clientId: String(client._id) },
           );
           await emailAssignee(accountant, req.user!.userId, [
-            { id: String(client._id), name: client.name },
+            { id: String(client._id), name: clientLabel(client) },
           ]);
         }
         const salesId = client.createdBy?.toString();
         if (salesId && salesId !== req.user!.userId && salesId !== next) {
           await createNotification(
             salesId,
-            `${client.name} has been allocated to ${accountant.name}`,
+            `${clientLabel(client)} has been allocated to ${accountant.name}`,
             "client_allocated",
             { clientId: String(client._id) },
           );

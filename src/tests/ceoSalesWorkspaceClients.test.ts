@@ -428,6 +428,37 @@ describe("accountant supervisors and bulk assignment", () => {
     }
   });
 
+  it("names the client by its company (falling back to the contact name) in the email and notification", async () => {
+    const sent = jest
+      .spyOn(emailService, "sendClientAssignedEmail")
+      .mockResolvedValue(undefined);
+    try {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { user: acct } = await createUserWithToken("accountant");
+      const withCompany = (
+        await post(ceo, { name: "Asha Kamenge", company: "Kamenge Traders Ltd" })
+      ).body.data.client._id as string;
+      const noCompany = await existing(ceo, "Solo Person");
+
+      // single assign
+      await assign(ceo, withCompany, [String(acct._id)]);
+      expect(sent.mock.calls[0][0].clients).toEqual([
+        { id: withCompany, name: "Kamenge Traders Ltd" },
+      ]);
+
+      // bulk assign: the company is used where there is one, the name where not
+      sent.mockClear();
+      const { user: acct2 } = await createUserWithToken("accountant");
+      await bulk(ceo, [withCompany, noCompany], [String(acct2._id)]);
+      expect(sent.mock.calls[0][0].clients.map((c) => c.name).sort()).toEqual([
+        "Kamenge Traders Ltd",
+        "Solo Person",
+      ]);
+    } finally {
+      sent.mockRestore();
+    }
+  });
+
   it("a failing email never fails the assignment", async () => {
     const sent = jest
       .spyOn(emailService, "sendClientAssignedEmail")
