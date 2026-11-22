@@ -61,6 +61,7 @@ import {
   downloadFromS3,
   getSignedFileUrl,
 } from "../services/s3Storage";
+import { ensureStoredFile } from "../utils/missingFile";
 import path from "path";
 import {
   resolveFolderType,
@@ -2322,6 +2323,9 @@ export const downloadDocument = async (
       res.status(404).json({ success: false, message: "File not found" });
       return;
     }
+
+    // Nothing was downloaded if the file isn't in storage — so don't log it.
+    if (!(await ensureStoredFile(req, res, doc.fileKey))) return;
 
     await createAuditLog({
       documentId: req.params.id,

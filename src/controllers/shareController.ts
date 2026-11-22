@@ -4,6 +4,7 @@ import { ShareLink } from "../models/ShareLink";
 import { DocumentModel } from "../models/Document";
 import { AuthRequest } from "../types/auth";
 import { getSignedFileUrl } from "../services/s3Storage";
+import { ensureStoredFile } from "../utils/missingFile";
 
 const DEFAULT_EXPIRY_DAYS = 7;
 const MAX_EXPIRY_DAYS = 30;
@@ -236,6 +237,9 @@ export const accessSharedDocument = async (
       res.status(404).json({ success: false, message: "No file found" });
       return;
     }
+
+    // Don't count a visit (or hand out a link) for a file that isn't in storage.
+    if (!(await ensureStoredFile(req, res, doc.fileKey))) return;
 
     link.accessCount = (link.accessCount ?? 0) + 1;
     link.lastAccessedAt = new Date();
