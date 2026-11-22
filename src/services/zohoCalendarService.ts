@@ -410,7 +410,12 @@ export function parseEventResult(ev: any): ZohoEventResult {
  *  unavailable: couldn't be fetched; the reason says what to do about it.
  */
 export type ZohoMeetingPasswordResult =
-  | { status: "ok"; password?: string }
+  | {
+      status: "ok";
+      password?: string;
+      /** Zoho's join link, when it already carries the password (one-click join). */
+      joinLink?: string;
+    }
   | {
       status: "unavailable";
       /** needs_reconnect: connected before the extra permission existed. masked: Zoho only returns it partly hidden. error: anything else (network, Zoho down). */
@@ -448,37 +453,168 @@ async function getMeetingOrgId(session: ZohoCalendarSession): Promise<string> {
   return String(zsoid);
 }
 
-/** Never throws, and gives up after a few seconds: it runs while a client waits for their booking to confirm. */
+/** What a password-like field holds, without ever exposing the value itself. */
+const classifyField = (raw: unknown): "full" | "hidden" | "none" => {
+  const p = interpretMeetingPassword(raw);
+  return p.kind === "ok" ? "full" : p.kind === "masked" ? "hidden" : "none";
+};
+
+/**
+ * Zoho's own join link, when it already carries the (complete) password as a
+ * `pwd` parameter — guests then join with one click and type nothing. Only a
+ * genuine https link on Zoho's meeting host is ever accepted.
+ */
+const joinLinkWithPassword = (raw: unknown): string | undefined => {
+  if (typeof raw !== "string") return undefined;
+  try {
+    const u = new URL(raw);
+    const pwd = u.searchParams.get("pwd");
+    if (u.protocol !== "https:" || u.hostname !== MEETING_DOMAIN || !pwd || pwd.includes("*")) {
+      return undefined;
+    }
+    return u.toString();
+  } catch {
+    return undefined;
+  }
+};
+
+type MeetingLookup =
+  | { ok: true; session: any }
+  | { ok: false; stage: "organization" | "meeting"; reason: "needs_reconnect" | "error" };
+
+/** Asks Zoho Meeting about one meeting. Never throws. */
+async function lookupZohoMeeting(
+  session: ZohoCalendarSession,
+  meetingKey: string,
+): Promise<MeetingLookup> {
+  let stage: "organization" | "meeting" = "organization";
+  try {
+    const zsoid = await getMeetingOrgId(session);
+    stage = "meeting";
+    const res = await axios.get(
+      meetingApi(`${encodeURIComponent(zsoid)}/sessions/${encodeURIComponent(meetingKey)}.json`),
+      { headers: meetingHeaders(session.accessToken), timeout: READ_TIMEOUT_MS },
+    );
+    return { ok: true, session: res.data?.session ?? res.data };
+  } catch (err: any) {
+    console.error(
+      `Zoho Meeting lookup failed (${stage}):`,
+      err?.response?.status,
+      err?.response?.data || err?.message || err,
+    );
+    return { ok: false, stage, reason: isScopeProblem(err) ? "needs_reconnect" : "error" };
+  }
+}
+
+/** Runs `work` but gives up after a few seconds: this runs while a client waits for their booking to confirm. */
+const withDeadline = <T>(work: Promise<T>, fallback: T, ms = 6000): Promise<T> => {
+  const giveUp = new Promise<T>((resolve) => {
+    const t = setTimeout(() => resolve(fallback), ms);
+    t.unref?.();
+  });
+  return Promise.race([work, giveUp]);
+};
+
+/** Never throws, and gives up after a few seconds instead of keeping a client waiting. */
 export async function fetchZohoMeetingPassword(
   session: ZohoCalendarSession,
   meetingKey: string,
 ): Promise<ZohoMeetingPasswordResult> {
   const work = async (): Promise<ZohoMeetingPasswordResult> => {
-    try {
-      const zsoid = await getMeetingOrgId(session);
-      const res = await axios.get(
-        meetingApi(`${encodeURIComponent(zsoid)}/sessions/${encodeURIComponent(meetingKey)}.json`),
-        { headers: meetingHeaders(session.accessToken), timeout: READ_TIMEOUT_MS },
-      );
-      const s = res.data?.session ?? res.data;
-      const parsed = interpretMeetingPassword(s?.pwd ?? s?.password);
-      if (parsed.kind === "masked") return { status: "unavailable", reason: "masked" };
-      return parsed.kind === "ok"
-        ? { status: "ok", password: parsed.password }
-        : { status: "ok" };
-    } catch (err: any) {
-      console.error(
-        "Zoho Meeting password lookup failed:",
-        err?.response?.status,
-        err?.response?.data || err?.message || err,
-      );
-      return { status: "unavailable", reason: isScopeProblem(err) ? "needs_reconnect" : "error" };
+    const look = await lookupZohoMeeting(session, meetingKey);
+    if (!look.ok) return { status: "unavailable", reason: look.reason };
+
+    const s = look.session;
+    const oneClick = joinLinkWithPassword(s?.joinLink);
+    const parsed = interpretMeetingPassword(s?.pwd ?? s?.password);
+    if (parsed.kind === "ok") {
+      return { status: "ok", password: parsed.password, ...(oneClick ? { joinLink: oneClick } : {}) };
     }
+    // Zoho hid the password, but its own join link carries it: that's enough.
+    if (oneClick) return { status: "ok", joinLink: oneClick };
+    if (parsed.kind === "masked") return { status: "unavailable", reason: "masked" };
+    return { status: "ok" };
   };
-  const giveUp = new Promise<ZohoMeetingPasswordResult>((resolve) =>
-    setTimeout(() => resolve({ status: "unavailable", reason: "error" }), 6000).unref?.(),
+  return withDeadline<ZohoMeetingPasswordResult>(work(), { status: "unavailable", reason: "error" });
+}
+
+// ── "Is the password coming through?" — a check the host can run ──
+
+export interface ZohoPasswordDiagnosis {
+  verdict: "works" | "one_click" | "no_password" | "hidden_by_zoho" | "reconnect" | "error";
+  /** Plain English, safe to show the host. Never contains the password. */
+  message: string;
+  /** What Zoho returned, as labels only — for support. */
+  details: {
+    organizationLookup: "ok" | "needs_reconnect" | "error";
+    meetingLookup: "ok" | "needs_reconnect" | "error" | "not_reached";
+    password: "full" | "hidden" | "none" | "unknown";
+    encryptedPassword: "full" | "hidden" | "none" | "unknown";
+    joinLinkHasPassword: boolean | null;
+  };
+}
+
+const DIAGNOSIS_MESSAGES: Record<ZohoPasswordDiagnosis["verdict"], string> = {
+  works:
+    "Working. The Hub can read the meeting's password and includes it in invitations, on the booking confirmation page and in the meeting details.",
+  one_click:
+    "Working. Zoho's join link already contains the password, so clients join with one click and type nothing.",
+  no_password:
+    "This Zoho meeting has no password, so clients can join with just the link. Nothing more to do.",
+  hidden_by_zoho:
+    "Zoho returned the password partly hidden (like \"a***z\"), so the Hub can't give it to clients. Zoho doesn't reveal it to apps. You can see it in Zoho Meeting and send it to the client yourself, or use a fixed meeting link from a service without a password (for example Google Meet or Teams) in the booking link's settings.",
+  reconnect:
+    "Zoho is connected, but without the permission to read meeting passwords. Disconnect and reconnect Zoho Calendar in Meetings, then run this check again.",
+  error:
+    "Couldn't get an answer from Zoho Meeting. It may be temporary: try again in a minute.",
+};
+
+export async function diagnoseZohoMeetingPassword(
+  session: ZohoCalendarSession,
+  meetingKey: string,
+): Promise<ZohoPasswordDiagnosis> {
+  const done = (
+    verdict: ZohoPasswordDiagnosis["verdict"],
+    details: ZohoPasswordDiagnosis["details"],
+  ): ZohoPasswordDiagnosis => ({ verdict, message: DIAGNOSIS_MESSAGES[verdict], details });
+
+  const failed: ZohoPasswordDiagnosis = done("error", {
+    organizationLookup: "error",
+    meetingLookup: "not_reached",
+    password: "unknown",
+    encryptedPassword: "unknown",
+    joinLinkHasPassword: null,
+  });
+
+  return withDeadline(
+    (async (): Promise<ZohoPasswordDiagnosis> => {
+      const look = await lookupZohoMeeting(session, meetingKey);
+      if (!look.ok) {
+        return done(look.reason === "needs_reconnect" ? "reconnect" : "error", {
+          organizationLookup: look.stage === "organization" ? look.reason : "ok",
+          meetingLookup: look.stage === "meeting" ? look.reason : "not_reached",
+          password: "unknown",
+          encryptedPassword: "unknown",
+          joinLinkHasPassword: null,
+        });
+      }
+      const s = look.session;
+      const password = classifyField(s?.pwd ?? s?.password);
+      const encryptedPassword = classifyField(s?.encryptPwd);
+      const oneClick = !!joinLinkWithPassword(s?.joinLink);
+      const details = {
+        organizationLookup: "ok" as const,
+        meetingLookup: "ok" as const,
+        password,
+        encryptedPassword,
+        joinLinkHasPassword: oneClick,
+      };
+      if (password === "full") return done("works", details);
+      if (oneClick) return done("one_click", details);
+      return done(password === "hidden" ? "hidden_by_zoho" : "no_password", details);
+    })(),
+    failed,
   );
-  return Promise.race([work(), giveUp]);
 }
 
 const eventsUrl = (calendarUid: string, eventUid?: string) =>

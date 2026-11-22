@@ -22,11 +22,13 @@ const mockZoho: {
   createZohoEvent: jest.Mock;
   updateZohoEvent: jest.Mock;
   fetchPassword: jest.Mock;
+  diagnose: jest.Mock;
 } = {
   session: null,
   createZohoEvent: jest.fn(),
   updateZohoEvent: jest.fn(),
   fetchPassword: jest.fn(),
+  diagnose: jest.fn(),
 };
 jest.mock("../services/zohoCalendarService", () => {
   const actual = jest.requireActual("../services/zohoCalendarService");
@@ -38,6 +40,7 @@ jest.mock("../services/zohoCalendarService", () => {
     createZohoEvent: (...a: any[]) => mockZoho.createZohoEvent(...a),
     updateZohoEvent: (...a: any[]) => mockZoho.updateZohoEvent(...a),
     fetchZohoMeetingPassword: (...a: any[]) => mockZoho.fetchPassword(...a),
+    diagnoseZohoMeetingPassword: (...a: any[]) => mockZoho.diagnose(...a),
   };
 });
 
@@ -70,6 +73,7 @@ beforeEach(() => {
   mockZoho.updateZohoEvent.mockImplementation(async (i: any) => ({ status: "updated", uid: i.uid, etag: "e2" }));
   mockZoho.fetchPassword.mockReset();
   mockZoho.fetchPassword.mockResolvedValue({ status: "ok", password: "Abc123" });
+  mockZoho.diagnose.mockReset();
 });
 
 afterEach(async () => {
@@ -176,6 +180,21 @@ describe("a Zoho Meeting password reaches the client", () => {
     expect(inviteTo("jane@client.com")!.html).toMatch(/Inline9/);
   });
 
+  it("uses Zoho's own join link when it already carries the password — one click, nothing to type", async () => {
+    const { ceo, link } = await setup();
+    const oneClick = "https://meeting.zoho.com/join?key=1049772213&pwd=abcDEF123";
+    mockZoho.fetchPassword.mockResolvedValue({ status: "ok", joinLink: oneClick });
+    const r = await book(link.slug, { ...jane(), startTime: slotAt().toISOString() });
+    expect(r.status).toBe(201);
+    expect(r.body.data.meetingLink).toBe(oneClick);
+    expect(r.body.data.meetingPassword).toBeUndefined();
+    expect((await MeetingModel.find({}))[0].meetingLink).toBe(oneClick);
+    expect(inviteTo("jane@client.com")!.html).toMatch(/pwd=abcDEF123/);
+    // Nothing for the host to worry about.
+    const note = await Notification.findOne({ userId: ceo._id, type: "meeting_booked" });
+    expect(note!.message).not.toMatch(/password/i);
+  });
+
   it("shows no password row when the meeting genuinely has none", async () => {
     const { ceo, link } = await setup();
     mockZoho.fetchPassword.mockResolvedValue({ status: "ok" }); // password turned off in Zoho
@@ -224,22 +243,29 @@ describe("when the password can't be fetched", () => {
     const note = await Notification.findOne({ userId: ceo._id, type: "meeting_booked" });
     expect(note!.message).toMatch(/password couldn't be retrieved/);
     expect(note!.message).toMatch(/Reconnect Zoho Calendar/);
-    expect(note!.message).toMatch(/turn off the meeting password/i);
   });
 
-  it.each(["masked", "error"] as const)(
-    "tells the host to turn the password off or send it themselves (%s)",
-    async (reason) => {
-      const { ceo, link } = await setup();
-      mockZoho.fetchPassword.mockResolvedValue({ status: "unavailable", reason });
-      const r = await book(link.slug, { ...jane(), startTime: slotAt().toISOString() });
-      expect(r.status).toBe(201);
-      const note = await Notification.findOne({ userId: ceo._id, type: "meeting_booked" });
-      expect(note!.message).toMatch(/password couldn't be retrieved/);
-      expect(note!.message).toMatch(/Turn off the meeting password in Zoho Meeting/);
-      expect(note!.message).not.toMatch(/Reconnect/);
-    },
-  );
+  it("when Zoho hides the password, says so — and offers things that actually work", async () => {
+    const { ceo, link } = await setup();
+    mockZoho.fetchPassword.mockResolvedValue({ status: "unavailable", reason: "masked" });
+    const r = await book(link.slug, { ...jane(), startTime: slotAt().toISOString() });
+    expect(r.status).toBe(201);
+    const note = await Notification.findOne({ userId: ceo._id, type: "meeting_booked" });
+    expect(note!.message).toMatch(/Zoho hides the meeting password from apps/);
+    expect(note!.message).toMatch(/Send it to them yourself/);
+    expect(note!.message).toMatch(/fixed meeting link/);
+    expect(note!.message).not.toMatch(/Reconnect/);
+    expect(note!.message).not.toMatch(/turn off/i); // we can't promise Zoho lets you
+  });
+
+  it("when the lookup fails for another reason, points to the check", async () => {
+    const { ceo, link } = await setup();
+    mockZoho.fetchPassword.mockResolvedValue({ status: "unavailable", reason: "error" });
+    await book(link.slug, { ...jane(), startTime: slotAt().toISOString() });
+    const note = await Notification.findOne({ userId: ceo._id, type: "meeting_booked" });
+    expect(note!.message).toMatch(/couldn't be retrieved just now/);
+    expect(note!.message).toMatch(/Check Zoho Meeting/);
+  });
 
   it("never fails the booking even if the lookup itself blows up", async () => {
     const { link } = await setup();
@@ -325,5 +351,65 @@ describe("later emails about the meeting keep the password", () => {
     expect(update!.html).toMatch(/join\?key=1049772213/);
     expect(update!.html).toMatch(/Meeting password/);
     expect(update!.html).toMatch(/Abc123/);
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════
+describe('the "Check Zoho Meeting" tool', () => {
+  const check = (token?: string) => {
+    const r = request(app).post("/api/booking-links/zoho-meeting-check");
+    return token ? r.set(auth(token)).send({}) : r.send({});
+  };
+
+  it("needs a login", async () => {
+    expect((await check()).status).toBe(401);
+  });
+
+  it("says so when Zoho Calendar isn't connected", async () => {
+    mockZoho.session = null;
+    const { token } = await setup();
+    const r = await check(token);
+    expect(r.status).toBe(200);
+    expect(r.body.data.verdict).toBe("not_connected");
+    expect(r.body.data.message).toMatch(/Connect it in Meetings/);
+    expect(mockZoho.diagnose).not.toHaveBeenCalled();
+  });
+
+  it("asks for a test booking first when there's no Zoho Meeting yet", async () => {
+    const { token } = await setup();
+    const r = await check(token);
+    expect(r.body.data.verdict).toBe("no_meeting");
+    expect(r.body.data.message).toMatch(/test booking/);
+    expect(mockZoho.diagnose).not.toHaveBeenCalled();
+  });
+
+  it("checks the host's most recent Zoho Meeting and relays the plain-English result", async () => {
+    const { token, link } = await setup();
+    await book(link.slug, { ...jane(), startTime: slotAt().toISOString() });
+    mockZoho.diagnose.mockResolvedValue({
+      verdict: "hidden_by_zoho",
+      message: "Zoho returned the password partly hidden…",
+      details: { organizationLookup: "ok", meetingLookup: "ok", password: "hidden", encryptedPassword: "hidden", joinLinkHasPassword: false },
+    });
+
+    const r = await check(token);
+    expect(r.status).toBe(200);
+    expect(r.body.data.verdict).toBe("hidden_by_zoho");
+    expect(r.body.data.message).toMatch(/partly hidden/);
+    expect(r.body.data.checkedMeeting).toBe("Intro call – Jane Client");
+    expect(r.body.data.details.password).toBe("hidden");
+    // It looked at the right meeting, as the host.
+    expect(mockZoho.diagnose).toHaveBeenCalledWith(SESSION, "1049772213");
+    // And never returned a password.
+    expect(JSON.stringify(r.body)).not.toMatch(/Abc123/);
+  });
+
+  it("only ever looks at the caller's own meetings", async () => {
+    const mine = await setup();
+    const theirs = await setup();
+    await book(theirs.link.slug, { ...jane(), startTime: slotAt().toISOString() });
+    const r = await check(mine.token); // I have no Zoho Meeting of my own
+    expect(r.body.data.verdict).toBe("no_meeting");
+    expect(mockZoho.diagnose).not.toHaveBeenCalled();
   });
 });

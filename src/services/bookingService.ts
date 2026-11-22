@@ -312,6 +312,9 @@ async function finishConfirmedMeeting(c: ConfirmContext): Promise<void> {
             const pw = await fetchZohoMeetingPassword(session, ev.meetingKey);
             if (pw.status === "ok") {
               if (pw.password) meeting.meetingPassword = pw.password;
+              // Zoho's own link already carries the password: use it, so the
+              // client joins with one click.
+              if (pw.joinLink) meeting.meetingLink = pw.joinLink;
             } else {
               passwordIssue = pw.reason;
             }
@@ -335,10 +338,12 @@ async function finishConfirmedMeeting(c: ConfirmContext): Promise<void> {
 
   const passwordNote =
     passwordIssue === "needs_reconnect"
-      ? "The Zoho Meeting password couldn't be retrieved, so the client may be asked for it. Reconnect Zoho Calendar (Meetings) so it can be, or turn off the meeting password in Zoho Meeting."
-      : passwordIssue
-        ? "The Zoho Meeting password couldn't be retrieved, so the client may be asked for it. Turn off the meeting password in Zoho Meeting, or send it to them yourself."
-        : "";
+      ? "The Zoho Meeting password couldn't be retrieved, so the client may be asked for it. Reconnect Zoho Calendar (Meetings) so it can be."
+      : passwordIssue === "masked"
+        ? "Zoho hides the meeting password from apps, so the client may be asked for it. Send it to them yourself (you can see it in Zoho Meeting) or use a fixed meeting link in this booking link's settings."
+        : passwordIssue
+          ? "The Zoho Meeting password couldn't be retrieved just now, so the client may be asked for it. Send it to them yourself, or run \"Check Zoho Meeting\" under Booking links to see why."
+          : "";
 
   if (!c.notifyOwner && passwordNote) {
     // An approved request doesn't ping the host about the booking itself,

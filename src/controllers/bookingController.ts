@@ -22,6 +22,7 @@ import {
   getOfferInfo,
 } from "../services/bookingService";
 import { EAT_TIMEZONE } from "../utils/eatTime";
+import { getZohoCalendarSession, diagnoseZohoMeetingPassword } from "../services/zohoCalendarService";
 
 // ─────────────────────────────────────────────────────────────────
 // Validation
@@ -374,6 +375,61 @@ export const deleteBookingLink = async (
       return;
     }
     res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+};
+
+/**
+ * "Is the Zoho Meeting password coming through?" — a one-click check for the
+ * host. It asks Zoho about the host's most recent Zoho Meeting and explains,
+ * in plain English, whether the Hub can pass the password on and what to do
+ * if not. It never returns the password itself.
+ */
+export const checkZohoMeeting = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const userId = req.user!.userId;
+    const session = await getZohoCalendarSession(userId);
+    if (!session) {
+      res.json({
+        success: true,
+        data: {
+          verdict: "not_connected",
+          message: "Zoho Calendar isn't connected for your account. Connect it in Meetings first.",
+        },
+      });
+      return;
+    }
+
+    const latest = await MeetingModel.findOne({
+      organizer: userId,
+      conferenceProvider: "zoho_meeting",
+      meetingLink: /[?&]key=/,
+    }).sort({ createdAt: -1 });
+    let key: string | null = null;
+    try {
+      key = latest?.meetingLink ? new URL(latest.meetingLink).searchParams.get("key") : null;
+    } catch {
+      key = null;
+    }
+    if (!latest || !key) {
+      res.json({
+        success: true,
+        data: {
+          verdict: "no_meeting",
+          message:
+            "There's no Zoho Meeting to check yet. Make one test booking (with \"Create a Zoho Meeting link\" on), then run this again. It examines your most recent Zoho Meeting.",
+        },
+      });
+      return;
+    }
+
+    const diagnosis = await diagnoseZohoMeetingPassword(session, key);
+    res.json({ success: true, data: { ...diagnosis, checkedMeeting: latest.title } });
   } catch (err) {
     next(err);
   }

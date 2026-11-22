@@ -1,11 +1,16 @@
 import "./testEnv";
 import axios from "axios";
 import {
+  diagnoseZohoMeetingPassword,
   fetchZohoMeetingPassword,
   interpretMeetingPassword,
   parseEventResult,
+  zohoMeetingJoinLink,
   ZohoCalendarSession,
 } from "../services/zohoCalendarService";
+
+// Zoho's meeting host in this environment (it depends on the configured region).
+const MEETING_ORIGIN = new URL(zohoMeetingJoinLink("1")).origin;
 
 // Each test uses its own calendar uid: the organization id is cached per
 // calendar for the life of the process, and tests mustn't leak into each other.
@@ -171,6 +176,123 @@ describe("fetchZohoMeetingPassword", () => {
       const pending = fetchZohoMeetingPassword(session(), "1");
       await jest.advanceTimersByTimeAsync(6100);
       expect(await pending).toEqual({ status: "unavailable", reason: "error" });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
+describe("when Zoho's own join link carries the password", () => {
+  const link = (qs: string) => `${MEETING_ORIGIN}/join?key=1049772213${qs}`;
+
+  it("uses that link when the password itself is hidden — clients join with one click", async () => {
+    zohoReturns({ pwd: "a***z", encryptPwd: "x***y", joinLink: link("&pwd=abcDEF123") });
+    const r = await fetchZohoMeetingPassword(session(), "1049772213");
+    expect(r).toEqual({ status: "ok", joinLink: link("&pwd=abcDEF123") });
+  });
+
+  it("returns both the password and the link when it has both", async () => {
+    zohoReturns({ pwd: "Abc123", joinLink: link("&pwd=abcDEF123") });
+    expect(await fetchZohoMeetingPassword(session(), "1")).toEqual({
+      status: "ok",
+      password: "Abc123",
+      joinLink: link("&pwd=abcDEF123"),
+    });
+  });
+
+  it("ignores a join link with no password in it", async () => {
+    zohoReturns({ pwd: "a***z", joinLink: link("") });
+    expect(await fetchZohoMeetingPassword(session(), "1")).toEqual({ status: "unavailable", reason: "masked" });
+  });
+
+  it("ignores a join link whose password is itself hidden", async () => {
+    zohoReturns({ pwd: "a***z", joinLink: link("&pwd=ab***yz") });
+    expect(await fetchZohoMeetingPassword(session(), "1")).toEqual({ status: "unavailable", reason: "masked" });
+  });
+
+  it("never accepts a link to some other site or over plain http", async () => {
+    zohoReturns({ pwd: "a***z", joinLink: "https://evil.example.com/join?key=1&pwd=abc123" });
+    expect((await fetchZohoMeetingPassword(session(), "1")).status).toBe("unavailable");
+    zohoReturns({ pwd: "a***z", joinLink: `${MEETING_ORIGIN.replace("https:", "http:")}/join?key=1&pwd=abc123` });
+    expect((await fetchZohoMeetingPassword(session(), "1")).status).toBe("unavailable");
+    zohoReturns({ pwd: "a***z", joinLink: "javascript:alert(1)" });
+    expect((await fetchZohoMeetingPassword(session(), "1")).status).toBe("unavailable");
+  });
+});
+
+describe("diagnoseZohoMeetingPassword (the host's one-click check)", () => {
+  const link = (qs: string) => `${MEETING_ORIGIN}/join?key=1${qs}`;
+
+  it("says it works when Zoho returns the full password", async () => {
+    zohoReturns({ pwd: "Abc123", encryptPwd: "XyZ789" });
+    const d = await diagnoseZohoMeetingPassword(session(), "1");
+    expect(d.verdict).toBe("works");
+    expect(d.details).toEqual({
+      organizationLookup: "ok", meetingLookup: "ok",
+      password: "full", encryptedPassword: "full", joinLinkHasPassword: false,
+    });
+  });
+
+  it("explains plainly when Zoho hides the password, and what to do instead", async () => {
+    zohoReturns({ pwd: "a***z", encryptPwd: "a***z" });
+    const d = await diagnoseZohoMeetingPassword(session(), "1");
+    expect(d.verdict).toBe("hidden_by_zoho");
+    expect(d.details.password).toBe("hidden");
+    expect(d.message).toMatch(/partly hidden/);
+    expect(d.message).toMatch(/send it to the client yourself/);
+    expect(d.message).toMatch(/fixed meeting link/);
+  });
+
+  it("recognises a one-click link", async () => {
+    zohoReturns({ pwd: "a***z", joinLink: link("&pwd=abcDEF123") });
+    const d = await diagnoseZohoMeetingPassword(session(), "1");
+    expect(d.verdict).toBe("one_click");
+    expect(d.details.joinLinkHasPassword).toBe(true);
+  });
+
+  it("says when the meeting simply has no password", async () => {
+    zohoReturns({ pwd: "" });
+    const d = await diagnoseZohoMeetingPassword(session(), "1");
+    expect(d.verdict).toBe("no_password");
+    expect(d.details.password).toBe("none");
+  });
+
+  it("says to reconnect when the permission is missing — and where it failed", async () => {
+    get.mockRejectedValue(httpError(401, { error: { message: "INVALID_OAUTHSCOPE" } }));
+    const d = await diagnoseZohoMeetingPassword(session(), "1");
+    expect(d.verdict).toBe("reconnect");
+    expect(d.details).toMatchObject({ organizationLookup: "needs_reconnect", meetingLookup: "not_reached" });
+    expect(d.message).toMatch(/reconnect Zoho Calendar/i);
+  });
+
+  it("separates 'organization lookup worked, meeting lookup failed'", async () => {
+    get.mockImplementation(async (url: string) => {
+      if (/user\.json$/.test(url)) return { data: { userDetails: { zsoid: 9001 } } };
+      throw httpError(500);
+    });
+    const d = await diagnoseZohoMeetingPassword(session(), "1");
+    expect(d.verdict).toBe("error");
+    expect(d.details).toMatchObject({ organizationLookup: "ok", meetingLookup: "error" });
+  });
+
+  it("never reveals a password, and never throws", async () => {
+    zohoReturns({ pwd: "SuperSecret99", encryptPwd: "AlsoSecret88", joinLink: link("&pwd=TokenSecret77") });
+    const d = await diagnoseZohoMeetingPassword(session(), "1");
+    const text = JSON.stringify(d);
+    for (const secret of ["SuperSecret99", "AlsoSecret88", "TokenSecret77"]) {
+      expect(text).not.toContain(secret);
+    }
+    get.mockRejectedValue(new Error("boom"));
+    await expect(diagnoseZohoMeetingPassword(session(), "1")).resolves.toMatchObject({ verdict: "error" });
+  });
+
+  it("gives up after a few seconds", async () => {
+    jest.useFakeTimers();
+    try {
+      get.mockImplementation(() => new Promise(() => undefined));
+      const pending = diagnoseZohoMeetingPassword(session(), "1");
+      await jest.advanceTimersByTimeAsync(6100);
+      expect((await pending).verdict).toBe("error");
     } finally {
       jest.useRealTimers();
     }

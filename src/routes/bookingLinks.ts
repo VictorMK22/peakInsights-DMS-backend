@@ -8,6 +8,7 @@ import {
   listBookingRequests,
   approveBookingRequestHandler,
   declineBookingRequestHandler,
+  checkZohoMeeting,
 } from "../controllers/bookingController";
 
 /**
@@ -24,6 +25,9 @@ router.use(authenticate);
 router.get("/requests", listBookingRequests);
 router.post("/requests/:id/approve", approveBookingRequestHandler);
 router.post("/requests/:id/decline", declineBookingRequestHandler);
+
+// "Is the Zoho Meeting password coming through?" — a check the host can run.
+router.post("/zoho-meeting-check", checkZohoMeeting);
 
 router.get("/", listMyBookingLinks);
 router.post("/", createBookingLink);
