@@ -2003,30 +2003,45 @@ export const replaceFile = async (
       return;
     }
 
-    // Delete the old file from S3 — same missing-fileKey guard as
-    // deleteDocument above, so replacing a file on a malformed record
-    // doesn't 500 either.
-    if (doc.fileKey) {
-      await deleteFromS3(doc.fileKey);
+    const oldKey = doc.fileKey;
+    const newKey = req.file.filename;
+
+    // Point the record at the new file FIRST. The upload middleware has already
+    // put the new object in S3, so if anything below fails the old file is
+    // still in place and the record still works. (Deleting the old object
+    // up-front used to leave a record pointing at a deleted file whenever the
+    // text extraction or the save threw.)
+    try {
+      const fileUrl = getLocalFileUrl(newKey);
+      const extracted = await extractTextContent(
+        req.file.buffer,
+        req.file.mimetype,
+        req.file.originalname,
+      );
+
+      doc.fileName = req.file.originalname;
+      doc.fileKey = newKey;
+      doc.fileUrl = fileUrl;
+      doc.fileSize = req.file.size;
+      doc.fileType = req.file.mimetype;
+      doc.modifiedBy = new mongoose.Types.ObjectId(req.user!.userId);
+      doc.modifiedAt = new Date();
+      if (extracted !== undefined) doc.contentText = extracted;
+
+      await doc.save();
+    } catch (err) {
+      // Nothing references the new upload now — don't leave it orphaned.
+      await deleteFromS3(newKey);
+      throw err;
     }
 
-    const fileUrl = getLocalFileUrl(req.file.filename);
-    const extracted = await extractTextContent(
-      req.file.buffer,
-      req.file.mimetype,
-      req.file.originalname,
-    );
+    // Only now is the old file unreferenced. deleteFromS3 logs rather than
+    // throws, so a failed cleanup never fails an otherwise successful replace.
+    // Same missing-fileKey guard as deleteDocument above.
+    if (oldKey && oldKey !== newKey) {
+      await deleteFromS3(oldKey);
+    }
 
-    doc.fileName = req.file.originalname;
-    doc.fileKey = req.file.filename;
-    doc.fileUrl = fileUrl;
-    doc.fileSize = req.file.size;
-    doc.fileType = req.file.mimetype;
-    doc.modifiedBy = new mongoose.Types.ObjectId(req.user!.userId);
-    doc.modifiedAt = new Date();
-    if (extracted !== undefined) doc.contentText = extracted;
-
-    await doc.save();
     await invalidateCache(req.user!.userId);
     await createAuditLog({
       documentId: req.params.id,
