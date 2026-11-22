@@ -6,6 +6,8 @@ import { ClientModel } from "../models/Client";
 import { DocumentModel } from "../models/Document";
 import { canAccess } from "./clientController";
 import { logClientActivity } from "../utils/clientAudit";
+import { createAuditLog } from "../utils/auditLogger";
+import { canDelete, invalidateCache } from "./documentController";
 
 /**
  * Folders inside a client's Documents tab. Everyone with access to the client
@@ -15,7 +17,9 @@ import { logClientActivity } from "../utils/clientAudit";
  *   - create a folder / see folders      : anyone with access to the client
  *   - rename or delete a folder          : whoever created it, or the CEO
  *   - move a document in/out of a folder : the uploader of that document, or the CEO
- * Deleting a folder never deletes documents — they go back to the main list.
+ * Deleting a folder returns its documents to the main list. If the caller asks
+ * for it (?deleteDocuments=true) the documents they are allowed to delete go to
+ * Trash instead — recoverable, like any other document delete.
  */
 
 const MAX_NAME_LENGTH = 80;
@@ -222,8 +226,11 @@ export const renameClientFolder = async (req: AuthRequest, res: Response) => {
   }
 };
 
-// DELETE /clients/:id/folders/:folderId
-// Documents inside go back to the client's main list — nothing is deleted.
+// DELETE /clients/:id/folders/:folderId[?deleteDocuments=true]
+// By default the documents inside go back to the client's main list.
+// With deleteDocuments=true, the documents the caller may delete (the owner or
+// the CEO — never an accountant) are moved to Trash; any the caller may NOT
+// delete are returned to the main list rather than destroyed or left hidden.
 export const deleteClientFolder = async (req: AuthRequest, res: Response) => {
   try {
     if (!(await requireClientAccess(req, res))) return;
@@ -249,7 +256,50 @@ export const deleteClientFolder = async (req: AuthRequest, res: Response) => {
       return;
     }
 
+    const { userId, role } = req.user!;
+    let trashedIds: mongoose.Types.ObjectId[] = [];
+
+    if (req.query.deleteDocuments === "true") {
+      const inFolder = await DocumentModel.find({
+        clientId: req.params.id,
+        clientFolderId: folder._id,
+        isDeleted: { $ne: true },
+      }).select("_id ownerId documentType");
+
+      trashedIds = inFolder
+        .filter((d) => canDelete(d, userId, role))
+        .map((d) => d._id as mongoose.Types.ObjectId);
+
+      if (trashedIds.length) {
+        await DocumentModel.updateMany(
+          { _id: { $in: trashedIds } },
+          {
+            $set: {
+              isDeleted: true,
+              deletedAt: new Date(),
+              deletedBy: new mongoose.Types.ObjectId(userId),
+            },
+            // Out of the folder too, so a restore lands in the main list
+            // instead of pointing at a folder that no longer exists.
+            $unset: { clientFolderId: "" },
+          },
+        );
+        await Promise.all(
+          trashedIds.map((id) =>
+            createAuditLog({ documentId: String(id), actorId: userId, action: "trashed" }),
+          ),
+        );
+        await invalidateCache(userId);
+      }
+    }
+
+    // Live documents go back to the main list (this is the number we report)…
     const released = await DocumentModel.updateMany(
+      { clientId: req.params.id, clientFolderId: folder._id, isDeleted: { $ne: true } },
+      { $unset: { clientFolderId: "" } },
+    );
+    // …and anything already in Trash stops pointing at the folder we're deleting.
+    await DocumentModel.updateMany(
       { clientId: req.params.id, clientFolderId: folder._id },
       { $unset: { clientFolderId: "" } },
     );
@@ -259,12 +309,21 @@ export const deleteClientFolder = async (req: AuthRequest, res: Response) => {
       clientId: req.params.id,
       category: "document",
       action: "folder_deleted",
-      summary: `Deleted document folder "${folder.name}" (${released.modifiedCount} document(s) returned to the main list)`,
+      summary:
+        trashedIds.length > 0
+          ? `Deleted document folder "${folder.name}" — ${trashedIds.length} document(s) moved to Trash` +
+            (released.modifiedCount > 0
+              ? `, ${released.modifiedCount} returned to the main list (not allowed to delete them)`
+              : "")
+          : `Deleted document folder "${folder.name}" (${released.modifiedCount} document(s) returned to the main list)`,
     });
     res.json({
       success: true,
       message: "Folder deleted",
-      data: { releasedDocuments: released.modifiedCount },
+      data: {
+        releasedDocuments: released.modifiedCount,
+        trashedDocuments: trashedIds.length,
+      },
     });
   } catch {
     res.status(500).json({ success: false });

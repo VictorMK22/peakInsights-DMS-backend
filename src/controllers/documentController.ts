@@ -73,7 +73,7 @@ import {
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────
 
-const invalidateCache = async (userId: string) => {
+export const invalidateCache = async (userId: string) => {
   try {
     if (!redis) return;
     const keys = await redis.keys(`docs:${userId}:*`);
@@ -247,7 +247,7 @@ const canModify = (
  */
 const ACCOUNTANT_DELETE_MESSAGE =
   "Accountants can't delete documents — only the CEO can";
-const canDelete = (
+export const canDelete = (
   doc: { ownerId: mongoose.Types.ObjectId | string; documentType?: string },
   userId: string,
   role: string,

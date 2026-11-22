@@ -210,3 +210,80 @@ describe("client document folders — rename / delete", () => {
     expect(fresh?.clientFolderId).toBeUndefined();
   });
 });
+
+describe("client document folders — delete together with documents", () => {
+  const inFolder = async (d: { _id: unknown }, folderId: string) =>
+    DocumentModel.updateOne({ _id: d._id }, { clientFolderId: folderId });
+  const del = (clientId: unknown, folderId: string, who: Person, withDocs: boolean) =>
+    request(app)
+      .delete(`/api/clients/${clientId}/folders/${folderId}${withDocs ? "?deleteDocuments=true" : ""}`)
+      .set(auth(who.token));
+
+  it("moves the folder's documents to Trash (recoverable) when asked", async () => {
+    const { ceo, rep, client, doc, createFolder } = await setup();
+    const id = (await createFolder(ceo, "Old stuff")).body.data.folder._id;
+    const a = await doc(rep, "a");
+    const b = await doc(ceo, "b");
+    await inFolder(a, id);
+    await inFolder(b, id);
+
+    const res = await del(client._id, id, ceo, true);
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ trashedDocuments: 2, releasedDocuments: 0 });
+    expect(await ClientFolderModel.findById(id)).toBeNull();
+
+    for (const d of [a, b]) {
+      const fresh = await DocumentModel.findById(d._id);
+      expect(fresh?.isDeleted).toBe(true); // in Trash, NOT permanently gone
+      expect(fresh?.deletedBy).toBeDefined();
+      expect(fresh?.clientFolderId).toBeUndefined(); // a restore lands in the main list
+    }
+
+    // …and they no longer show in the client's Documents tab.
+    const list = await request(app)
+      .get(`/api/clients/${client._id}/documents`)
+      .set(auth(ceo.token));
+    expect(list.status).toBe(200);
+    expect(JSON.stringify(list.body)).not.toMatch(/"title":"a"|"title":"b"/);
+  });
+
+  it("only trashes what the caller may delete; the rest returns to the main list", async () => {
+    const { rep, colleague, client, doc, createFolder } = await setup();
+    const id = (await createFolder(rep, "Mixed")).body.data.folder._id;
+    const mine = await doc(rep, "mine");
+    const theirs = await doc(colleague, "theirs"); // someone else's document
+    await inFolder(mine, id);
+    await inFolder(theirs, id);
+
+    const res = await del(client._id, id, rep, true);
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ trashedDocuments: 1, releasedDocuments: 1 });
+
+    expect((await DocumentModel.findById(mine._id))?.isDeleted).toBe(true);
+    const kept = await DocumentModel.findById(theirs._id);
+    expect(kept?.isDeleted).not.toBe(true);
+    expect(kept?.clientFolderId).toBeUndefined();
+  });
+
+  it("accountants can never delete documents this way", async () => {
+    const { colleague, client, doc, createFolder } = await setup();
+    const id = (await createFolder(colleague, "Mine")).body.data.folder._id;
+    const own = await doc(colleague, "own");
+    await inFolder(own, id);
+
+    const res = await del(client._id, id, colleague, true);
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ trashedDocuments: 0, releasedDocuments: 1 });
+    expect((await DocumentModel.findById(own._id))?.isDeleted).not.toBe(true);
+  });
+
+  it("without the flag nothing changes: documents are released, not trashed", async () => {
+    const { ceo, client, doc, createFolder } = await setup();
+    const id = (await createFolder(ceo, "Plain")).body.data.folder._id;
+    const a = await doc(ceo, "a");
+    await inFolder(a, id);
+    const res = await del(client._id, id, ceo, false);
+    expect(res.body.data).toMatchObject({ trashedDocuments: 0, releasedDocuments: 1 });
+    expect((await DocumentModel.findById(a._id))?.isDeleted).not.toBe(true);
+  });
+});
