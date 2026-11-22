@@ -401,3 +401,151 @@ export const moveClientDocument = async (req: AuthRequest, res: Response) => {
     res.status(500).json({ success: false });
   }
 };
+// ── Bulk actions on documents ───────────────────────────────────────────────
+
+const BULK_MAX_DOCS = 200;
+
+/** Validates { docIds } from the body: 1..BULK_MAX_DOCS distinct valid ids. */
+const parseDocIds = (raw: unknown): { error: string } | { ids: string[] } => {
+  if (!Array.isArray(raw) || raw.length === 0)
+    return { error: "Choose at least one document" };
+  const ids = [...new Set(raw.map(String))];
+  if (!ids.every(isValidId)) return { error: "Contains an invalid document id" };
+  if (ids.length > BULK_MAX_DOCS)
+    return { error: `You can change up to ${BULK_MAX_DOCS} documents at a time` };
+  return { ids };
+};
+
+const preview = (titles: string[]): string =>
+  titles.slice(0, 3).map((t) => `"${t}"`).join(", ") +
+  (titles.length > 3 ? ` and ${titles.length - 3} more` : "");
+
+// POST /clients/:id/documents/bulk-move   { docIds: string[], folderId: string | null }
+// Same rule as moving one document: only the uploader, or the CEO. Documents the
+// caller may not move are skipped (and counted) instead of failing the request.
+export const bulkMoveClientDocuments = async (req: AuthRequest, res: Response) => {
+  try {
+    if (!(await requireClientAccess(req, res))) return;
+    const parsed = parseDocIds(req.body?.docIds);
+    if ("error" in parsed) {
+      res.status(400).json({ success: false, message: parsed.error });
+      return;
+    }
+
+    const raw = req.body?.folderId;
+    let target: IClientFolder | null = null;
+    if (raw !== null && raw !== undefined && raw !== "") {
+      if (!isValidId(raw)) {
+        res.status(400).json({ success: false, message: "Invalid folder" });
+        return;
+      }
+      target = await ClientFolderModel.findOne({ _id: raw, clientId: req.params.id });
+      if (!target) {
+        res.status(404).json({ success: false, message: "Folder not found" });
+        return;
+      }
+    }
+
+    const { userId, role } = req.user!;
+    const docs = await DocumentModel.find({
+      _id: { $in: parsed.ids },
+      clientId: req.params.id,
+      isDeleted: { $ne: true },
+    }).select("title ownerId clientFolderId");
+
+    const notFound = parsed.ids.length - docs.length;
+    const allowed = docs.filter((d) => role === "ceo" || String(d.ownerId) === userId);
+    const skippedNotAllowed = docs.length - allowed.length;
+    const toMove = allowed.filter(
+      (d) => String(d.clientFolderId ?? "") !== String(target?._id ?? ""),
+    );
+
+    if (toMove.length > 0) {
+      await DocumentModel.updateMany(
+        { _id: { $in: toMove.map((d) => d._id) } },
+        target
+          ? { $set: { clientFolderId: target._id } }
+          : { $unset: { clientFolderId: "" } },
+      );
+      await logClientActivity(req, {
+        clientId: req.params.id,
+        category: "document",
+        action: "document_moved",
+        summary: target
+          ? `Moved ${toMove.length} document(s) into folder "${target.name}": ${preview(toMove.map((d) => d.title))}`
+          : `Moved ${toMove.length} document(s) out of their folder: ${preview(toMove.map((d) => d.title))}`,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Documents moved",
+      data: {
+        moved: toMove.length,
+        alreadyThere: allowed.length - toMove.length,
+        skippedNotAllowed,
+        notFound,
+      },
+    });
+  } catch {
+    res.status(500).json({ success: false });
+  }
+};
+
+// POST /clients/:id/documents/bulk-delete   { docIds: string[] }
+// Moves documents to Trash (recoverable) using the normal delete rule: the owner
+// or the CEO, never an accountant. Others are skipped and counted.
+export const bulkDeleteClientDocuments = async (req: AuthRequest, res: Response) => {
+  try {
+    if (!(await requireClientAccess(req, res))) return;
+    const parsed = parseDocIds(req.body?.docIds);
+    if ("error" in parsed) {
+      res.status(400).json({ success: false, message: parsed.error });
+      return;
+    }
+
+    const { userId, role } = req.user!;
+    const docs = await DocumentModel.find({
+      _id: { $in: parsed.ids },
+      clientId: req.params.id,
+      isDeleted: { $ne: true },
+    }).select("title ownerId documentType");
+
+    const notFound = parsed.ids.length - docs.length;
+    const allowed = docs.filter((d) => canDelete(d, userId, role));
+    const skippedNotAllowed = docs.length - allowed.length;
+
+    if (allowed.length > 0) {
+      await DocumentModel.updateMany(
+        { _id: { $in: allowed.map((d) => d._id) } },
+        {
+          $set: {
+            isDeleted: true,
+            deletedAt: new Date(),
+            deletedBy: new mongoose.Types.ObjectId(userId),
+          },
+        },
+      );
+      await Promise.all(
+        allowed.map((d) =>
+          createAuditLog({ documentId: String(d._id), actorId: userId, action: "trashed" }),
+        ),
+      );
+      await invalidateCache(userId);
+      await logClientActivity(req, {
+        clientId: req.params.id,
+        category: "document",
+        action: "document_trashed",
+        summary: `Moved ${allowed.length} document(s) to Trash: ${preview(allowed.map((d) => d.title))}`,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Documents moved to Trash",
+      data: { trashed: allowed.length, skippedNotAllowed, notFound },
+    });
+  } catch {
+    res.status(500).json({ success: false });
+  }
+};

@@ -29,6 +29,8 @@ import {
   renameClientFolder,
   deleteClientFolder,
   moveClientDocument,
+  bulkMoveClientDocuments,
+  bulkDeleteClientDocuments,
 } from "../controllers/clientFolderController";
 import {
   getClientNotes,
@@ -182,5 +184,7 @@ router.post("/:id/folders", createClientFolder);
 router.put("/:id/folders/:folderId", renameClientFolder);
 router.delete("/:id/folders/:folderId", deleteClientFolder);
 router.put("/:id/documents/:docId/folder", moveClientDocument);
+router.post("/:id/documents/bulk-move", bulkMoveClientDocuments);
+router.post("/:id/documents/bulk-delete", bulkDeleteClientDocuments);
 
 export default router;

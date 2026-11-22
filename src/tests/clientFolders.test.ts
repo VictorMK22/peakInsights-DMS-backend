@@ -287,3 +287,98 @@ describe("client document folders — delete together with documents", () => {
     expect((await DocumentModel.findById(a._id))?.isDeleted).not.toBe(true);
   });
 });
+
+
+describe("client documents — bulk move and delete", () => {
+  const bulk = (clientId: unknown, path: "bulk-move" | "bulk-delete", who: Person, body: object) =>
+    request(app)
+      .post(`/api/clients/${clientId}/documents/${path}`)
+      .set(auth(who.token))
+      .send(body);
+
+  it("moves several documents into a folder, skipping ones the caller doesn't own", async () => {
+    const { rep, colleague, client, doc, createFolder } = await setup();
+    const folderId = (await createFolder(rep, "Q1")).body.data.folder._id;
+    const a = await doc(rep, "a");
+    const b = await doc(rep, "b");
+    const theirs = await doc(colleague, "theirs");
+
+    const res = await bulk(client._id, "bulk-move", rep, {
+      docIds: [a._id, b._id, theirs._id],
+      folderId,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ moved: 2, skippedNotAllowed: 1, notFound: 0 });
+    expect(String((await DocumentModel.findById(a._id))?.clientFolderId)).toBe(folderId);
+    expect(String((await DocumentModel.findById(b._id))?.clientFolderId)).toBe(folderId);
+    expect((await DocumentModel.findById(theirs._id))?.clientFolderId).toBeUndefined();
+
+    // Moving them back out (folderId null) works and re-running is a no-op.
+    const out = await bulk(client._id, "bulk-move", rep, { docIds: [a._id, b._id], folderId: null });
+    expect(out.body.data.moved).toBe(2);
+    expect((await DocumentModel.findById(a._id))?.clientFolderId).toBeUndefined();
+    const again = await bulk(client._id, "bulk-move", rep, { docIds: [a._id], folderId: null });
+    expect(again.body.data).toMatchObject({ moved: 0, alreadyThere: 1 });
+  });
+
+  it("the CEO can move anyone's documents", async () => {
+    const { ceo, rep, client, doc, createFolder } = await setup();
+    const folderId = (await createFolder(ceo, "All")).body.data.folder._id;
+    const a = await doc(rep, "a");
+    const res = await bulk(client._id, "bulk-move", ceo, { docIds: [a._id], folderId });
+    expect(res.body.data.moved).toBe(1);
+  });
+
+  it("validates input and never touches another client's documents or folders", async () => {
+    const { rep, client, otherClient, doc, createFolder } = await setup();
+    const mine = await doc(rep, "mine");
+    const foreign = await doc(rep, "foreign", otherClient._id);
+    const foreignFolder = (await createFolder(rep, "Theirs", otherClient._id)).body.data.folder._id;
+
+    expect((await bulk(client._id, "bulk-move", rep, { docIds: [], folderId: null })).status).toBe(400);
+    expect((await bulk(client._id, "bulk-move", rep, { docIds: ["nope"], folderId: null })).status).toBe(400);
+    expect(
+      (await bulk(client._id, "bulk-move", rep, { docIds: [mine._id], folderId: foreignFolder })).status,
+    ).toBe(404);
+
+    const res = await bulk(client._id, "bulk-delete", rep, { docIds: [mine._id, foreign._id] });
+    expect(res.body.data).toMatchObject({ trashed: 1, notFound: 1 });
+    expect((await DocumentModel.findById(foreign._id))?.isDeleted).not.toBe(true);
+  });
+
+  it("outsiders get 403/404, not access", async () => {
+    const { outsider, client, rep, doc } = await setup();
+    const a = await doc(rep, "a");
+    const res = await bulk(client._id, "bulk-delete", outsider, { docIds: [a._id] });
+    expect([403, 404]).toContain(res.status);
+    expect((await DocumentModel.findById(a._id))?.isDeleted).not.toBe(true);
+  });
+
+  it("moves documents to Trash (recoverable); accountants and non-owners are skipped", async () => {
+    const { ceo, rep, colleague, client, doc } = await setup();
+    const mine = await doc(rep, "mine");
+    const other = await doc(ceo, "other");
+    const res = await bulk(client._id, "bulk-delete", rep, { docIds: [mine._id, other._id] });
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ trashed: 1, skippedNotAllowed: 1 });
+    const gone = await DocumentModel.findById(mine._id);
+    expect(gone?.isDeleted).toBe(true);
+    expect(gone?.deletedBy).toBeDefined();
+    expect((await DocumentModel.findById(other._id))?.isDeleted).not.toBe(true);
+
+    const own = await doc(colleague, "acc");
+    const acc = await bulk(client._id, "bulk-delete", colleague, { docIds: [own._id] });
+    expect(acc.body.data).toMatchObject({ trashed: 0, skippedNotAllowed: 1 });
+    expect((await DocumentModel.findById(own._id))?.isDeleted).not.toBe(true);
+
+    const list = await request(app).get(`/api/clients/${client._id}/documents`).set(auth(ceo.token));
+    expect(JSON.stringify(list.body)).not.toMatch(/"title":"mine"/);
+  });
+
+  it("the CEO can trash anyone's documents", async () => {
+    const { ceo, rep, client, doc } = await setup();
+    const a = await doc(rep, "a");
+    const res = await bulk(client._id, "bulk-delete", ceo, { docIds: [a._id] });
+    expect(res.body.data.trashed).toBe(1);
+  });
+});
