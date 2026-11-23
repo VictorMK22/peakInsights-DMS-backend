@@ -573,8 +573,12 @@ export const updateUser = async (
     // accountants and tech accounts included — to another department. New
     // accountants / tech accounts still START in Accounting / ICT (see
     // createAccountant / createTech); this edit is how they are moved later.
-    // A department must be one the CEO has created (or blank for none), so
-    // the dropdown and the server agree.
+    // A department must be one the CEO has created, so the dropdown and the
+    // server agree. A blank one never clears a user's department — it is
+    // ignored (everyone belongs to a department).
+    if (typeof updates.department === "string" && !updates.department.trim()) {
+      delete updates.department;
+    }
     if (typeof updates.department === "string" && updates.department.trim()) {
       const name = updates.department.trim();
       const [existing, known] = await Promise.all([
