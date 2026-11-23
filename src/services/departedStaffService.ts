@@ -156,9 +156,19 @@ export async function releaseClientsOfUser(
     const $set: Record<string, unknown> = {};
     const $unset: Record<string, 1> = {};
     if (String(c.allocatedAccountant ?? "") === userId) {
-      $unset.allocatedAccountant = 1;
-      $unset.allocatedAt = 1;
-      $unset.allocatedBy = 1;
+      // A client can have several accountants: if another one is still
+      // serving, they become the primary instead of the client showing as
+      // "awaiting an accountant". Only when nobody is left is it cleared.
+      const successor = c.assignedTo.find(
+        (id) => String(id) !== userId && servingNow.has(String(id)),
+      );
+      if (successor) {
+        $set.allocatedAccountant = successor;
+      } else {
+        $unset.allocatedAccountant = 1;
+        $unset.allocatedAt = 1;
+        $unset.allocatedBy = 1;
+      }
     }
     if (flag) {
       $set.needsReallocation = true;

@@ -7,6 +7,7 @@ import { ClientModel } from "../models/Client";
 import { User } from "../models/User";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import * as emailService from "../services/emailService";
+import { releaseClientsOfUser } from "../services/departedStaffService";
 
 beforeAll(async () => {
   await startTestDb();
@@ -145,6 +146,152 @@ describe("allocating won clients", () => {
     const id = await won(ceo);
     const res = await allocate(ceo, id, String(acct._id));
     expect(res.status).toBe(200);
+  });
+
+  describe("several accountants on one won client", () => {
+    const allocateMany = (token: string, id: string, accountantIds: string[]) =>
+      request(app)
+        .post(`/api/clients/${id}/allocate-accountant`)
+        .set(auth(token))
+        .send({ accountantIds });
+    // A client a sales person won — they stay on it while accountants serve.
+    const wonBySales = async (sales: string) => {
+      const made = await post(sales, { name: "Sales Win" });
+      const id = made.body.data.client._id as string;
+      await stage(sales, id, "won");
+      return id;
+    };
+
+    it("allocates two accountants like an existing client: both assigned, first is primary, sales person kept", async () => {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { user: salesUser, token: sales } = await createUserWithToken("sales_person");
+      const { user: a } = await createUserWithToken("accountant");
+      const { user: b } = await createUserWithToken("accountant");
+      const id = await wonBySales(sales);
+
+      const res = await allocateMany(ceo, id, [String(a._id), String(b._id)]);
+      expect(res.status).toBe(200);
+
+      const stored = await ClientModel.findById(id).lean();
+      expect(stored!.assignedTo.map(String).sort()).toEqual(
+        [String(salesUser._id), String(a._id), String(b._id)].sort(),
+      );
+      expect(String(stored!.allocatedAccountant)).toBe(String(a._id));
+
+      const pending = await request(app).get("/api/clients/awaiting-allocation").set(auth(ceo));
+      expect(pending.body.data.clients).toEqual([]);
+    });
+
+    it("a re-allocation replaces the team, keeps the primary if still on it, and keeps the sales person", async () => {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { user: salesUser, token: sales } = await createUserWithToken("sales_person");
+      const { user: a } = await createUserWithToken("accountant");
+      const { user: b } = await createUserWithToken("accountant");
+      const { user: c } = await createUserWithToken("accountant");
+      const id = await wonBySales(sales);
+      await allocateMany(ceo, id, [String(a._id), String(b._id)]);
+
+      const res = await allocateMany(ceo, id, [String(b._id), String(c._id)]);
+      expect(res.status).toBe(200);
+      const stored = await ClientModel.findById(id).lean();
+      expect(stored!.assignedTo.map(String).sort()).toEqual(
+        [String(salesUser._id), String(b._id), String(c._id)].sort(),
+      );
+      // a (the old primary) is gone, so the first of the new list takes over
+      expect(String(stored!.allocatedAccountant)).toBe(String(b._id));
+
+      await allocateMany(ceo, id, [String(c._id), String(b._id)]);
+      // b is still on the team and already primary — it does not jump to c
+      expect(String((await ClientModel.findById(id).lean())!.allocatedAccountant)).toBe(String(b._id));
+    });
+
+    it("notifies and emails only the newly added accountants", async () => {
+      const sent = jest
+        .spyOn(emailService, "sendClientAssignedEmail")
+        .mockResolvedValue(undefined);
+      try {
+        const { token: ceo } = await createUserWithToken("ceo");
+        const { token: sales } = await createUserWithToken("sales_person");
+        const { user: a } = await createUserWithToken("accountant");
+        const { user: b } = await createUserWithToken("accountant");
+        const id = await wonBySales(sales);
+
+        await allocateMany(ceo, id, [String(a._id)]);
+        expect(sent).toHaveBeenCalledTimes(1);
+        sent.mockClear();
+        await allocateMany(ceo, id, [String(a._id), String(b._id)]);
+        expect(sent).toHaveBeenCalledTimes(1);
+        expect(sent.mock.calls[0][0].assigneeTo).toBe(b.email);
+      } finally {
+        sent.mockRestore();
+      }
+    });
+
+    it("rejects an empty list, and a list with anyone who cannot serve a client", async () => {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { token: sales, user: rep } = await createUserWithToken("sales_person");
+      const { user: a } = await createUserWithToken("accountant");
+      const id = await wonBySales(sales);
+
+      expect((await allocateMany(ceo, id, [])).status).toBe(400);
+      expect((await allocateMany(ceo, id, [String(a._id), String(rep._id)])).status).toBe(400);
+      expect((await allocateMany(ceo, id, ["not-an-id"])).status).toBe(400);
+      expect((await ClientModel.findById(id).lean())!.allocatedAccountant).toBeUndefined();
+    });
+
+    it("the older single accountantId form adds an accountant and replaces the previous primary", async () => {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { token: sales } = await createUserWithToken("sales_person");
+      const { user: a } = await createUserWithToken("accountant");
+      const { user: b } = await createUserWithToken("accountant");
+      const id = await wonBySales(sales);
+      await allocate(ceo, id, String(a._id));
+      await allocate(ceo, id, String(b._id));
+      const stored = await ClientModel.findById(id).lean();
+      expect(stored!.assignedTo.map(String)).not.toContain(String(a._id));
+      expect(stored!.assignedTo.map(String)).toContain(String(b._id));
+      expect(String(stored!.allocatedAccountant)).toBe(String(b._id));
+    });
+
+    it("when the primary accountant leaves, another accountant takes over instead of the client going back to 'awaiting'", async () => {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { token: sales } = await createUserWithToken("sales_person");
+      const { user: a } = await createUserWithToken("accountant");
+      const { user: b } = await createUserWithToken("accountant");
+      const id = await wonBySales(sales);
+      await allocateMany(ceo, id, [String(a._id), String(b._id)]);
+
+      const result = await releaseClientsOfUser(String(a._id));
+      expect(result.needReallocation).toBe(0);
+      const stored = await ClientModel.findById(id).lean();
+      expect(stored!.assignedTo.map(String)).not.toContain(String(a._id));
+      expect(String(stored!.allocatedAccountant)).toBe(String(b._id));
+      expect(stored!.needsReallocation).toBeFalsy();
+
+      // the last accountant leaving does send it back to the CEO's queue
+      const last = await releaseClientsOfUser(String(b._id));
+      expect(last.needReallocation).toBe(1);
+      const after = await ClientModel.findById(id).lean();
+      expect(after!.allocatedAccountant).toBeUndefined();
+      expect(after!.needsReallocation).toBe(true);
+    });
+
+    it("assigning accountants to a won client the ordinary way sets the primary accountant too", async () => {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { token: sales } = await createUserWithToken("sales_person");
+      const { user: a } = await createUserWithToken("accountant");
+      const { user: b } = await createUserWithToken("accountant");
+      const id = await wonBySales(sales);
+      const assign = (userIds: string[]) =>
+        request(app).post(`/api/clients/${id}/assign`).set(auth(ceo)).send({ userIds });
+
+      expect((await assign([String(a._id), String(b._id)])).status).toBe(200);
+      expect(String((await ClientModel.findById(id).lean())!.allocatedAccountant)).toBe(String(a._id));
+
+      // the primary is removed → another accountant still serving takes over
+      expect((await assign([String(b._id)])).status).toBe(200);
+      expect(String((await ClientModel.findById(id).lean())!.allocatedAccountant)).toBe(String(b._id));
+    });
   });
 
   it("rejects allocating to someone who is not an accountant or the CEO", async () => {

@@ -907,7 +907,7 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
         .json({ success: false, message: "userIds contains an invalid id" });
 
     const current = await ClientModel.findById(req.params.id).select(
-      "assignedTo isSalesLead salesStage",
+      "assignedTo isSalesLead salesStage allocatedAccountant",
     );
     if (!current) return res.status(404).json({ success: false });
 
@@ -944,6 +944,38 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
           : "A client can only be assigned to accountants, accountant supervisors (or yourself)",
       });
 
+    // A won client keeps a PRIMARY accountant (`allocatedAccountant`) next to
+    // its assignees. Setting the team here keeps that in step, so assigning
+    // accountants to a won client the ordinary way also clears "Awaiting
+    // accountant" and a removed primary is replaced by someone still serving.
+    let primaryUpdate: { $set?: Record<string, unknown>; $unset?: Record<string, 1> } = {};
+    if (!prospect && current.isSalesLead) {
+      const roles = userIds.length
+        ? await User.find({ _id: { $in: userIds } })
+            .select("role")
+            .lean()
+        : [];
+      const serving = userIds.filter((id) => {
+        const u = roles.find((r) => String(r._id) === id);
+        return (
+          !!u &&
+          (u.role === "accountant" || u.role === "ceo" || supervisorIds.has(id))
+        );
+      });
+      const prev = current.allocatedAccountant?.toString();
+      if (serving.length === 0) {
+        if (prev) primaryUpdate = { $unset: { allocatedAccountant: 1, allocatedAt: 1, allocatedBy: 1 } };
+      } else if (!prev || !serving.includes(prev)) {
+        primaryUpdate = {
+          $set: {
+            allocatedAccountant: new mongoose.Types.ObjectId(serving[0]),
+            allocatedAt: new Date(),
+            allocatedBy: new mongoose.Types.ObjectId(req.user!.userId),
+          },
+        };
+      }
+    }
+
     const client = await ClientModel.findByIdAndUpdate(
       req.params.id,
       {
@@ -954,7 +986,9 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
           ...(!prospect && userIds.length > 0
             ? { needsReallocation: false }
             : {}),
+          ...(primaryUpdate.$set ?? {}),
         },
+        ...(primaryUpdate.$unset ? { $unset: primaryUpdate.$unset } : {}),
       },
       { new: true },
     ).populate("assignedTo", "name email role profilePicture");
@@ -1020,6 +1054,9 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
 // ═══════════════════════════════════════════════════════════════
 
 const BULK_ASSIGN_MAX_CLIENTS = 200;
+
+/** Most accountants / supervisors one won client may be allocated to at once. */
+const MAX_CLIENT_ACCOUNTANTS = 20;
 
 export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
   if (!isCEO(req))
@@ -1238,26 +1275,61 @@ export const getAwaitingAllocation = async (
   }
 };
 
-// POST /clients/:id/allocate-accountant  { accountantId }
-// CEO only. Adds the accountant to the client's assignees (keeping the sales
-// person who won it) and records the allocation. Calling it again with a
-// different accountant re-allocates: the previous allocated accountant is
-// removed.
+// POST /clients/:id/allocate-accountant  { accountantIds: string[] }
+//   (the older single form  { accountantId }  still works)
+// CEO only. Puts one or more accountants / accountant supervisors (or the CEO
+// themself) on a won client — the same way existing clients are assigned.
+//
+// With `accountantIds` the list IS the client's serving team: people on it are
+// added, people who served before but are not on it are taken off, and anyone
+// who is not a server (the sales person who won the client) is kept. With the
+// single `accountantId` the accountant is added and the previously allocated
+// accountant is replaced, as before.
+//
+// `allocatedAccountant` stays as the PRIMARY accountant (the first one chosen,
+// or the current primary if they are still on the team); the rest are ordinary
+// assignees, so every existing access rule keeps working.
 export const allocateAccountant = async (req: AuthRequest, res: Response) => {
   if (!isCEO(req))
     return res
       .status(403)
       .json({ success: false, message: "Only the CEO can allocate accountants" });
   try {
-    const { accountantId } = req.body as { accountantId?: string };
-    if (!accountantId || !mongoose.Types.ObjectId.isValid(accountantId))
+    const body = req.body as { accountantIds?: unknown; accountantId?: unknown };
+    const listMode = body.accountantIds !== undefined;
+    const requested: unknown[] = listMode
+      ? Array.isArray(body.accountantIds)
+        ? body.accountantIds
+        : []
+      : body.accountantId
+        ? [body.accountantId]
+        : [];
+    const validId = (id: unknown): id is string =>
+      typeof id === "string" && mongoose.Types.ObjectId.isValid(id);
+    if (requested.length === 0)
+      return res.status(400).json({
+        success: false,
+        message: listMode
+          ? "Choose at least one accountant"
+          : "accountantId is required",
+      });
+    if (!requested.every(validId))
       return res
         .status(400)
-        .json({ success: false, message: "accountantId is required" });
+        .json({ success: false, message: "Contains an invalid id" });
+    const chosen = [...new Set(requested as string[])];
+    if (chosen.length > MAX_CLIENT_ACCOUNTANTS)
+      return res.status(400).json({
+        success: false,
+        message: `A client can have up to ${MAX_CLIENT_ACCOUNTANTS} accountants`,
+      });
 
-    const [client, accountant] = await Promise.all([
+    const [client, people, supervisorIds] = await Promise.all([
       ClientModel.findById(req.params.id),
-      User.findById(accountantId).select("name email role isActive"),
+      User.find({ _id: { $in: chosen } })
+        .select("name email role isActive")
+        .lean(),
+      getAccountantSupervisorIds(),
     ]);
     if (!client)
       return res.status(404).json({ success: false, message: "Client not found" });
@@ -1266,78 +1338,118 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
         success: false,
         message: "An accountant can only be allocated to a client that has been won",
       });
+
     // The CEO may keep a won client and serve it personally, so they are a
     // valid choice alongside the accountants.
-    const allocatingToSelf =
-      !!accountant &&
-      accountant.role === "ceo" &&
-      accountant._id.toString() === req.user!.userId;
-    const supervisorIds =
-      accountant && accountant.role === "supervisor"
-        ? await getAccountantSupervisorIds()
-        : new Set<string>();
-    if (
-      !accountant ||
-      !accountant.isActive ||
-      (!canServeClient(accountant.role, String(accountant._id), supervisorIds) &&
-        !allocatingToSelf)
-    )
+    const invalid = chosen.some((id) => {
+      const u = people.find((p) => String(p._id) === id);
+      if (!u || !u.isActive) return true;
+      if (id === req.user!.userId && u.role === "ceo") return false; // self
+      return !canServeClient(u.role, id, supervisorIds);
+    });
+    if (invalid)
       return res.status(400).json({
         success: false,
-        message: "Choose an active accountant, accountant supervisor (or yourself)",
+        message: "Choose active accountants, accountant supervisors (or yourself)",
       });
 
+    // Work out who on the client today is a "server" (as opposed to the sales
+    // person who won it) so the sales person is never dropped by a reallocation.
+    const before = client.assignedTo.map((id) => id.toString());
+    const beforeUsers = before.length
+      ? await User.find({ _id: { $in: before } })
+          .select("role")
+          .lean()
+      : [];
+    const isServer = (id: string) => {
+      const u = beforeUsers.find((b) => String(b._id) === id);
+      return (
+        !!u &&
+        (u.role === "accountant" ||
+          u.role === "ceo" ||
+          supervisorIds.has(id))
+      );
+    };
+
     const previous = client.allocatedAccountant?.toString();
-    const next = accountant._id.toString();
-    const assignees = client.assignedTo
-      .map((id) => id.toString())
-      .filter((id) => id !== previous);
-    if (!assignees.includes(next)) assignees.push(next);
+    const servingBefore = before.filter(isServer);
+    // List mode: exactly the chosen team. Single mode: add them, and replace
+    // the previously allocated accountant (anyone else serving stays).
+    const team = listMode
+      ? chosen
+      : [...new Set([...servingBefore.filter((id) => id !== previous), ...chosen])];
+    const primary =
+      previous && team.includes(previous) ? previous : team[0];
+
+    const kept = before.filter((id) => !isServer(id)); // sales person etc.
+    const assignees = [...new Set([...kept, ...team])];
+    const added = team.filter((id) => !before.includes(id));
+    const removed = servingBefore.filter((id) => !team.includes(id));
+    const primaryChanged = primary !== previous;
 
     client.assignedTo = assignees.map((id) => new mongoose.Types.ObjectId(id));
     client.assignedAt = new Date();
-    client.allocatedAccountant = accountant._id as mongoose.Types.ObjectId;
-    client.allocatedAt = new Date();
-    client.allocatedBy = new mongoose.Types.ObjectId(req.user!.userId);
+    client.allocatedAccountant = new mongoose.Types.ObjectId(primary);
+    if (primaryChanged || !client.allocatedAt) {
+      client.allocatedAt = new Date();
+      client.allocatedBy = new mongoose.Types.ObjectId(req.user!.userId);
+    }
     // A client whose accountant left is back in service.
     client.needsReallocation = false;
     await client.save();
 
-    // Tell the accountant, and the sales person who won the client.
-    if (previous !== next) {
-      try {
-        if (next !== req.user!.userId) {
-          await createNotification(
-            next,
-            `You have been allocated a new client: ${clientLabel(client)}`,
-            "client_allocated",
-            { clientId: String(client._id) },
-          );
-          await emailAssignee(accountant, req.user!.userId, [
+    const teamNames = team
+      .map((id) => people.find((p) => String(p._id) === id)?.name)
+      .filter(Boolean) as string[];
+
+    // Tell each newly added accountant, and the sales person who won the client.
+    try {
+      for (const id of added) {
+        if (id === req.user!.userId) continue;
+        await createNotification(
+          id,
+          `You have been allocated a new client: ${clientLabel(client)}`,
+          "client_allocated",
+          { clientId: String(client._id) },
+        );
+        const person = people.find((p) => String(p._id) === id);
+        if (person)
+          await emailAssignee(person, req.user!.userId, [
             { id: String(client._id), name: clientLabel(client) },
           ]);
-        }
-        const salesId = client.createdBy?.toString();
-        if (salesId && salesId !== req.user!.userId && salesId !== next) {
-          await createNotification(
-            salesId,
-            `${clientLabel(client)} has been allocated to ${accountant.name}`,
-            "client_allocated",
-            { clientId: String(client._id) },
-          );
-        }
-      } catch (err) {
-        console.error("❌ client_allocated notify failed:", err);
       }
+      const salesId = client.createdBy?.toString();
+      if (
+        (added.length > 0 || removed.length > 0) &&
+        salesId &&
+        salesId !== req.user!.userId &&
+        !team.includes(salesId)
+      ) {
+        await createNotification(
+          salesId,
+          `${clientLabel(client)} has been allocated to ${teamNames.join(", ")}`,
+          "client_allocated",
+          { clientId: String(client._id) },
+        );
+      }
+    } catch (err) {
+      console.error("❌ client_allocated notify failed:", err);
     }
 
+    const reallocated = servingBefore.length > 0 && (added.length > 0 || removed.length > 0);
     await logClientActivity(req, {
       clientId: client._id as mongoose.Types.ObjectId,
       clientName: client.name,
       category: "assignment",
-      action: previous && previous !== next ? "accountant_reallocated" : "accountant_allocated",
-      summary: `${previous && previous !== next ? "Reallocated" : "Allocated"} accountant: ${accountant.name}`,
-      details: { accountantId: next, previousAccountantId: previous },
+      action: reallocated ? "accountant_reallocated" : "accountant_allocated",
+      summary: `${reallocated ? "Reallocated" : "Allocated"} accountant${teamNames.length === 1 ? "" : "s"}: ${teamNames.join(", ")}`,
+      details: {
+        accountantIds: team,
+        primaryAccountantId: primary,
+        previousAccountantId: previous,
+        added,
+        removed,
+      },
     });
     const populated = await client.populate([
       { path: "assignedTo", select: "name email role profilePicture" },
@@ -1346,6 +1458,7 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
     res.json({ success: true, data: { client: populated } });
     return;
   } catch (err) {
+    console.error("allocateAccountant error:", err);
     res.status(500).json({ success: false });
     return;
   }
