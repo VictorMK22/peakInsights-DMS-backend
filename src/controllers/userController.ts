@@ -1,6 +1,7 @@
 import { Response, NextFunction } from "express";
 import { User } from "../models/User";
 import { Department as DepartmentModel } from "../models/Department";
+import { isTechDepartmentName } from "../middleware/auth";
 import { getTeamMembers as getTeamMembersFor } from "../utils/team";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { DocumentModel } from "../models/Document";
@@ -554,6 +555,19 @@ export const updateUser = async (
       department: string;
       isActive: boolean;
     }>;
+
+    // A tech supervisor (a supervisor in the ICT / Tech department) stays in
+    // that department: it is what gives them their tech access, so a
+    // department change in this request is ignored (name etc. still save).
+    if (updates.department !== undefined) {
+      const target = await User.findById(id).select("role department");
+      if (
+        target?.role === "supervisor" &&
+        isTechDepartmentName(target.department)
+      ) {
+        delete updates.department;
+      }
+    }
 
     // The CEO (the only role allowed on this route) may move anyone —
     // accountants and tech accounts included — to another department. New
