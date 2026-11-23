@@ -512,7 +512,7 @@ const buildClientListFilter = (
   uid: mongoose.Types.ObjectId,
   owners: mongoose.Types.ObjectId[] | null,
 ): Record<string, unknown> => {
-  const { search, salesStage, salesOnly, tab, mine } = query;
+  const { search, salesStage, salesOnly, tab, mine, accountantRole } = query;
   const filter: Record<string, unknown> = {};
 
   // CEO: all clients. Supervisor: clients where they are directly assigned
@@ -536,6 +536,15 @@ const buildClientListFilter = (
     and.push({ isSalesLead: true, salesStage: { $ne: "won" } });
   else if (tab === "won")
     and.push({ $or: [{ isSalesLead: { $ne: true } }, { salesStage: "won" }] });
+  // GET /clients?accountantRole=primary|secondary — the caller's own clients
+  // split by their part in serving them: the one primary accountant, or one of
+  // the secondary accountants (on the client but not the primary).
+  if (accountantRole === "primary" || accountantRole === "secondary") {
+    and.push({ $or: [{ isSalesLead: { $ne: true } }, { salesStage: "won" }] });
+    if (accountantRole === "primary") and.push({ allocatedAccountant: uid });
+    else
+      and.push({ assignedTo: uid }, { allocatedAccountant: { $ne: uid } });
+  }
   if (search)
     and.push({
       $or: [
@@ -977,7 +986,7 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
     // accountants to a won client the ordinary way also clears "Awaiting
     // accountant" and a removed primary is replaced by someone still serving.
     let primaryUpdate: { $set?: Record<string, unknown>; $unset?: Record<string, 1> } = {};
-    if (!prospect && current.isSalesLead) {
+    if (!prospect) {
       const roles = finalIds.length
         ? await User.find({ _id: { $in: finalIds } })
             .select("role")
@@ -1174,8 +1183,8 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
       const added = uniqueUserIds.filter((id) => !have.has(id));
       const keep = [...have].filter((id) => staying.has(id));
       const hasOthers = keep.length !== have.size; // e.g. a sales person
-      const needsAllocation =
-        !!c.isSalesLead && c.salesStage === "won" && !c.allocatedAccountant;
+      // Won and existing clients each keep one primary accountant.
+      const needsAllocation = !c.allocatedAccountant;
       if (
         added.length === 0 &&
         !hasOthers &&
@@ -1192,7 +1201,9 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
       if (added.length > 0) $set.assignedAt = now;
       if (c.needsReallocation) $set.needsReallocation = false;
       if (needsAllocation) {
-        $set.allocatedAccountant = toObjectId(primaryId);
+        // An accountant already on the client becomes primary; otherwise the
+        // first one chosen.
+        $set.allocatedAccountant = toObjectId(keep[0] ?? primaryId);
         $set.allocatedAt = now;
         $set.allocatedBy = toObjectId(req.user!.userId);
       }
@@ -1315,8 +1326,10 @@ export const getAwaitingAllocation = async (
   }
 };
 
-// POST /clients/:id/allocate-accountant  { accountantIds: string[] }
+// POST /clients/:id/allocate-accountant  { accountantIds: string[], primaryId? }
 //   (the older single form  { accountantId }  still works)
+// `primaryId` (one of accountantIds) is the PRIMARY accountant; the rest are
+// SECONDARY. A client has exactly one primary and any number of secondaries.
 // CEO only. Puts one or more accountants / accountant supervisors (or the CEO
 // themself) on a won client — the same way existing clients are assigned.
 //
@@ -1336,7 +1349,11 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
       .status(403)
       .json({ success: false, message: "Only the CEO can allocate accountants" });
   try {
-    const body = req.body as { accountantIds?: unknown; accountantId?: unknown };
+    const body = req.body as {
+      accountantIds?: unknown;
+      accountantId?: unknown;
+      primaryId?: unknown;
+    };
     const listMode = body.accountantIds !== undefined;
     const requested: unknown[] = listMode
       ? Array.isArray(body.accountantIds)
@@ -1359,6 +1376,17 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
         .status(400)
         .json({ success: false, message: "Contains an invalid id" });
     const chosen = [...new Set(requested as string[])];
+    // The CEO may name which of the chosen is the primary accountant; everyone
+    // else chosen is a secondary accountant.
+    const requestedPrimary =
+      typeof body.primaryId === "string" && body.primaryId
+        ? body.primaryId
+        : undefined;
+    if (requestedPrimary && !chosen.includes(requestedPrimary))
+      return res.status(400).json({
+        success: false,
+        message: "The primary accountant must be one of the chosen accountants",
+      });
     if (chosen.length > MAX_CLIENT_ACCOUNTANTS)
       return res.status(400).json({
         success: false,
@@ -1374,7 +1402,13 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
     ]);
     if (!client)
       return res.status(404).json({ success: false, message: "Client not found" });
-    if (client.salesStage !== "won" && !client.needsReallocation)
+    // Won clients and existing clients (never in the pipeline) take
+    // accountants; prospects still in the pipeline do not.
+    if (
+      client.isSalesLead &&
+      client.salesStage !== "won" &&
+      !client.needsReallocation
+    )
       return res.status(400).json({
         success: false,
         message: "An accountant can only be allocated to a client that has been won",
@@ -1420,7 +1454,8 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
       ? chosen
       : [...new Set([...servingBefore.filter((id) => id !== previous), ...chosen])];
     const primary =
-      previous && team.includes(previous) ? previous : team[0];
+      requestedPrimary ??
+      (previous && team.includes(previous) ? previous : team[0]);
 
     // Only accountants / supervisors / the CEO stay on a won client — the
     // sales person who won it (or anyone else) is not kept.
@@ -1450,7 +1485,7 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
         if (id === req.user!.userId) continue;
         await createNotification(
           id,
-          `You have been allocated a new client: ${clientLabel(client)}`,
+          `You have been allocated a new client: ${clientLabel(client)} (as ${id === primary ? "primary" : "secondary"} accountant)`,
           "client_allocated",
           { clientId: String(client._id) },
         );
@@ -1459,6 +1494,20 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
           await emailAssignee(person, req.user!.userId, [
             { id: String(client._id), name: clientLabel(client) },
           ]);
+      }
+      // Someone who stays on the client but moves between primary and
+      // secondary is told too.
+      for (const id of team) {
+        if (added.includes(id) || id === req.user!.userId) continue;
+        const wasPrimary = id === previous;
+        const isPrimary = id === primary;
+        if (wasPrimary === isPrimary) continue;
+        await createNotification(
+          id,
+          `You are now the ${isPrimary ? "primary" : "secondary"} accountant for ${clientLabel(client)}`,
+          "client_allocated",
+          { clientId: String(client._id) },
+        );
       }
       const salesId = client.createdBy?.toString();
       if (
@@ -1484,7 +1533,11 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
       clientName: client.name,
       category: "assignment",
       action: reallocated ? "accountant_reallocated" : "accountant_allocated",
-      summary: `${reallocated ? "Reallocated" : "Allocated"} accountant${teamNames.length === 1 ? "" : "s"}: ${teamNames.join(", ")}`,
+      summary: `${reallocated ? "Reallocated" : "Allocated"} accountant${teamNames.length === 1 ? "" : "s"}: ${teamNames.join(", ")}${
+        team.length > 1
+          ? ` (primary: ${people.find((p) => String(p._id) === primary)?.name ?? "—"})`
+          : ""
+      }`,
       details: {
         accountantIds: team,
         primaryAccountantId: primary,

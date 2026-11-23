@@ -1,5 +1,6 @@
 import { Response, NextFunction } from "express";
 import { User } from "../models/User";
+import { Department as DepartmentModel } from "../models/Department";
 import { getTeamMembers as getTeamMembersFor } from "../utils/team";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { DocumentModel } from "../models/Document";
@@ -554,16 +555,27 @@ export const updateUser = async (
       isActive: boolean;
     }>;
 
-    // Accountants and tech accounts always stay in their fixed
-    // department (Accounting / ICT respectively) — same rule enforced
-    // at creation time (see createAccountant/createTech). An edit
-    // should never be able to drift either out of it, so any
-    // department change in this request is dropped for those roles.
-    if (updates.department !== undefined) {
-      const existing = await User.findById(id).select("role");
-      if (existing?.role === "accountant" || existing?.role === "tech") {
-        delete updates.department;
+    // The CEO (the only role allowed on this route) may move anyone —
+    // accountants and tech accounts included — to another department. New
+    // accountants / tech accounts still START in Accounting / ICT (see
+    // createAccountant / createTech); this edit is how they are moved later.
+    // A department must be one the CEO has created (or blank for none), so
+    // the dropdown and the server agree.
+    if (typeof updates.department === "string" && updates.department.trim()) {
+      const name = updates.department.trim();
+      const [existing, known] = await Promise.all([
+        User.findById(id).select("department"),
+        DepartmentModel.exists({ name }),
+      ]);
+      // Keeping the department a user already has is always fine (the
+      // default "Accounting" / "ICT" may not be on the Departments page).
+      if (!known && existing?.department !== name) {
+        res
+          .status(400)
+          .json({ success: false, message: "Choose an existing department" });
+        return;
       }
+      updates.department = name;
     }
 
     // Switching someone to inactive from the edit form is the same as

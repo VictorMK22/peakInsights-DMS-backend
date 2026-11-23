@@ -205,6 +205,50 @@ describe("allocating won clients", () => {
       expect(String((await ClientModel.findById(id).lean())!.allocatedAccountant)).toBe(String(b._id));
     });
 
+    it("the CEO names the primary; the rest are secondary, and each accountant can filter by role", async () => {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { token: sales } = await createUserWithToken("sales_person");
+      const { user: a, token: aToken } = await createUserWithToken("accountant");
+      const { user: b, token: bToken } = await createUserWithToken("accountant");
+      const id = await wonBySales(sales);
+
+      const res = await request(app)
+        .post(`/api/clients/${id}/allocate-accountant`)
+        .set(auth(ceo))
+        .send({ accountantIds: [String(a._id), String(b._id)], primaryId: String(b._id) });
+      expect(res.status).toBe(200);
+      expect(String((await ClientModel.findById(id).lean())!.allocatedAccountant)).toBe(String(b._id));
+
+      const ids = async (token: string, role: string) =>
+        (await request(app).get(`/api/clients?mine=true&accountantRole=${role}`).set(auth(token))).body.data.clients.map((c: any) => c._id);
+      expect(await ids(bToken, "primary")).toEqual([id]);
+      expect(await ids(bToken, "secondary")).toEqual([]);
+      expect(await ids(aToken, "primary")).toEqual([]);
+      expect(await ids(aToken, "secondary")).toEqual([id]);
+
+      // the primary must be one of the chosen accountants
+      const { user: c } = await createUserWithToken("accountant");
+      const bad = await request(app)
+        .post(`/api/clients/${id}/allocate-accountant`)
+        .set(auth(ceo))
+        .send({ accountantIds: [String(a._id)], primaryId: String(c._id) });
+      expect(bad.status).toBe(400);
+    });
+
+    it("an existing client (never in the pipeline) can be given a primary and a secondary accountant", async () => {
+      const { token: ceo } = await createUserWithToken("ceo");
+      const { user: a } = await createUserWithToken("accountant");
+      const { user: b } = await createUserWithToken("accountant");
+      const made = await post(ceo, { name: "Old Client" });
+      const id = made.body.data.client._id as string;
+
+      const res = await allocateMany(ceo, id, [String(a._id), String(b._id)]);
+      expect(res.status).toBe(200);
+      const stored = await ClientModel.findById(id).lean();
+      expect(String(stored!.allocatedAccountant)).toBe(String(a._id));
+      expect(stored!.assignedTo.map(String).sort()).toEqual([String(a._id), String(b._id)].sort());
+    });
+
     it("notifies and emails only the newly added accountants", async () => {
       const sent = jest
         .spyOn(emailService, "sendClientAssignedEmail")
