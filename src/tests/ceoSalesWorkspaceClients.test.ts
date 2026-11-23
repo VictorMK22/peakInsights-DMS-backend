@@ -154,7 +154,7 @@ describe("allocating won clients", () => {
         .post(`/api/clients/${id}/allocate-accountant`)
         .set(auth(token))
         .send({ accountantIds });
-    // A client a sales person won — they stay on it while accountants serve.
+    // A client a sales person won — once accountants are allocated, only they serve it.
     const wonBySales = async (sales: string) => {
       const made = await post(sales, { name: "Sales Win" });
       const id = made.body.data.client._id as string;
@@ -162,9 +162,9 @@ describe("allocating won clients", () => {
       return id;
     };
 
-    it("allocates two accountants like an existing client: both assigned, first is primary, sales person kept", async () => {
+    it("allocates two accountants like an existing client: both assigned, first is primary, sales person taken off", async () => {
       const { token: ceo } = await createUserWithToken("ceo");
-      const { user: salesUser, token: sales } = await createUserWithToken("sales_person");
+      const { token: sales } = await createUserWithToken("sales_person");
       const { user: a } = await createUserWithToken("accountant");
       const { user: b } = await createUserWithToken("accountant");
       const id = await wonBySales(sales);
@@ -174,7 +174,7 @@ describe("allocating won clients", () => {
 
       const stored = await ClientModel.findById(id).lean();
       expect(stored!.assignedTo.map(String).sort()).toEqual(
-        [String(salesUser._id), String(a._id), String(b._id)].sort(),
+        [String(a._id), String(b._id)].sort(),
       );
       expect(String(stored!.allocatedAccountant)).toBe(String(a._id));
 
@@ -182,9 +182,9 @@ describe("allocating won clients", () => {
       expect(pending.body.data.clients).toEqual([]);
     });
 
-    it("a re-allocation replaces the team, keeps the primary if still on it, and keeps the sales person", async () => {
+    it("a re-allocation replaces the team, keeps the primary if still on it, and the sales person stays off", async () => {
       const { token: ceo } = await createUserWithToken("ceo");
-      const { user: salesUser, token: sales } = await createUserWithToken("sales_person");
+      const { token: sales } = await createUserWithToken("sales_person");
       const { user: a } = await createUserWithToken("accountant");
       const { user: b } = await createUserWithToken("accountant");
       const { user: c } = await createUserWithToken("accountant");
@@ -195,7 +195,7 @@ describe("allocating won clients", () => {
       expect(res.status).toBe(200);
       const stored = await ClientModel.findById(id).lean();
       expect(stored!.assignedTo.map(String).sort()).toEqual(
-        [String(salesUser._id), String(b._id), String(c._id)].sort(),
+        [String(b._id), String(c._id)].sort(),
       );
       // a (the old primary) is gone, so the first of the new list takes over
       expect(String(stored!.allocatedAccountant)).toBe(String(b._id));
@@ -345,16 +345,19 @@ describe("assigning clients", () => {
     expect((await assign(ceo, id, [String(acct._id)])).status).toBe(400);
   });
 
-  it("keeps people who are already on the client when others are added", async () => {
+  it("takes the sales person off a won client when its team is saved", async () => {
     const { token: ceo } = await createUserWithToken("ceo");
     const { token: sales, user: rep } = await createUserWithToken("sales_person");
     const { user: acct } = await createUserWithToken("accountant");
     const lead = await post(sales, { name: "Won By Rep" });
     const id = lead.body.data.client._id;
     await stage(sales, id, "won");
-    // the rep who won it stays assigned while an accountant is added
+    // the rep who won it is sent along by the UI, but is not kept
     const res = await assign(ceo, id, [String(rep._id), String(acct._id)]);
     expect(res.status).toBe(200);
+    const stored = await ClientModel.findById(id).lean();
+    expect(stored!.assignedTo.map(String)).toEqual([String(acct._id)]);
+    expect(String(stored!.allocatedAccountant)).toBe(String(acct._id));
   });
 });
 
@@ -493,6 +496,28 @@ describe("accountant supervisors and bulk assignment", () => {
 
     const pending = await request(app).get("/api/clients/awaiting-allocation").set(auth(ceo));
     expect(pending.body.data.clients).toEqual([]);
+  });
+
+  it("bulk assignment takes a sales person off a won client but keeps accountants already on it", async () => {
+    const { token: ceo } = await createUserWithToken("ceo");
+    const { token: sales, user: rep } = await createUserWithToken("sales_person");
+    const { user: first } = await createUserWithToken("accountant");
+    const { user: second } = await createUserWithToken("accountant");
+    const made = await post(sales, { name: "Won By Rep" });
+    const id = made.body.data.client._id as string;
+    await stage(sales, id, "won");
+    // legacy shape: sales person and an accountant both on the client
+    await ClientModel.updateOne(
+      { _id: id },
+      { $set: { assignedTo: [rep._id, first._id], allocatedAccountant: first._id } },
+    );
+
+    const res = await bulk(ceo, [id], [String(second._id)]);
+    expect(res.status).toBe(200);
+    const stored = await ClientModel.findById(id).lean();
+    expect(stored!.assignedTo.map(String).sort()).toEqual(
+      [String(first._id), String(second._id)].sort(),
+    );
   });
 
   it("lets the CEO include themself and accountant supervisors in a bulk assignment", async () => {

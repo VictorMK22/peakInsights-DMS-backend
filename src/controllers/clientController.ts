@@ -54,6 +54,30 @@ const canServeClient = (
 ) => role === "accountant" || accountantSupervisorIds.has(id);
 
 /**
+ * A won / existing client is served by accountants (and accountant
+ * supervisors, or the CEO personally) — never by the sales person who won it.
+ * Given the user ids on a client, returns only the ones allowed to stay.
+ */
+const servingOnly = async (
+  ids: string[],
+  accountantSupervisorIds: Set<string>,
+): Promise<string[]> => {
+  if (ids.length === 0) return [];
+  const users = await User.find({ _id: { $in: ids } })
+    .select("role")
+    .lean();
+  return ids.filter((id) => {
+    const u = users.find((x) => String(x._id) === id);
+    return (
+      !!u &&
+      (u.role === "accountant" ||
+        u.role === "ceo" ||
+        canServeClient(u.role, id, accountantSupervisorIds))
+    );
+  });
+};
+
+/**
  * How a client is named in notifications and emails to staff: the company
  * (that is who the firm works for), falling back to the contact person's name
  * for clients that have no company recorded.
@@ -915,8 +939,9 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
     //   prospect (still in the pipeline)  → sales people
     //   existing / won client             → accountants and accountant
     //                                       supervisors
-    // and in both cases the CEO may assign THEMSELF. People already on the
-    // client (e.g. the sales person who won it) are kept as they are.
+    // and in both cases the CEO may assign THEMSELF. A won / existing client
+    // is served by accountants only, so a sales person (e.g. the one who won
+    // it) is taken off it when its team is saved.
     const prospect = current.isSalesLead && current.salesStage !== "won";
     const already = new Set(current.assignedTo.map((id) => id.toString()));
     const newIds = [...new Set(userIds.map(String))].filter(
@@ -944,18 +969,21 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
           : "A client can only be assigned to accountants, accountant supervisors (or yourself)",
       });
 
+    // Won / existing clients keep accountants only — drop anyone else.
+    const finalIds = prospect ? userIds : await servingOnly(userIds, supervisorIds);
+
     // A won client keeps a PRIMARY accountant (`allocatedAccountant`) next to
     // its assignees. Setting the team here keeps that in step, so assigning
     // accountants to a won client the ordinary way also clears "Awaiting
     // accountant" and a removed primary is replaced by someone still serving.
     let primaryUpdate: { $set?: Record<string, unknown>; $unset?: Record<string, 1> } = {};
     if (!prospect && current.isSalesLead) {
-      const roles = userIds.length
-        ? await User.find({ _id: { $in: userIds } })
+      const roles = finalIds.length
+        ? await User.find({ _id: { $in: finalIds } })
             .select("role")
             .lean()
         : [];
-      const serving = userIds.filter((id) => {
+      const serving = finalIds.filter((id) => {
         const u = roles.find((r) => String(r._id) === id);
         return (
           !!u &&
@@ -980,10 +1008,10 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
       req.params.id,
       {
         $set: {
-          assignedTo: userIds.map((id) => new mongoose.Types.ObjectId(id)),
+          assignedTo: finalIds.map((id) => new mongoose.Types.ObjectId(id)),
           assignedAt: new Date(),
           // Putting someone on the client answers the "accountant left" queue.
-          ...(!prospect && userIds.length > 0
+          ...(!prospect && finalIds.length > 0
             ? { needsReallocation: false }
             : {}),
           ...(primaryUpdate.$set ?? {}),
@@ -1044,9 +1072,10 @@ export const assignClient = async (req: AuthRequest, res: Response) => {
 // CEO picks several won / existing clients and puts the chosen accountants
 // / accountant supervisors (or themself) on all of them at once.
 //
-// It only ADDS people: everyone already on a client (including the sales
-// person who won it) stays, because the selected clients each have a
-// different set of assignees. Use the per-client assign to remove someone.
+// It only ADDS accountants: the accountants already on a client stay, because
+// the selected clients each have a different set of assignees (use the
+// per-client assign to remove one). A sales person still on a won / existing
+// client is taken off, as these clients are served by accountants only.
 //
 // A won prospect that has no allocated accountant yet also gets the FIRST
 // person in `userIds` as its allocated accountant, so it stops showing as
@@ -1130,6 +1159,11 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
     const toObjectId = (id: string) => new mongoose.Types.ObjectId(id);
     const now = new Date();
     const primaryId = uniqueUserIds[0];
+    // Who on these clients may stay (accountants / supervisors / CEO).
+    const everyoneOnClients = [
+      ...new Set(clients.flatMap((c) => c.assignedTo.map((id) => id.toString()))),
+    ];
+    const staying = new Set(await servingOnly(everyoneOnClients, supervisorIds));
     const ops: mongoose.AnyBulkWriteOperation<any>[] = [];
     const newlyAssigned = new Map<string, { id: string; name: string }[]>();
     const bulkAudit: { id: mongoose.Types.ObjectId; name?: string; added: string[] }[] = [];
@@ -1138,14 +1172,23 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
     for (const c of clients) {
       const have = new Set(c.assignedTo.map((id) => id.toString()));
       const added = uniqueUserIds.filter((id) => !have.has(id));
+      const keep = [...have].filter((id) => staying.has(id));
+      const hasOthers = keep.length !== have.size; // e.g. a sales person
       const needsAllocation =
         !!c.isSalesLead && c.salesStage === "won" && !c.allocatedAccountant;
-      if (added.length === 0 && !needsAllocation && !c.needsReallocation) {
+      if (
+        added.length === 0 &&
+        !hasOthers &&
+        !needsAllocation &&
+        !c.needsReallocation
+      ) {
         alreadyAssigned += 1;
         continue;
       }
 
-      const $set: Record<string, unknown> = {};
+      const $set: Record<string, unknown> = {
+        assignedTo: [...new Set([...keep, ...uniqueUserIds])].map(toObjectId),
+      };
       if (added.length > 0) $set.assignedAt = now;
       if (c.needsReallocation) $set.needsReallocation = false;
       if (needsAllocation) {
@@ -1157,10 +1200,7 @@ export const bulkAssignClients = async (req: AuthRequest, res: Response) => {
       ops.push({
         updateOne: {
           filter: { _id: c._id },
-          update: {
-            $addToSet: { assignedTo: { $each: uniqueUserIds.map(toObjectId) } },
-            $set,
-          },
+          update: { $set },
         },
       });
       for (const id of added) {
@@ -1282,9 +1322,10 @@ export const getAwaitingAllocation = async (
 //
 // With `accountantIds` the list IS the client's serving team: people on it are
 // added, people who served before but are not on it are taken off, and anyone
-// who is not a server (the sales person who won the client) is kept. With the
-// single `accountantId` the accountant is added and the previously allocated
-// accountant is replaced, as before.
+// who is not a server (the sales person who won the client) is taken off —
+// won clients are served by accountants only. With the single `accountantId`
+// the accountant is added and the previously allocated accountant is
+// replaced, as before.
 //
 // `allocatedAccountant` stays as the PRIMARY accountant (the first one chosen,
 // or the current primary if they are still on the team); the rest are ordinary
@@ -1354,7 +1395,7 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
       });
 
     // Work out who on the client today is a "server" (as opposed to the sales
-    // person who won it) so the sales person is never dropped by a reallocation.
+    // person who won it, who is taken off once accountants are allocated).
     const before = client.assignedTo.map((id) => id.toString());
     const beforeUsers = before.length
       ? await User.find({ _id: { $in: before } })
@@ -1381,8 +1422,9 @@ export const allocateAccountant = async (req: AuthRequest, res: Response) => {
     const primary =
       previous && team.includes(previous) ? previous : team[0];
 
-    const kept = before.filter((id) => !isServer(id)); // sales person etc.
-    const assignees = [...new Set([...kept, ...team])];
+    // Only accountants / supervisors / the CEO stay on a won client — the
+    // sales person who won it (or anyone else) is not kept.
+    const assignees = [...new Set(team)];
     const added = team.filter((id) => !before.includes(id));
     const removed = servingBefore.filter((id) => !team.includes(id));
     const primaryChanged = primary !== previous;
