@@ -18,6 +18,7 @@ import {
 } from "../services/salesReportService";
 import { sendSalesWeeklyReportEmail } from "../services/emailService";
 import { sweepBookingRequests } from "../services/bookingService";
+import { scheduleErrorReport } from "../services/errorReportService";
 
 // ═════════════════════════════════════════════════════════════════
 // These two endpoints replace the BullMQ-queued background jobs used
@@ -43,7 +44,16 @@ export const runEmailSync = async (req: Request, res: Response) => {
       .then((summary) =>
         console.log("Cron email sync (async) completed:", JSON.stringify(summary)),
       )
-      .catch((err) => console.error("Cron email sync (async) failed:", err));
+      .catch((err) => {
+        console.error("Cron email sync (async) failed:", err);
+        // Replied 202 already, so nothing else would ever surface this.
+        scheduleErrorReport({
+          source: "server",
+          error: err,
+          title: "Scheduled email sync failed",
+          context: { kind: "cron", method: "POST", route: "/api/cron/sync-emails" },
+        });
+      });
     waitUntil(job);
     res.status(202).json({ success: true, message: "Email sync started" });
     return;

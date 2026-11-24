@@ -1,6 +1,8 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import app from "../src/app";
 import { connectDatabaseServerless } from "../src/config/databaseServerless";
+import { scheduleErrorReport } from "../src/services/errorReportService";
+import { normalizePath } from "../src/utils/errorScrub";
 
 // ═════════════════════════════════════════════════════════════════
 // VERCEL SERVERLESS ENTRY POINT
@@ -34,7 +36,30 @@ import { connectDatabaseServerless } from "../src/config/databaseServerless";
 // ═════════════════════════════════════════════════════════════════
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  await connectDatabaseServerless();
+  // This runs BEFORE Express, so a failure here never reaches errorHandler —
+  // without this catch a database outage would be a bare platform 500 that
+  // nobody is told about.
+  try {
+    await connectDatabaseServerless();
+  } catch (err) {
+    console.error("Database connection failed:", err);
+    scheduleErrorReport({
+      source: "server",
+      error: err,
+      title: "Database connection failed",
+      context: {
+        kind: "db-connect",
+        method: req.method,
+        route: normalizePath(req.url),
+        statusCode: 503,
+      },
+    });
+    res.status(503).json({
+      success: false,
+      message: "The service is temporarily unavailable. Please try again shortly.",
+    });
+    return;
+  }
   // Express apps are valid (req, res) => void handlers themselves —
   // no adapter library needed.
   return (app as unknown as (req: VercelRequest, res: VercelResponse) => void)(

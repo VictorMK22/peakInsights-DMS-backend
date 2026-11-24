@@ -73,6 +73,12 @@ export const serveFile = async (req: Request, res: Response): Promise<void> => {
       filename: safeName,
       forceAttachment: download === "1",
     });
+    // Helmet's default (same-origin) stops the browser embedding this file in
+    // an <img> on the frontend's origin — which is a different origin from
+    // the API. Access is already gated by the signed, expiring token above,
+    // so allowing cross-origin embedding adds no exposure. Needed for
+    // screenshot thumbnails on error reports.
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     res.redirect(302, s3Url);
   } catch (err) {
     console.error("serveFile error:", err);

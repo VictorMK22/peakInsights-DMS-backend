@@ -5,6 +5,7 @@ import { initSocket } from "./socket/socketServer";
 import { initYjsServer } from "./yjs/yjsServer";
 import { connectDatabase } from "./config/database";
 import { startEmailSyncScheduler } from "./config/emailSyncQueue";
+import { reportError } from "./services/errorReportService";
 
 // ═════════════════════════════════════════════════════════════════
 // TRADITIONAL / LOCAL DEV ENTRY POINT — run via `npm run dev` / `npm
@@ -33,6 +34,13 @@ const startServer = async () => {
     });
   } catch (error) {
     console.error("❌ Failed to start server:", error);
+    // Await so the alert is sent before the process exits.
+    await reportError({
+      source: "server",
+      error,
+      title: "Server failed to start",
+      context: { kind: "startup" },
+    });
     process.exit(1);
   }
 };

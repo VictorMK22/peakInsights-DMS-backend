@@ -5,6 +5,14 @@ import helmet from "helmet";
 import morgan from "morgan";
 import rateLimit from "express-rate-limit";
 import { errorHandler, notFound } from "./middleware/errorHandler";
+import {
+  requestContext,
+  installConsoleErrorCapture,
+} from "./middleware/requestContext";
+import {
+  installProcessErrorHandlers,
+  isReportingEnabled,
+} from "./services/errorReportService";
 import { validateWhatsappEnv } from "./config/validateWhatsappEnv";
 
 import authRoutes from "./routes/auth";
@@ -33,6 +41,7 @@ import calendarBlockRoutes from "./routes/calendarBlocks";
 import bookingLinkRoutes from "./routes/bookingLinks";
 import publicBookingRoutes from "./routes/publicBooking";
 import todoRoutes from "./routes/todos";
+import errorReportRoutes from "./routes/errorReports";
 
 // ── ICT workspace routes ────────────────────────────────────────
 import projectRoutes from "./routes/projects";
@@ -52,6 +61,11 @@ dotenv.config();
 // Runs once per process (cold start on Vercel, once at boot locally) —
 // app.ts is the shared module both entry points import.
 validateWhatsappEnv();
+
+// Error reporting: catch crashes nothing else caught, and remember Errors that
+// handlers console.error() before answering 500 (see middleware/requestContext).
+installProcessErrorHandlers();
+if (isReportingEnabled()) installConsoleErrorCapture();
 
 // ═════════════════════════════════════════════════════════════════
 // This file builds and exports the configured Express app, with NO
@@ -102,7 +116,14 @@ app.use(
   }),
 );
 
-app.use(cors({ origin: FRONTEND_URL, credentials: true }));
+// X-Request-Id is exposed so the browser can show it when something fails.
+app.use(
+  cors({
+    origin: FRONTEND_URL,
+    credentials: true,
+    exposedHeaders: ["X-Request-Id"],
+  }),
+);
 app.use(morgan("dev"));
 
 // The `verify` callback stashes the exact raw bytes of every JSON body
@@ -136,6 +157,10 @@ app.use(
     skip: (req) => req.path.startsWith("/webhooks/"),
   }),
 );
+
+// After the body parsers on purpose: AsyncLocalStorage context is lost
+// across body-parser's stream callbacks, so it must start after them.
+app.use(requestContext);
 
 app.use((req, _res, next) => {
   console.log("→", req.method, req.url);
@@ -176,6 +201,7 @@ app.use("/api/notifications", notificationRoutes);
 app.use("/api/presence", presenceRoutes);
 app.use("/api/calendar-blocks", calendarBlockRoutes);
 app.use("/api/todos", todoRoutes);
+app.use("/api/error-reports", errorReportRoutes);
 app.use("/api/projects", projectRoutes);
 app.use("/api/tickets", ticketRoutes);
 app.use("/api/assets", assetRoutes);

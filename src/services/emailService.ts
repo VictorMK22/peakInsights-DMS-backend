@@ -1166,3 +1166,282 @@ export async function sendSalesWeeklyReportEmail(
     ),
   );
 }
+
+// ═════════════════════════════════════════════════════════════════
+// ERROR REPORTS — alerts to the tech supervisor, and the two-way
+// conversation between a person who reported a problem and the ICT team.
+// Everything interpolated into the HTML is escaped: error messages and
+// user comments are untrusted text.
+// ═════════════════════════════════════════════════════════════════
+
+const SEVERITY_COLORS: Record<string, string> = {
+  critical: "#dc2626",
+  high: "#ea580c",
+  medium: "#ca8a04",
+  low: "#2563eb",
+};
+
+const sevChip = (severity: string) =>
+  `<span style="display:inline-block;padding:2px 10px;border-radius:999px;background:${SEVERITY_COLORS[severity] ?? "#64748b"};color:#fff;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;">${esc(severity)}</span>`;
+
+const preBlock = (text: string) =>
+  `<pre style="margin:8px 0 16px;padding:12px;background:#0f172a;color:#e2e8f0;border-radius:8px;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;">${esc(text)}</pre>`;
+
+/** Link that opens a report for whoever clicks it (see /error-reports on the frontend). */
+export const buildErrorReportUrl = (reportId: string): string =>
+  `${APP_URL}/error-reports?report=${encodeURIComponent(reportId)}`;
+
+const oneLine = (s: string, max = 150) =>
+  s.replace(/\s+/g, " ").trim().slice(0, max);
+
+export interface ErrorAlertEmailData {
+  reportId: string;
+  reportNumber: string;
+  severity: string;
+  source: "server" | "client" | "user_report";
+  title: string;
+  message?: string;
+  stack?: string;
+  method?: string;
+  route?: string;
+  pageUrl?: string;
+  statusCode?: number;
+  kind?: string;
+  userAgent?: string;
+  requestId?: string;
+  /** "Jane Doe (sales_person)" — who it happened to. */
+  userLabel?: string;
+  occurredAt: Date;
+  occurrences: number;
+  /** Occurrences since the previous alert for this same error. */
+  sinceLastAlert?: number;
+  /** True when this is a repeat alert for a still-unacknowledged error. */
+  isRepeat?: boolean;
+}
+
+/**
+ * Sent to the tech supervisor when an error occurs anywhere in the system
+ * (server, browser, background job). Returns true if the email was sent.
+ */
+export async function sendErrorAlertEmail(
+  to: string,
+  toName: string | undefined,
+  d: ErrorAlertEmailData,
+): Promise<boolean> {
+  const where =
+    d.source === "client"
+      ? (d.pageUrl ?? "browser")
+      : [d.method, d.route].filter(Boolean).join(" ") || "server";
+  const sourceLabel =
+    d.source === "client" ? "Browser (frontend)" : "Server (API / background)";
+
+  const repeatNote = d.isRepeat
+    ? highlight(
+        `<strong>This error is still happening.</strong> It has occurred ${d.occurrences} time${d.occurrences === 1 ? "" : "s"} in total` +
+          (d.sinceLastAlert ? ` (${d.sinceLastAlert} since the last alert)` : "") +
+          `. You will not get another email for it once you acknowledge it.`,
+      )
+    : d.occurrences > 1
+      ? highlight(`This error has occurred ${d.occurrences} times.`)
+      : "";
+
+  const html = wrap(
+    "Error alert",
+    `
+      ${h1("An error occurred in the system")}
+      ${p(
+        "Hi " +
+          esc(toName ?? "there") +
+          ", PeakInsights Hub captured an error that needs the tech team's attention.",
+      )}
+      <p style="margin:0 0 12px;">${sevChip(d.severity)}</p>
+      ${info("Reference", esc(d.reportNumber))}
+      ${info("Where", esc(where))}
+      ${info("Source", esc(sourceLabel))}
+      ${d.statusCode ? info("Response", String(d.statusCode)) : ""}
+      ${d.kind ? info("Type", esc(d.kind)) : ""}
+      ${info("When", esc(formatEatDateTime(d.occurredAt)))}
+      ${d.userLabel ? info("Affected user", esc(d.userLabel)) : ""}
+      ${d.requestId ? info("Request ID", esc(d.requestId)) : ""}
+      ${d.userAgent ? info("Browser", esc(oneLine(d.userAgent, 120))) : ""}
+      ${repeatNote}
+      ${d.message ? `<p style="margin:16px 0 4px;font-size:13px;font-weight:700;color:#0f172a;">Error message</p>${preBlock(d.message)}` : ""}
+      ${
+        d.stack
+          ? `<p style="margin:0 0 4px;font-size:13px;font-weight:700;color:#0f172a;">Stack trace</p>${preBlock(d.stack.split("\n").slice(0, 14).join("\n"))}`
+          : ""
+      }
+      ${btn("Open error report", buildErrorReportUrl(d.reportId), "#dc2626")}
+    `,
+  );
+
+  const sent = await send(
+    to,
+    `🚨 ${d.severity.toUpperCase()} · ${d.reportNumber} · ${oneLine(d.title)}`,
+    html,
+  );
+  return sent !== null;
+}
+
+export interface UserErrorReportEmailData {
+  reportId: string;
+  reportNumber: string;
+  severity: string;
+  title: string;
+  description?: string;
+  reporterName: string;
+  reporterEmail?: string;
+  reporterRole?: string;
+  pageUrl?: string;
+  requestId?: string;
+  lastApiError?: string;
+  screenshotCount: number;
+  /** Set when the report was linked to an auto-captured server error. */
+  relatedReportNumber?: string;
+  occurredAt: Date;
+}
+
+/**
+ * A person pressed "Report a problem" and shared it with the tech
+ * supervisor. Their screenshots are attached to the email itself, so they
+ * can be read straight from the inbox. Reply-To is the reporter, so
+ * replying to the email reaches them directly.
+ */
+export async function sendUserErrorReportEmail(
+  to: string,
+  toName: string | undefined,
+  d: UserErrorReportEmailData,
+  attachments: MailAttachment[],
+): Promise<boolean> {
+  const html = wrap(
+    "Problem reported",
+    `
+      ${h1("A user reported a problem")}
+      ${p(
+        "Hi " +
+          esc(toName ?? "there") +
+          ", <strong>" +
+          esc(d.reporterName) +
+          "</strong> shared a problem with you from PeakInsights Hub.",
+      )}
+      <p style="margin:0 0 12px;">${sevChip(d.severity)}</p>
+      ${info("Reference", esc(d.reportNumber))}
+      ${info("Reported by", esc(d.reporterName + (d.reporterRole ? ` (${d.reporterRole})` : "")))}
+      ${d.reporterEmail ? info("Email", esc(d.reporterEmail)) : ""}
+      ${d.pageUrl ? info("Page", esc(d.pageUrl)) : ""}
+      ${d.requestId ? info("Request ID", esc(d.requestId)) : ""}
+      ${d.relatedReportNumber ? info("Linked server error", esc(d.relatedReportNumber)) : ""}
+      ${info("Screenshots", d.screenshotCount ? `${d.screenshotCount} attached to this email` : "none")}
+      ${info("When", esc(formatEatDateTime(d.occurredAt)))}
+      ${d.description ? `<p style="margin:16px 0 4px;font-size:13px;font-weight:700;color:#0f172a;">What they said</p>${highlight(esc(d.description).replace(/\n/g, "<br />"))}` : ""}
+      ${d.lastApiError ? `<p style="margin:0 0 4px;font-size:13px;font-weight:700;color:#0f172a;">Last failed request seen by their browser</p>${preBlock(d.lastApiError)}` : ""}
+      ${btn("Open report & reply", buildErrorReportUrl(d.reportId), "#0ea5e9")}
+      ${p('<span style="font-size:13px;color:#64748b;">You can also reply to this email — it goes straight to ' + esc(d.reporterName) + ".</span>")}
+    `,
+  );
+
+  const sent = await send(
+    to,
+    `🐞 ${d.reportNumber} · ${oneLine(d.reporterName, 60)} reported: ${oneLine(d.title, 110)}`,
+    html,
+    d.reporterEmail,
+    undefined,
+    attachments,
+    { fromName: d.reporterName },
+  );
+  return sent !== null;
+}
+
+export interface ErrorReportCommentEmailData {
+  reportId: string;
+  reportNumber: string;
+  title: string;
+  authorName: string;
+  authorRole?: string;
+  body: string;
+  screenshotCount: number;
+  /** Who this email is for. */
+  audience: "ict" | "reporter";
+}
+
+/** A new comment on a report — to the ICT team, or back to the reporter. */
+export async function sendErrorReportCommentEmail(
+  to: string,
+  toName: string | undefined,
+  d: ErrorReportCommentEmailData,
+  attachments: MailAttachment[],
+  replyTo?: string,
+): Promise<boolean> {
+  const html = wrap(
+    "New comment on error report",
+    `
+      ${h1(d.audience === "ict" ? "New comment on a reported problem" : "The tech team replied to your report")}
+      ${p(
+        "Hi " +
+          esc(toName ?? "there") +
+          ", <strong>" +
+          esc(d.authorName) +
+          "</strong> commented on <strong>" +
+          esc(d.reportNumber) +
+          "</strong> — " +
+          esc(oneLine(d.title, 120)) +
+          ".",
+      )}
+      ${d.body ? highlight(esc(d.body).replace(/\n/g, "<br />")) : ""}
+      ${d.screenshotCount ? p(`${d.screenshotCount} screenshot${d.screenshotCount === 1 ? "" : "s"} attached.`) : ""}
+      ${btn(d.audience === "ict" ? "Open report & reply" : "View the conversation", buildErrorReportUrl(d.reportId))}
+    `,
+  );
+  const sent = await send(
+    to,
+    `💬 ${d.reportNumber} · new comment from ${oneLine(d.authorName, 60)}`,
+    html,
+    replyTo,
+    undefined,
+    attachments,
+    { fromName: d.authorName },
+  );
+  return sent !== null;
+}
+
+/** Tells the reporter their report was resolved (or re-opened). */
+export async function sendErrorReportStatusEmail(
+  to: string,
+  toName: string | undefined,
+  d: {
+    reportId: string;
+    reportNumber: string;
+    title: string;
+    status: string;
+    byName: string;
+  },
+): Promise<boolean> {
+  const resolved = d.status === "resolved";
+  const html = wrap(
+    "Report status updated",
+    `
+      ${h1(resolved ? "Your reported problem was marked resolved" : "Your report status changed")}
+      ${p(
+        "Hi " +
+          esc(toName ?? "there") +
+          ", <strong>" +
+          esc(d.byName) +
+          "</strong> set <strong>" +
+          esc(d.reportNumber) +
+          "</strong> (" +
+          esc(oneLine(d.title, 120)) +
+          ") to <strong>" +
+          esc(d.status.replace("_", " ")) +
+          "</strong>.",
+      )}
+      ${resolved ? highlight("If it's still not working for you, just reply on the report and it will be re-opened.") : ""}
+      ${btn("View report", buildErrorReportUrl(d.reportId))}
+    `,
+  );
+  const sent = await send(
+    to,
+    `${resolved ? "✅" : "ℹ️"} ${d.reportNumber} · ${d.status.replace("_", " ")}`,
+    html,
+  );
+  return sent !== null;
+}
