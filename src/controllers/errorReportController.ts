@@ -38,15 +38,33 @@ const clean = (v: unknown, max: number): string =>
 const idOk = (id: unknown): id is string =>
   typeof id === "string" && mongoose.isValidObjectId(id);
 
-/** CEO, Tech staff, and supervisors of a Tech department (same rule as requireIctAccess). */
+/**
+ * ONLY a supervisor of a Tech department. The CEO and Tech staff are
+ * deliberately NOT included: the error reports queue belongs to the tech
+ * supervisor alone. Everyone else reports through "Report a problem" and can
+ * only ever see the reports they filed themselves.
+ */
 const hasIctAccess = async (req: AuthRequest): Promise<boolean> => {
-  const role = req.user?.role;
-  if (role === "ceo" || role === "tech") return true;
-  if (role === "supervisor") {
-    const me = await User.findById(req.user!.userId).select("department");
-    return isTechDepartmentName(me?.department);
+  if (req.user?.role !== "supervisor") return false;
+  const me = await User.findById(req.user.userId).select("department");
+  return isTechDepartmentName(me?.department);
+};
+
+/** Route guard for everything that is the tech supervisor's alone. */
+export const requireTechSupervisor = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    if (await hasIctAccess(req)) return next();
+    res.status(403).json({
+      success: false,
+      message: "Only the tech supervisor can access error reports.",
+    });
+  } catch (err) {
+    next(err);
   }
-  return false;
 };
 
 const isOwner = (report: IErrorReport, userId: string): boolean =>

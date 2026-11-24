@@ -662,6 +662,50 @@ describe("conversation + triage", () => {
   });
 });
 
+describe("only the tech supervisor has the error reports", () => {
+  it("the CEO and Tech staff cannot list, open, comment on or triage other people's reports", async () => {
+    const tech = await techSupervisor();
+    const reporter = await createUserWithToken("sales_person");
+    const created = await request(app).post("/api/error-reports").set(auth(reporter.token)).field("description", "broken").field("severity", "high");
+    const id = created.body.data.report._id;
+
+    for (const role of ["ceo", "tech"] as const) {
+      const u = await createUserWithToken(role);
+      expect((await request(app).get("/api/error-reports").set(auth(u.token))).status).toBe(403);
+      expect((await request(app).get(`/api/error-reports/${id}`).set(auth(u.token))).status).toBe(404);
+      expect((await request(app).post(`/api/error-reports/${id}/comments`).set(auth(u.token)).field("body", "x")).status).toBe(404);
+      expect((await request(app).patch(`/api/error-reports/${id}`).set(auth(u.token)).send({ status: "resolved" })).status).toBe(403);
+    }
+    // the tech supervisor still can
+    expect((await request(app).get("/api/error-reports").set(auth(tech.token))).status).toBe(200);
+  });
+
+  it("a supervisor outside the Tech department cannot either", async () => {
+    await techSupervisor();
+    const sales = await createUserWithToken("supervisor");
+    await User.updateOne({ _id: sales.user._id }, { department: "Sales" });
+    expect((await request(app).get("/api/error-reports").set(auth(sales.token))).status).toBe(403);
+  });
+
+  it("the CEO and Tech staff can still report a problem and follow their OWN report", async () => {
+    const tech = await techSupervisor();
+    for (const role of ["ceo", "tech"] as const) {
+      const u = await createUserWithToken(role);
+      const res = await request(app).post("/api/error-reports").set(auth(u.token)).field("description", `from ${role}`).field("severity", "high");
+      expect(res.status).toBe(201);
+      const id = res.body.data.report._id;
+      const mine = await request(app).get("/api/error-reports/mine").set(auth(u.token));
+      expect(mine.body.data.reports).toHaveLength(1);
+      const own = await request(app).get(`/api/error-reports/${id}`).set(auth(u.token));
+      expect(own.status).toBe(200);
+      expect(own.body.data.report.stack).toBeUndefined(); // reporter view, not triage view
+      // the tech supervisor is the one who gets told
+      expect(await Notification.countDocuments({ userId: tech.user._id, type: "error_report_new" })).toBeGreaterThan(0);
+      await Notification.deleteMany({});
+    }
+  });
+});
+
 describe("POST /api/error-reports/client (browser errors)", () => {
   it("accepts an anonymous browser crash, de-duplicates it, alerts once", async () => {
     await techSupervisor();

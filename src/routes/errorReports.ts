@@ -1,6 +1,6 @@
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
-import { authenticate, requireIctAccess } from "../middleware/auth";
+import { authenticate } from "../middleware/auth";
 import { screenshotUpload } from "../middleware/screenshotUpload";
 import {
   createUserReport,
@@ -11,6 +11,7 @@ import {
   updateReport,
   reportClientError,
   tryAuthenticate,
+  requireTechSupervisor,
 } from "../controllers/errorReportController";
 import { AuthRequest } from "../types/auth";
 
@@ -45,9 +46,9 @@ router.use(authenticate);
 // Order matters: fixed paths before "/:id".
 router.get("/mine", listMine);
 router.post("/", submitLimiter, ...screenshotUpload, createUserReport);
-router.get("/", requireIctAccess, listAll);
+router.get("/", requireTechSupervisor, listAll);
 router.get("/:id", getReport);
 router.post("/:id/comments", submitLimiter, ...screenshotUpload, addComment);
-router.patch("/:id", requireIctAccess, updateReport);
+router.patch("/:id", requireTechSupervisor, updateReport);
 
 export default router;
