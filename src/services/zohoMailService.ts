@@ -136,7 +136,7 @@ export interface ZohoMessageSummary {
   toAddress: string;
   ccAddress?: string; // other recipients — a client can be on the Cc line
   receivedTime: string; // epoch millis as string
-  /** When the sender actually sent it (same in every recipient's copy), epoch millis as string. */
+  /** Zoho's `sentDateInGMT`. UNRELIABLE: shifted by the mailbox account's timezone offset. Use receivedTime for real times; this is only kept for the legacy dedupe fingerprint. */
   sentTime?: string;
   /** Whether the mailbox owner has opened it in Zoho. undefined = Zoho didn't say. */
   isRead?: boolean;

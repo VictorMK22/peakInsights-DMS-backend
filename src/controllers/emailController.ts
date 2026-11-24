@@ -522,22 +522,20 @@ export const getInboxEmails = async (
     const { page, limit } = parsePage(req.query as Record<string, string>);
     const skip = (page - 1) * limit;
 
+    // The inbox is mail OTHER people sent me (to me, Cc'd, or as a thread
+    // participant). Mail I sent lives in Sent only — it must not appear here.
+    // One exception keeps conversations working: when someone replies to a
+    // thread I started, that thread surfaces here (it has a reply for me).
+    const me = new mongoose.Types.ObjectId(userId);
+    const threadsRepliedToMe = await EmailLog.distinct("parentId", {
+      parentId: { $ne: null },
+      senderId: { $ne: me },
+      $or: [{ receiverId: me }, { ccIds: me }],
+    });
     const baseFilter = {
       $or: [
-        { receiverId: userId, parentId: null },
-        // Own sent mail shows up here too — but an announcement only once
-        // (the lead copy), plus any recipient copy that got a reply so the
-        // broadcaster can actually see and answer it.
-        {
-          senderId: userId,
-          parentId: null,
-          $or: [
-            { broadcastId: { $exists: false } },
-            { broadcastLead: true },
-            { hasReplies: true },
-          ],
-        },
-        { ccIds: userId, parentId: null },
+        { receiverId: userId, parentId: null, senderId: { $ne: userId } },
+        { ccIds: userId, parentId: null, senderId: { $ne: userId } },
         // Anyone else on the thread — e.g. added to the Cc of a later
         // reply — sees the conversation in their inbox too.
         {
@@ -546,6 +544,7 @@ export const getInboxEmails = async (
           senderId: { $ne: userId },
           receiverId: { $ne: userId },
         },
+        { _id: { $in: threadsRepliedToMe }, parentId: null },
       ],
     };
     // ?unread=1 — only conversations with something I haven't opened: an
@@ -584,7 +583,6 @@ export const getInboxEmails = async (
     ]);
 
     const threadIds = emails.map((e) => e._id);
-    const me = new mongoose.Types.ObjectId(userId);
     const unreadReplyCounts = threadIds.length
       ? await EmailLog.aggregate([
           {

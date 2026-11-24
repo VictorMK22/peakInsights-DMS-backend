@@ -127,6 +127,62 @@ function computeMessageDedupeKey(msg: ZohoMessageSummary): string {
   return crypto.createHash("sha256").update(`msg::${normalized}`).digest("hex");
 }
 
+/** When the message really arrived, as epoch ms.
+ *
+ *  NOT Zoho's `sentDateInGMT`: despite its name it is shifted by the mailbox
+ *  account's timezone offset (for a US-Pacific account it reads 8 hours AHEAD),
+ *  which put emails in the future and made the same message carry a different
+ *  time in each mailbox. `receivedTime` is the real UTC instant. Never returns
+ *  a time later than now, so a bad value can't produce a future-dated email. */
+function deliveredAtMs(msg: ZohoMessageSummary): number {
+  const t = Number(msg.receivedTime);
+  return Number.isFinite(t) ? Math.min(t, Date.now()) : Date.now();
+}
+
+// Copies of one message (hub-sent row, sender's Sent copy, each recipient's
+// Inbox copy) are stamped seconds apart, never hours.
+const DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
+const escapeRegexSync = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Finds an email we already logged for this same message, however it got
+ *  there. The exact-fingerprint check misses mail sent from the hub itself
+ *  (those rows have no fingerprint, so the sync logged the delivered copy a
+ *  second time) and copies whose timestamps differ between mailboxes. Same
+ *  sender + same subject + close in time + at least one shared address. */
+async function findLoggedCopy(opts: {
+  senderId: unknown;
+  subject: string;
+  whenMs: number;
+  addresses: string[]; // To + Cc of the message, plus the mailbox owner
+  excludeId?: unknown; // ignore this row (used to look for a rival of a row just saved)
+  olderThanId?: string; // only rows with a lower _id (the race winner is the lowest)
+}): Promise<LoggedEmailRef | null> {
+  const win = {
+    $gte: new Date(opts.whenMs - DUPLICATE_WINDOW_MS),
+    $lte: new Date(opts.whenMs + DUPLICATE_WINDOW_MS),
+  };
+  const candidates = await EmailLog.find({
+    parentId: null,
+    senderId: opts.senderId,
+    ...(opts.excludeId ? { _id: { $ne: opts.excludeId } } : {}),
+    subject: new RegExp(`^${escapeRegexSync(opts.subject.trim())}$`, "i"),
+    // createdAt too: rows synced before the timestamp fix carry a shifted sentAt.
+    $or: [{ sentAt: win }, { createdAt: win }],
+  })
+    .select("senderId receiverId isRead toEmail toAddresses ccEmails")
+    .limit(20);
+
+  const wanted = new Set(opts.addresses.map((a) => a.toLowerCase()));
+  return (
+    candidates.find((c) =>
+      (!opts.olderThanId || String(c._id) < opts.olderThanId) &&
+      [c.toEmail, ...(c.toAddresses ?? []), ...(c.ccEmails ?? [])].some((a) =>
+        wanted.has(String(a).toLowerCase()),
+      ),
+    ) ?? null
+  );
+}
+
 /** Plain-text preview of an HTML email body: drops <style>/<script>/<head>,
  *  strips tags, decodes common entities, collapses whitespace. */
 function htmlToPreview(html: string, max = 200): string {
@@ -304,7 +360,8 @@ async function syncOneMailbox(
     );
   }
 
-  integration.lastSyncedAt = new Date(newestSeen);
+  // Never park the cursor in the future, or new mail would be skipped until then.
+  integration.lastSyncedAt = new Date(Math.min(newestSeen, Date.now()));
   integration.status = "connected";
   integration.lastError = undefined;
   await integration.save();
@@ -695,7 +752,7 @@ async function syncInternalMessage(
   accountId: string,
 ): Promise<boolean> {
   const epochMs = Number(msg.receivedTime);
-  const sentMs = Number(msg.sentTime ?? msg.receivedTime);
+  const sentMs = deliveredAtMs(msg);
   const dedupeKey = computeMessageDedupeKey(msg);
   // Emails logged before the message-level key existed use the pair-based one.
   const legacyKey = computeInternalDedupeKey(
@@ -712,6 +769,24 @@ async function syncInternalMessage(
   }).select("senderId receiverId isRead");
   if (existing) {
     await recordMailboxOwner(existing, integration.userId, readInZoho);
+    return false;
+  }
+
+  // Not seen by fingerprint — is it still a message we hold (sent from the hub,
+  // or logged from another mailbox with a different timestamp)? Join it
+  // instead of adding a second row.
+  const loggedCopy = await findLoggedCopy({
+    senderId: direction === "inbound" ? otherUserId : integration.userId,
+    subject: msg.subject,
+    whenMs: sentMs,
+    addresses: [
+      ...extractAllEmails(msg.toAddress),
+      ...extractAllEmails(msg.ccAddress ?? ""),
+      integration.emailAddress,
+    ],
+  });
+  if (loggedCopy) {
+    await recordMailboxOwner(loggedCopy, integration.userId, readInZoho);
     return false;
   }
 
@@ -739,7 +814,7 @@ async function syncInternalMessage(
   );
 
   try {
-    await EmailLog.create({
+    const created = await EmailLog.create({
       senderId: direction === "inbound" ? otherUserId : integration.userId,
       receiverId: direction === "inbound" ? integration.userId : otherUserId,
       toEmail:
@@ -758,6 +833,27 @@ async function syncInternalMessage(
       dedupeKey,
       attachments: attachments.length ? attachments : undefined,
     });
+
+    // Race guard: two syncs running at the same moment (cron + the Sync button,
+    // or two mailboxes) can both pass the check above and both insert. After
+    // saving, look for a rival; the LOWEST _id wins, the other removes itself.
+    const rival = await findLoggedCopy({
+      senderId: created.senderId,
+      subject: msg.subject,
+      whenMs: sentMs,
+      addresses: [
+        ...extractAllEmails(msg.toAddress),
+        ...extractAllEmails(msg.ccAddress ?? ""),
+        integration.emailAddress,
+      ],
+      excludeId: created._id,
+      olderThanId: String(created._id),
+    });
+    if (rival) {
+      await EmailLog.deleteOne({ _id: created._id });
+      await recordMailboxOwner(rival, integration.userId, readInZoho);
+      return false;
+    }
     return true;
   } catch (err: any) {
     if (err?.code === 11000) {
