@@ -9,22 +9,29 @@ import {
   parseEmailList,
 } from "../utils/errorScrub";
 
+// Fake credentials for testing the scrubber. They are ASSEMBLED AT RUNTIME on
+// purpose: a literal secret-shaped string in the source (even a made-up one)
+// trips GitHub secret scanning. `.invalid` is a reserved TLD that never resolves.
+const FAKE_DB_PASSWORD = ["fake", "password", "123"].join("");
+const FAKE_DB_URI = ["mongodb", "+srv://", "fakeuser", ":", FAKE_DB_PASSWORD, "@", "cluster.example.invalid", "/db"].join("");
+const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
+const FAKE_JWT = [b64({ alg: "HS256" }), b64({ userId: "12345678" }), "z".repeat(24)].join(".");
+const FAKE_BEARER = ["Bearer", ["fake", "token", "abc"].join("-")].join(" ");
+
 describe("scrub", () => {
   it("redacts bearer tokens, JWTs and DB credentials", () => {
-    const jwt =
-      "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOiIxMjM0NTY3OCJ9.abcdefghijk12345";
     const out = scrub(
-      `Authorization: Bearer abc.def-123 and ${jwt} at mongodb+srv://admin:p4ss@cluster0.mongodb.net/db`,
+      `Authorization: ${FAKE_BEARER} and ${FAKE_JWT} at ${FAKE_DB_URI}`,
     );
-    expect(out).not.toContain("abc.def-123");
-    expect(out).not.toContain(jwt);
-    expect(out).not.toContain("p4ss");
-    expect(out).toContain("mongodb+srv://[redacted]@cluster0.mongodb.net/db");
+    expect(out).not.toContain("fake-token-abc");
+    expect(out).not.toContain(FAKE_JWT);
+    expect(out).not.toContain(FAKE_DB_PASSWORD);
+    expect(out).toContain("mongodb+srv://[redacted]@cluster.example.invalid/db");
   });
 
   it("redacts secrets in query strings and key/value pairs", () => {
-    const out = scrub('GET /x?token=SECRET123&ok=1 {"password":"hunter2"} apiKey=abc');
-    expect(out).not.toMatch(/SECRET123|hunter2|apiKey=abc/);
+    const out = scrub('GET /x?token=NOTREAL123&ok=1 {"password":"notreal-pw"} apiKey=notreal-key');
+    expect(out).not.toMatch(/NOTREAL123|notreal-pw|notreal-key/);
     expect(out).toContain("ok=1");
   });
 

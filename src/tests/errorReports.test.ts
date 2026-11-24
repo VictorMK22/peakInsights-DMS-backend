@@ -89,6 +89,12 @@ const techSupervisor = async () => {
   return s;
 };
 
+// Assembled at runtime so no secret-shaped literal sits in the source
+// (GitHub secret scanning flags even made-up ones).
+const FAKE_DB_PASSWORD = ["fake", "password", "123"].join("");
+const FAKE_DB_URI = ["mongodb", "+srv://", "fakeuser", ":", FAKE_DB_PASSWORD, "@", "cluster.example.invalid"].join("");
+const FAKE_BEARER_TOKEN = ["fake", "token", "abc"].join("-");
+
 const boom = (msg = "db exploded") => new Error(msg);
 
 describe("reportError: who is alerted", () => {
@@ -194,11 +200,12 @@ describe("reportError: de-duplication", () => {
     await techSupervisor();
     await reportError({
       source: "server",
-      error: boom("connect failed mongodb+srv://admin:hunter2@c0.mongodb.net Bearer abc.def"),
+      error: boom(`connect failed ${FAKE_DB_URI} Bearer ${FAKE_BEARER_TOKEN}`),
     });
     const r = (await ErrorReport.findOne())!;
-    expect(r.message).not.toMatch(/hunter2|abc\.def/);
-    expect(r.stack ?? "").not.toMatch(/hunter2/);
+    expect(r.message).not.toContain(FAKE_DB_PASSWORD);
+    expect(r.message).not.toContain(FAKE_BEARER_TOKEN);
+    expect(r.stack ?? "").not.toContain(FAKE_DB_PASSWORD);
   });
 });
 
