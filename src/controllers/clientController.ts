@@ -19,7 +19,7 @@ import { createNotification } from "../services/notificationService";
 import { syncMyMailbox } from "../services/emailSyncService";
 import { EmailIntegrationModel } from "../models/EmailIntegration";
 import { getAccountantSupervisorIds } from "../utils/accountantSupervisors";
-import mongoose from "mongoose";
+import mongoose, { PipelineStage } from "mongoose";
 import { logClientActivity } from "../utils/clientAudit";
 import * as XLSX from "xlsx";
 
@@ -511,6 +511,10 @@ const buildClientListFilter = (
   query: Record<string, string>,
   uid: mongoose.Types.ObjectId,
   owners: mongoose.Types.ObjectId[] | null,
+  // Whose primary / secondary clients `accountantRole` means. The caller by
+  // default; the person picked with `?assignee=` when the CEO (or a
+  // supervisor, for their team) opens another accountant's list.
+  roleSubject: mongoose.Types.ObjectId = uid,
 ): Record<string, unknown> => {
   const { search, salesStage, salesOnly, tab, mine, accountantRole } = query;
   const filter: Record<string, unknown> = {};
@@ -536,14 +540,20 @@ const buildClientListFilter = (
     and.push({ isSalesLead: true, salesStage: { $ne: "won" } });
   else if (tab === "won")
     and.push({ $or: [{ isSalesLead: { $ne: true } }, { salesStage: "won" }] });
-  // GET /clients?accountantRole=primary|secondary — the caller's own clients
+  // GET /clients?accountantRole=primary|secondary — one person's clients
   // split by their part in serving them: the one primary accountant, or one of
-  // the secondary accountants (on the client but not the primary).
+  // the secondary accountants (on the client but not the primary). That
+  // person is the caller, or whoever `?assignee=` names (already checked
+  // against what the caller may look at — see checkAssignee).
   if (accountantRole === "primary" || accountantRole === "secondary") {
     and.push({ $or: [{ isSalesLead: { $ne: true } }, { salesStage: "won" }] });
-    if (accountantRole === "primary") and.push({ allocatedAccountant: uid });
+    if (accountantRole === "primary")
+      and.push({ allocatedAccountant: roleSubject });
     else
-      and.push({ assignedTo: uid }, { allocatedAccountant: { $ne: uid } });
+      and.push(
+        { assignedTo: roleSubject },
+        { allocatedAccountant: { $ne: roleSubject } },
+      );
   }
   if (search)
     and.push({
@@ -561,7 +571,11 @@ const buildClientListFilter = (
 const UNASSIGNED = "unassigned";
 
 type AssigneeCheck =
-  | { condition: Record<string, unknown> | null }
+  | {
+      condition: Record<string, unknown> | null;
+      /** The person asked for, when `?assignee=` named one (not "unassigned"). */
+      id?: mongoose.Types.ObjectId;
+    }
   | { error: { status: number; message: string } };
 
 /**
@@ -585,7 +599,7 @@ const checkAssignee = (
   const id = new mongoose.Types.ObjectId(raw);
   if (owners && !owners.some((o) => o.equals(id)))
     return { error: { status: 403, message: "Access denied" } };
-  return { condition: { assignedTo: id } };
+  return { condition: { assignedTo: id }, id };
 };
 
 const CLIENT_LIST_POPULATE = [
@@ -594,17 +608,81 @@ const CLIENT_LIST_POPULATE = [
   { path: "createdBy", select: "name role" },
 ] as const;
 
-// GET /clients
+// ── Alphabetical order ───────────────────────────────────────────
+// Client lists run A–Z by the name the app shows for a client: the company,
+// or the contact's name when no company is recorded. The collation makes it
+// case- and accent-insensitive and number-aware ("Client 2" before
+// "Client 10"); _id breaks ties so paging never repeats or skips a row.
+const NAME_COLLATION = {
+  locale: "en",
+  strength: 1,
+  numericOrdering: true,
+} as const;
+
+const ADD_SORT_LABEL: PipelineStage = {
+  $addFields: {
+    _sortLabel: {
+      $let: {
+        vars: { company: { $trim: { input: { $ifNull: ["$company", ""] } } } },
+        in: {
+          $cond: [
+            { $gt: [{ $strLenCP: "$$company" }, 0] },
+            "$$company",
+            { $trim: { input: { $ifNull: ["$name", ""] } } },
+          ],
+        },
+      },
+    },
+  },
+};
+const SORT_BY_LABEL: PipelineStage = { $sort: { _sortLabel: 1, _id: 1 } };
+
+/**
+ * The ids of the clients matching `filter`, A–Z, from `skip` on (at most
+ * `limit` of them when given). The order is computed in Mongo, so this hands
+ * back ids only — load them with loadClientsInOrder.
+ */
+const sortedClientIds = async (
+  filter: Record<string, unknown>,
+  skip = 0,
+  limit?: number,
+): Promise<mongoose.Types.ObjectId[]> => {
+  const rows = await ClientModel.aggregate<{ _id: mongoose.Types.ObjectId }>([
+    { $match: filter },
+    ADD_SORT_LABEL,
+    SORT_BY_LABEL,
+    ...(skip > 0 ? [{ $skip: skip }] : []),
+    ...(limit ? [{ $limit: limit }] : []),
+    { $project: { _id: 1 } },
+  ]).collation(NAME_COLLATION);
+  return rows.map((r) => r._id);
+};
+
+/** The listed clients (people populated) for `ids`, in the same order. */
+const loadClientsInOrder = async (ids: mongoose.Types.ObjectId[]) => {
+  if (ids.length === 0) return [];
+  const docs = await ClientModel.find({ _id: { $in: ids } })
+    .populate([...CLIENT_LIST_POPULATE])
+    .lean();
+  const byId = new Map(docs.map((c) => [String(c._id), c]));
+  return ids.flatMap((id) => byId.get(String(id)) ?? []);
+};
+
+// GET /clients — A–Z by client name (see NAME_COLLATION)
 //   ?assignee=<userId>     only that person's clients — the CEO may pick
 //                          anyone, a supervisor themself or their team
 //   ?assignee=unassigned   clients nobody is assigned to (CEO only)
+//   ?accountantRole=primary|secondary
+//                          with ?assignee=<userId>: that accountant's primary
+//                          (or secondary) clients; without it, the caller's
 export const getClients = async (req: AuthRequest, res: Response) => {
   try {
     const { page = "1", limit = "20", assignee } = req.query as Record<
       string,
       string
     >;
-    const skip = (Number(page) - 1) * Number(limit);
+    const pageNo = Math.max(parseInt(page, 10) || 1, 1);
+    const pageSize = Math.max(parseInt(limit, 10) || 20, 1);
     const uid = new mongoose.Types.ObjectId(req.user!.userId);
 
     const owners = await browsableOwnerIds(req);
@@ -620,29 +698,24 @@ export const getClients = async (req: AuthRequest, res: Response) => {
       req.query as Record<string, string>,
       uid,
       owners,
+      picked.id ?? uid,
     );
     if (picked.condition) filter = withCondition(filter, picked.condition);
 
-    const [clients, total] = await Promise.all([
-      ClientModel.find(filter)
-        .populate("assignedTo", "name email role profilePicture")
-        .populate("allocatedAccountant", "name email")
-        .populate("createdBy", "name role")
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(Number(limit))
-        .lean(),
+    const [ids, total] = await Promise.all([
+      sortedClientIds(filter, (pageNo - 1) * pageSize, pageSize),
       ClientModel.countDocuments(filter),
     ]);
+    const clients = await loadClientsInOrder(ids);
 
     res.json({
       success: true,
       data: { clients },
       pagination: {
-        page: Number(page),
-        limit: Number(limit),
+        page: pageNo,
+        limit: pageSize,
         total,
-        totalPages: Math.ceil(total / Number(limit)),
+        totalPages: Math.ceil(total / pageSize),
       },
     });
     return;
@@ -656,9 +729,10 @@ export const getClients = async (req: AuthRequest, res: Response) => {
 // assigned to (CEO and supervisors only). Takes the same mine / salesOnly /
 // salesStage / tab / search params as GET /clients.
 //
-//   ?perGroup=N   clients previewed per person (default 5, max 20; 0 = counts
-//                 only). Each group's `total` is always the full count — the
-//                 client opens a person's whole list with ?assignee=<id>.
+//   ?perGroup=N   clients previewed per person, A–Z (default 5, max 20; 0 =
+//                 counts only). Each group's `total` is always the full count
+//                 — the client opens a person's whole list with
+//                 ?assignee=<id>.
 //
 // A client assigned to several people is listed under each of them, so the
 // group totals can add up to more than `totalClients` (the distinct count).
@@ -692,7 +766,8 @@ export const getClientsGrouped = async (req: AuthRequest, res: Response) => {
         ids?: mongoose.Types.ObjectId[];
       }>([
         { $match: filter },
-        { $sort: { createdAt: -1 } },
+        ADD_SORT_LABEL,
+        SORT_BY_LABEL,
         { $unwind: "$assignedTo" },
         ...(scope ? [{ $match: { assignedTo: { $in: scope } } }] : []),
         {
@@ -709,7 +784,7 @@ export const getClientsGrouped = async (req: AuthRequest, res: Response) => {
               },
             ]
           : []),
-      ]),
+      ]).collation(NAME_COLLATION),
       scope
         ? 0
         : ClientModel.countDocuments(withCondition(filter, UNASSIGNED_CONDITION)),
@@ -718,13 +793,11 @@ export const getClientsGrouped = async (req: AuthRequest, res: Response) => {
 
     const unassignedIds =
       !scope && perGroup > 0 && unassignedTotal > 0
-        ? (
-            await ClientModel.find(withCondition(filter, UNASSIGNED_CONDITION))
-              .sort({ createdAt: -1 })
-              .limit(perGroup)
-              .select("_id")
-              .lean()
-          ).map((c) => c._id as mongoose.Types.ObjectId)
+        ? await sortedClientIds(
+            withCondition(filter, UNASSIGNED_CONDITION),
+            0,
+            perGroup,
+          )
         : [];
 
     // Who the groups belong to. A supervisor's whole active team is listed

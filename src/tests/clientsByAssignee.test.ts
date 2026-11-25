@@ -211,21 +211,15 @@ describe("GET /clients/grouped — a supervisor", () => {
     expect(groupOf(res, "Sue").clients.map((c: any) => c.name)).toEqual(["Mine"]);
   });
 
-  it("previews the newest clients but reports the full total", async () => {
+  it("previews the first clients A–Z but reports the full total", async () => {
     const { sup, ann, mk } = await setup();
-    const made = [];
-    for (let i = 1; i <= 4; i++) made.push(await mk(`Client ${i}`, [ann]));
-    // Make the order unambiguous: Client 4 newest ... Client 1 oldest.
-    for (const [i, c] of made.entries())
-      await ClientModel.collection.updateOne(
-        { _id: c._id },
-        { $set: { createdAt: new Date(2026, 0, 1 + i) } },
-      );
+    // Created in reverse so creation order and A–Z order disagree.
+    for (let i = 4; i >= 1; i--) await mk(`Client ${i}`, [ann]);
 
     const res = await grouped(sup.token, "perGroup=2");
     const g = groupOf(res, "Ann");
     expect(g.total).toBe(4);
-    expect(g.clients.map((c: any) => c.name)).toEqual(["Client 4", "Client 3"]);
+    expect(g.clients.map((c: any) => c.name)).toEqual(["Client 1", "Client 2"]);
   });
 
   it("perGroup=0 returns counts only", async () => {
@@ -322,5 +316,93 @@ describe("GET /clients/grouped — access", () => {
     const sales = await createUserWithToken("sales_person");
     expect((await grouped(ann.token)).status).toBe(403);
     expect((await grouped(sales.token)).status).toBe(403);
+  });
+});
+
+describe("GET /clients — alphabetical order", () => {
+  const order = (res: request.Response) =>
+    res.body.data.clients.map((c: any) => c.company?.trim() || c.name);
+
+  it("sorts by company, else name, ignoring case, with numbers in natural order", async () => {
+    const { ceo, mk } = await setup();
+    await mk("zed", []);
+    await mk("Contact Z", [], { company: "Beta Ltd" });
+    await mk("Client 10", []);
+    await mk("Client 2", []);
+    await mk("alpha", []);
+    await mk("Contact A", [], { company: "   " }); // blank company -> name
+    const res = await list(ceo.token);
+    expect(order(res)).toEqual([
+      "alpha",
+      "Beta Ltd",
+      "Client 2",
+      "Client 10",
+      "Contact A",
+      "zed",
+    ]);
+  });
+
+  it("keeps the order across pages without repeats", async () => {
+    const { ceo, mk } = await setup();
+    for (const n of ["E", "C", "A", "D", "B"]) await mk(`Co ${n}`, []);
+    const p1 = await list(ceo.token, "limit=2&page=1");
+    const p2 = await list(ceo.token, "limit=2&page=2");
+    const p3 = await list(ceo.token, "limit=2&page=3");
+    expect([...order(p1), ...order(p2), ...order(p3)]).toEqual([
+      "Co A", "Co B", "Co C", "Co D", "Co E",
+    ]);
+    expect(p1.body.pagination).toMatchObject({ page: 1, limit: 2, total: 5, totalPages: 3 });
+  });
+});
+
+describe("GET /clients?assignee=&accountantRole= — an accountant's primary and secondary clients", () => {
+  it("splits one accountant's clients for the CEO", async () => {
+    const { ceo, ann, ben, mk } = await setup();
+    await mk("Primary Two", [ann], { allocatedAccountant: ann.user._id });
+    await mk("Primary One", [ann, ben], { allocatedAccountant: ann.user._id });
+    await mk("Secondary B", [ann, ben], { allocatedAccountant: ben.user._id });
+    await mk("Secondary A", [ben, ann], { allocatedAccountant: ben.user._id });
+    await mk("Bens Only", [ben], { allocatedAccountant: ben.user._id });
+
+    const q = (role: string) =>
+      list(ceo.token, `assignee=${ann.user._id}&accountantRole=${role}`);
+    const primary = await q("primary");
+    const secondary = await q("secondary");
+    expect(primary.body.data.clients.map((c: any) => c.name)).toEqual([
+      "Primary One",
+      "Primary Two",
+    ]);
+    expect(secondary.body.data.clients.map((c: any) => c.name)).toEqual([
+      "Secondary A",
+      "Secondary B",
+    ]);
+    expect(secondary.body.pagination.total).toBe(2);
+  });
+
+  it("leaves out prospects still in the sales pipeline", async () => {
+    const { ceo, ann, mk } = await setup();
+    await mk("Won", [ann], { allocatedAccountant: ann.user._id, isSalesLead: true, salesStage: "won" });
+    await mk("Prospect", [ann], { allocatedAccountant: ann.user._id, isSalesLead: true, salesStage: "in_discussion" });
+    const res = await list(ceo.token, `assignee=${ann.user._id}&accountantRole=primary`);
+    expect(names(res)).toEqual(["Won"]);
+  });
+
+  it("lets a supervisor see a team member's split but not an outsider's", async () => {
+    const { sup, ann, outsider, mk } = await setup();
+    await mk("Anns", [ann], { allocatedAccountant: ann.user._id });
+    await mk("Outsiders", [outsider], { allocatedAccountant: outsider.user._id });
+    const ok = await list(sup.token, `assignee=${ann.user._id}&accountantRole=primary`);
+    expect(ok.status).toBe(200);
+    expect(names(ok)).toEqual(["Anns"]);
+    const no = await list(sup.token, `assignee=${outsider.user._id}&accountantRole=primary`);
+    expect(no.status).toBe(403);
+  });
+
+  it("without ?assignee= still means the caller's own split", async () => {
+    const { ann, ben, mk } = await setup();
+    await mk("Mine", [ann], { allocatedAccountant: ann.user._id });
+    await mk("Bens", [ben], { allocatedAccountant: ben.user._id });
+    const res = await list(ann.token, "accountantRole=primary");
+    expect(names(res)).toEqual(["Mine"]);
   });
 });
