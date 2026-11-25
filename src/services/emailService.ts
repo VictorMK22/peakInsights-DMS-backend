@@ -607,7 +607,6 @@ export async function sendDirectUserEmail(
   const {
     toEmail,
     ccEmails,
-    toName,
     fromName = "A colleague",
     fromEmail,
     subject,
@@ -648,17 +647,14 @@ export async function sendDirectUserEmail(
       </div>`
     : "";
 
-  const attachmentNote = attachments?.length
-    ? p(
-        "<strong>Attachments:</strong> " +
-          attachments.map((a) => escapeHtml(a.filename)).join(", "),
-      )
-    : "";
-
+  // Plain new messages carry no "New message for …" banner; the
+  // From/Cc/attachment lines are also omitted because the real email
+  // headers and attachments already convey them.
   const heading = broadcast
     ? "Announcement from " + senderLine
-    : (quoted ? "Reply from " : "New message for ") +
-      (quoted ? senderLine : (toName ?? "you"));
+    : quoted
+      ? "Reply from " + senderLine
+      : "";
 
   const result = await send(
     toEmail,
@@ -666,13 +662,9 @@ export async function sendDirectUserEmail(
     wrap(
       broadcast ? "Announcement" : quoted ? "New Reply" : "New Email Message",
       `
-      ${h1(heading)}
-      ${quoted || broadcast ? "" : p("<strong>From:</strong> " + senderLine)}
-      ${ccEmails?.length ? p("<strong>Cc:</strong> " + ccEmails.map(escapeHtml).join(", ")) : ""}
+      ${heading ? h1(heading) : ""}
       ${p(safeBody)}
-      ${attachmentNote}
       ${quoteBlock}
-      ${highlight("Reply directly to respond to the sender.")}
     `,
     ),
     // Reply-To is the real PeakInsights user, so a reply from the
