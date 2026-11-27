@@ -33,6 +33,7 @@ import shareRoutes from "./routes/share";
 import filesRoutes from "./routes/files";
 import departmentRoutes from "./routes/departments";
 import trashRoutes from "./routes/trash";
+import settingsRoutes from "./routes/settings";
 import learningCategoryRoutes from "./routes/learningCategories";
 import meetingRoutes from "./routes/meetings";
 import meetingRsvpRoutes from "./routes/meetingRsvp";
@@ -190,6 +191,7 @@ app.use("/api", shareRoutes);
 app.use("/api/files", filesRoutes);
 app.use("/api/departments", departmentRoutes);
 app.use("/api/trash", trashRoutes);
+app.use("/api/settings", settingsRoutes);
 app.use("/api/learning-categories", learningCategoryRoutes);
 app.use("/api/meetings", meetingRoutes);
 // Public — token-authorised Accept / Decline links from invitation emails

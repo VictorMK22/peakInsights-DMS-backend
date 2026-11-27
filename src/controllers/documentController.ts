@@ -41,6 +41,7 @@ import { DocumentModel } from "../models/Document";
 import { SupervisorMapping } from "../models/SupervisorMapping";
 import { ClientModel } from "../models/Client";
 import { canAccess as canAccessClient } from "./clientController";
+import { buildDeletePolicy } from "../utils/documentDeletionPolicy";
 import { ClientFolderModel } from "../models/ClientFolder";
 import { TaskModel } from "../models/Task";
 import { createAuditLog } from "../utils/auditLogger";
@@ -241,20 +242,13 @@ const canModify = (
 };
 
 /**
- * Deleting is stricter than editing: accountants can never delete
- * documents (trash, permanent or bulk) — only the CEO can. Everything
- * else falls back to the normal owner/CEO rule in canModify.
+ * Deleting has its own rule, separate from canModify: see
+ * utils/documentDeletionPolicy.ts (CEO always; Tech supervisors their own;
+ * everyone else only while the company-wide switch is on, and then their own
+ * documents or those of clients they are assigned to). It is async because it
+ * reads the switch and the client assignments, so handlers build a policy
+ * once with buildDeletePolicy() and test documents against it.
  */
-const ACCOUNTANT_DELETE_MESSAGE =
-  "Accountants can't delete documents — only the CEO can";
-export const canDelete = (
-  doc: { ownerId: mongoose.Types.ObjectId | string; documentType?: string },
-  userId: string,
-  role: string,
-): boolean => {
-  if (role === "accountant") return false;
-  return canModify(doc, userId, role);
-};
 
 /**
  * Replaces a document's fileUrl with a freshly-signed, short-lived
@@ -1527,7 +1521,7 @@ export const patchDocumentContent = async (
 // ─────────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────
 // TRASH DOCUMENT (soft delete)
-// Owner or CEO; moves the document to Trash. The physical file is
+// Allowed per documentDeletionPolicy; moves the document to Trash. The physical file is
 // left on disk untouched — it's only removed by
 // permanentlyDeleteDocument or when Trash is emptied.
 // ─────────────────────────────────────────────────────────────────
@@ -1543,14 +1537,9 @@ export const deleteDocument = async (
       return;
     }
 
-    if (!canDelete(doc, req.user!.userId, req.user!.role)) {
-      res.status(403).json({
-        success: false,
-        message:
-          req.user!.role === "accountant"
-            ? ACCOUNTANT_DELETE_MESSAGE
-            : "Only the owner or CEO can delete this document",
-      });
+    const policy = await buildDeletePolicy(req.user!, [doc]);
+    if (!policy.canDelete(doc)) {
+      res.status(403).json({ success: false, message: policy.reasonFor(doc) });
       return;
     }
 
@@ -1655,14 +1644,11 @@ export const permanentlyDeleteDocument = async (
       res.status(404).json({ success: false, message: "Document not found" });
       return;
     }
-    if (!canDelete(doc, req.user!.userId, req.user!.role)) {
-      res.status(403).json({
-        success: false,
-        message:
-          req.user!.role === "accountant"
-            ? ACCOUNTANT_DELETE_MESSAGE
-            : "Only the owner or CEO can delete this document",
-      });
+    const policy = await buildDeletePolicy(req.user!, [doc], {
+      permanent: true,
+    });
+    if (!policy.canDelete(doc)) {
+      res.status(403).json({ success: false, message: policy.reasonFor(doc) });
       return;
     }
     if (!doc.isDeleted) {
@@ -1803,7 +1789,7 @@ export const copyDocument = async (
 
 // ─────────────────────────────────────────────────────────────────
 // BULK DELETE DOCUMENTS (moves to Trash)
-// Same rule as single delete (owner or CEO), applied per-document.
+// Same rule as single delete (see documentDeletionPolicy), applied per-document.
 // Items the requester can't modify or that don't exist are skipped
 // and reported back in `failed` rather than failing the whole batch —
 // a multi-select delete shouldn't abort just because one item in the
@@ -1835,9 +1821,10 @@ export const bulkDeleteDocuments = async (
       if (!foundIds.has(id)) failed.push({ id, reason: "not_found" });
     }
 
+    const policy = await buildDeletePolicy(req.user!, docs);
     const now = new Date();
     for (const doc of docs) {
-      if (!canDelete(doc, req.user!.userId, req.user!.role)) {
+      if (!policy.canDelete(doc)) {
         failed.push({ id: String(doc._id), reason: "forbidden" });
         continue;
       }

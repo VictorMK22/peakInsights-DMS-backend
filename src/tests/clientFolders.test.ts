@@ -6,6 +6,7 @@ import { createUserWithToken } from "./helpers/fixtures";
 import { ClientModel } from "../models/Client";
 import { ClientFolderModel } from "../models/ClientFolder";
 import { DocumentModel } from "../models/Document";
+import { AppSettingModel } from "../models/AppSetting";
 
 beforeAll(async () => {
   await startTestDb();
@@ -17,7 +18,16 @@ afterEach(async () => {
   await ClientModel.deleteMany({});
   await ClientFolderModel.deleteMany({});
   await DocumentModel.deleteMany({});
+  await AppSettingModel.deleteMany({});
 });
+
+// Regular users can only delete while the company-wide switch is on.
+const userDelete = (on: boolean) =>
+  AppSettingModel.findOneAndUpdate(
+    { key: "documentDeletion" },
+    { $set: { value: { userDeleteEnabled: on } } },
+    { upsert: true },
+  );
 
 const auth = (token: string) => ({ Authorization: `Bearer ${token}` });
 
@@ -247,25 +257,47 @@ describe("client document folders — delete together with documents", () => {
     expect(JSON.stringify(list.body)).not.toMatch(/"title":"a"|"title":"b"/);
   });
 
-  it("only trashes what the caller may delete; the rest returns to the main list", async () => {
+  it("switch ON: an assigned user trashes the folder's documents, including a colleague's", async () => {
+    await userDelete(true);
     const { rep, colleague, client, doc, createFolder } = await setup();
     const id = (await createFolder(rep, "Mixed")).body.data.folder._id;
     const mine = await doc(rep, "mine");
-    const theirs = await doc(colleague, "theirs"); // someone else's document
+    const theirs = await doc(colleague, "theirs"); // same client, rep is assigned
     await inFolder(mine, id);
     await inFolder(theirs, id);
 
     const res = await del(client._id, id, rep, true);
     expect(res.status).toBe(200);
-    expect(res.body.data).toMatchObject({ trashedDocuments: 1, releasedDocuments: 1 });
-
+    expect(res.body.data).toMatchObject({ trashedDocuments: 2, releasedDocuments: 0 });
     expect((await DocumentModel.findById(mine._id))?.isDeleted).toBe(true);
-    const kept = await DocumentModel.findById(theirs._id);
-    expect(kept?.isDeleted).not.toBe(true);
-    expect(kept?.clientFolderId).toBeUndefined();
+    expect((await DocumentModel.findById(theirs._id))?.isDeleted).toBe(true);
   });
 
-  it("accountants can never delete documents this way", async () => {
+  it("switch OFF: regular users trash nothing; documents return to the main list", async () => {
+    await userDelete(false);
+    const { rep, client, doc, createFolder } = await setup();
+    const id = (await createFolder(rep, "Mine")).body.data.folder._id;
+    const own = await doc(rep, "own");
+    await inFolder(own, id);
+
+    const res = await del(client._id, id, rep, true);
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ trashedDocuments: 0, releasedDocuments: 1 });
+    expect((await DocumentModel.findById(own._id))?.isDeleted).not.toBe(true);
+  });
+
+  it("switch OFF: the CEO can still trash everything", async () => {
+    await userDelete(false);
+    const { ceo, rep, client, doc, createFolder } = await setup();
+    const id = (await createFolder(ceo, "CEO")).body.data.folder._id;
+    const theirs = await doc(rep, "theirs");
+    await inFolder(theirs, id);
+    const res = await del(client._id, id, ceo, true);
+    expect(res.body.data).toMatchObject({ trashedDocuments: 1, releasedDocuments: 0 });
+  });
+
+  it("switch ON: accountants can trash documents (recoverable) on their client", async () => {
+    await userDelete(true);
     const { colleague, client, doc, createFolder } = await setup();
     const id = (await createFolder(colleague, "Mine")).body.data.folder._id;
     const own = await doc(colleague, "own");
@@ -273,8 +305,8 @@ describe("client document folders — delete together with documents", () => {
 
     const res = await del(client._id, id, colleague, true);
     expect(res.status).toBe(200);
-    expect(res.body.data).toMatchObject({ trashedDocuments: 0, releasedDocuments: 1 });
-    expect((await DocumentModel.findById(own._id))?.isDeleted).not.toBe(true);
+    expect(res.body.data).toMatchObject({ trashedDocuments: 1, releasedDocuments: 0 });
+    expect((await DocumentModel.findById(own._id))?.isDeleted).toBe(true);
   });
 
   it("without the flag nothing changes: documents are released, not trashed", async () => {
@@ -341,6 +373,7 @@ describe("client documents — bulk move and delete", () => {
       (await bulk(client._id, "bulk-move", rep, { docIds: [mine._id], folderId: foreignFolder })).status,
     ).toBe(404);
 
+    await userDelete(true);
     const res = await bulk(client._id, "bulk-delete", rep, { docIds: [mine._id, foreign._id] });
     expect(res.body.data).toMatchObject({ trashed: 1, notFound: 1 });
     expect((await DocumentModel.findById(foreign._id))?.isDeleted).not.toBe(true);
@@ -354,25 +387,33 @@ describe("client documents — bulk move and delete", () => {
     expect((await DocumentModel.findById(a._id))?.isDeleted).not.toBe(true);
   });
 
-  it("moves documents to Trash (recoverable); accountants and non-owners are skipped", async () => {
+  it("switch ON: assigned users trash documents on their client (recoverable)", async () => {
+    await userDelete(true);
     const { ceo, rep, colleague, client, doc } = await setup();
     const mine = await doc(rep, "mine");
-    const other = await doc(ceo, "other");
+    const other = await doc(ceo, "other"); // not rep's upload, but rep is assigned
     const res = await bulk(client._id, "bulk-delete", rep, { docIds: [mine._id, other._id] });
     expect(res.status).toBe(200);
-    expect(res.body.data).toMatchObject({ trashed: 1, skippedNotAllowed: 1 });
+    expect(res.body.data).toMatchObject({ trashed: 2, skippedNotAllowed: 0 });
     const gone = await DocumentModel.findById(mine._id);
     expect(gone?.isDeleted).toBe(true);
-    expect(gone?.deletedBy).toBeDefined();
-    expect((await DocumentModel.findById(other._id))?.isDeleted).not.toBe(true);
+    expect(gone?.deletedBy).toBeDefined(); // in Trash, not destroyed
 
     const own = await doc(colleague, "acc");
     const acc = await bulk(client._id, "bulk-delete", colleague, { docIds: [own._id] });
-    expect(acc.body.data).toMatchObject({ trashed: 0, skippedNotAllowed: 1 });
-    expect((await DocumentModel.findById(own._id))?.isDeleted).not.toBe(true);
+    expect(acc.body.data).toMatchObject({ trashed: 1, skippedNotAllowed: 0 });
+  });
 
-    const list = await request(app).get(`/api/clients/${client._id}/documents`).set(auth(ceo.token));
-    expect(JSON.stringify(list.body)).not.toMatch(/"title":"mine"/);
+  it("switch OFF: regular users are skipped; the CEO is not", async () => {
+    await userDelete(false);
+    const { ceo, rep, client, doc } = await setup();
+    const mine = await doc(rep, "mine");
+    const blocked = await bulk(client._id, "bulk-delete", rep, { docIds: [mine._id] });
+    expect(blocked.body.data).toMatchObject({ trashed: 0, skippedNotAllowed: 1 });
+    expect((await DocumentModel.findById(mine._id))?.isDeleted).not.toBe(true);
+
+    const allowed = await bulk(client._id, "bulk-delete", ceo, { docIds: [mine._id] });
+    expect(allowed.body.data).toMatchObject({ trashed: 1 });
   });
 
   it("the CEO can trash anyone's documents", async () => {

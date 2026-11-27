@@ -1,3 +1,8 @@
+import {
+  buildDeletePolicy,
+  isTechSupervisorUser,
+  USER_DELETE_OFF_MESSAGE,
+} from "../utils/documentDeletionPolicy";
 import { Response } from "express";
 import { AuthRequest } from "../types/auth";
 import { FolderModel } from "../models/Folder";
@@ -551,11 +556,21 @@ export const deleteFolderRecursive = async (
   res: Response,
 ) => {
   try {
-    if (req.user!.role === "accountant")
-      return res.status(403).json({
-        success: false,
-        message: "Accountants can't delete folders — only the CEO can",
-      });
+    {
+      const actor = req.user!;
+      if (actor.role !== "ceo") {
+        const policy = await buildDeletePolicy(actor, []);
+        // Tech supervisors always may (their own folders); everyone else
+        // only while the company-wide switch is on.
+        if (
+          !policy.userDeleteEnabled &&
+          !(await isTechSupervisorUser(actor.userId, actor.role))
+        )
+          return res
+            .status(403)
+            .json({ success: false, message: USER_DELETE_OFF_MESSAGE });
+      }
+    }
     const { folderId } = req.params;
     const folder = await FolderModel.findById(folderId);
     if (!folder) return res.status(404).json({ success: false });
@@ -708,6 +723,21 @@ export const permanentlyDeleteFolder = async (
         success: false,
         message: "Accountants can't delete folders — only the CEO can",
       });
+    {
+      const actor = req.user!;
+      if (actor.role !== "ceo") {
+        const policy = await buildDeletePolicy(actor, []);
+        // Tech supervisors always may (their own folders); everyone else
+        // only while the company-wide switch is on.
+        if (
+          !policy.userDeleteEnabled &&
+          !(await isTechSupervisorUser(actor.userId, actor.role))
+        )
+          return res
+            .status(403)
+            .json({ success: false, message: USER_DELETE_OFF_MESSAGE });
+      }
+    }
     const { folderId } = req.params;
     const folder = await FolderModel.findById(folderId);
     if (!folder) return res.status(404).json({ success: false });
@@ -912,11 +942,21 @@ export const copyFolder = async (req: AuthRequest, res: Response) => {
 // ─────────────────────────────────────────────────────────────────
 export const bulkDeleteFolders = async (req: AuthRequest, res: Response) => {
   try {
-    if (req.user!.role === "accountant")
-      return res.status(403).json({
-        success: false,
-        message: "Accountants can't delete folders — only the CEO can",
-      });
+    {
+      const actor = req.user!;
+      if (actor.role !== "ceo") {
+        const policy = await buildDeletePolicy(actor, []);
+        // Tech supervisors always may (their own folders); everyone else
+        // only while the company-wide switch is on.
+        if (
+          !policy.userDeleteEnabled &&
+          !(await isTechSupervisorUser(actor.userId, actor.role))
+        )
+          return res
+            .status(403)
+            .json({ success: false, message: USER_DELETE_OFF_MESSAGE });
+      }
+    }
     const { folderIds } = req.body as { folderIds?: string[] };
     if (!Array.isArray(folderIds) || folderIds.length === 0) {
       res

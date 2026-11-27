@@ -7,7 +7,8 @@ import { DocumentModel } from "../models/Document";
 import { canAccess } from "./clientController";
 import { logClientActivity } from "../utils/clientAudit";
 import { createAuditLog } from "../utils/auditLogger";
-import { canDelete, invalidateCache } from "./documentController";
+import { invalidateCache } from "./documentController";
+import { buildDeletePolicy } from "../utils/documentDeletionPolicy";
 
 /**
  * Folders inside a client's Documents tab. Everyone with access to the client
@@ -229,7 +230,7 @@ export const renameClientFolder = async (req: AuthRequest, res: Response) => {
 // DELETE /clients/:id/folders/:folderId[?deleteDocuments=true]
 // By default the documents inside go back to the client's main list.
 // With deleteDocuments=true, the documents the caller may delete (the owner or
-// the CEO — never an accountant) are moved to Trash; any the caller may NOT
+// the CEO, or anyone assigned to the client while deletion is switched on) are moved to Trash; any the caller may NOT
 // delete are returned to the main list rather than destroyed or left hidden.
 export const deleteClientFolder = async (req: AuthRequest, res: Response) => {
   try {
@@ -264,10 +265,11 @@ export const deleteClientFolder = async (req: AuthRequest, res: Response) => {
         clientId: req.params.id,
         clientFolderId: folder._id,
         isDeleted: { $ne: true },
-      }).select("_id ownerId documentType");
+      }).select("_id ownerId documentType clientId");
 
+      const policy = await buildDeletePolicy({ userId, role }, inFolder);
       trashedIds = inFolder
-        .filter((d) => canDelete(d, userId, role))
+        .filter((d) => policy.canDelete(d))
         .map((d) => d._id as mongoose.Types.ObjectId);
 
       if (trashedIds.length) {
@@ -494,7 +496,7 @@ export const bulkMoveClientDocuments = async (req: AuthRequest, res: Response) =
 
 // POST /clients/:id/documents/bulk-delete   { docIds: string[] }
 // Moves documents to Trash (recoverable) using the normal delete rule: the owner
-// or the CEO, never an accountant. Others are skipped and counted.
+// (see utils/documentDeletionPolicy). Others are skipped and counted.
 export const bulkDeleteClientDocuments = async (req: AuthRequest, res: Response) => {
   try {
     if (!(await requireClientAccess(req, res))) return;
@@ -509,10 +511,11 @@ export const bulkDeleteClientDocuments = async (req: AuthRequest, res: Response)
       _id: { $in: parsed.ids },
       clientId: req.params.id,
       isDeleted: { $ne: true },
-    }).select("title ownerId documentType");
+    }).select("title ownerId documentType clientId");
 
     const notFound = parsed.ids.length - docs.length;
-    const allowed = docs.filter((d) => canDelete(d, userId, role));
+    const policy = await buildDeletePolicy({ userId, role }, docs);
+    const allowed = docs.filter((d) => policy.canDelete(d));
     const skippedNotAllowed = docs.length - allowed.length;
 
     if (allowed.length > 0) {

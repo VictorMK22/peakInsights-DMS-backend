@@ -21,6 +21,11 @@ import { SupervisorMapping } from "../models/SupervisorMapping";
 import { createAuditLog } from "../utils/auditLogger";
 import { attachSignedUrlsToMany } from "./documentController";
 import { deleteFromS3 } from "../services/s3Storage";
+import {
+  buildDeletePolicy,
+  isTechSupervisorUser,
+  USER_DELETE_OFF_MESSAGE,
+} from "../utils/documentDeletionPolicy";
 
 // ─────────────────────────────────────────────────────────────────
 // GET TRASH
@@ -115,6 +120,19 @@ export const emptyTrash = async (req: AuthRequest, res: Response) => {
         message: "Accountants can't permanently delete — only the CEO can",
       });
     const userId = req.user!.userId;
+
+    // Regular users may only empty their Trash while deletion is switched
+    // on; the CEO and Tech supervisors are never affected by the switch.
+    if (req.user!.role !== "ceo") {
+      const policy = await buildDeletePolicy(req.user!, []);
+      if (
+        !policy.userDeleteEnabled &&
+        !(await isTechSupervisorUser(userId, req.user!.role))
+      )
+        return res
+          .status(403)
+          .json({ success: false, message: USER_DELETE_OFF_MESSAGE });
+    }
 
     const docs = await DocumentModel.find({
       ownerId: userId,
