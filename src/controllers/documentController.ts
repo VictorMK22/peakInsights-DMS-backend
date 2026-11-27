@@ -62,7 +62,7 @@ import {
   getSignedFileUrl,
 } from "../services/s3Storage";
 import { ensureStoredFile } from "../utils/missingFile";
-import path from "path";
+import { extractTextContent } from "../utils/extractTextContent";
 import {
   resolveFolderType,
   cloneDocumentRecord,
@@ -254,121 +254,6 @@ export const canDelete = (
 ): boolean => {
   if (role === "accountant") return false;
   return canModify(doc, userId, role);
-};
-
-/**
- * Best-effort text extraction at upload time, so the in-browser
- * content editor (patchDocumentContent) has something real to work
- * with right away instead of starting empty. Never throws — a failed
- * extraction just means contentText stays empty, it doesn't block
- * the upload itself.
- *
- * Covers: .txt/.md/.csv (plain text), .rtf (control-code stripped),
- * .docx (mammoth), .xlsx/.xls (xlsx — handles both formats), .pptx
- * (slide text via JSZip, since .pptx is just a zip of XML).
- * Deliberately NOT covered: PDFs (excluded by design), and legacy
- * binary .doc/.ppt (pre-XML Office formats — would need something
- * like LibreOffice/antiword to read at all, not worth the dependency
- * weight for a best-effort feature).
- */
-const extractTextContent = async (
-  fileBuffer: Buffer,
-  fileType: string,
-  originalName: string,
-): Promise<string | undefined> => {
-  const ext = path.extname(originalName).toLowerCase();
-
-  try {
-    // Plain text formats — mimetype detection for .md/.csv is
-    // inconsistent across browsers/OSes, so extension is checked too.
-    if (
-      fileType === "text/plain" ||
-      fileType === "text/markdown" ||
-      fileType === "text/csv" ||
-      [".txt", ".md", ".csv"].includes(ext)
-    ) {
-      return fileBuffer.toString("utf-8");
-    }
-
-    // RTF — strip control codes/groups for a rough plain-text read.
-    // Not a full RTF parser, but good enough to make the text searchable/editable.
-    if (
-      fileType === "application/rtf" ||
-      fileType === "text/rtf" ||
-      ext === ".rtf"
-    ) {
-      const raw = fileBuffer.toString("utf-8");
-      return raw
-        .replace(/\\par[d]?/g, "\n")
-        .replace(/\{\\[^{}]*\}/g, "")
-        .replace(/\\[a-zA-Z]+-?\d*/g, "")
-        .replace(/[{}]/g, "")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
-    }
-
-    // .docx
-    if (
-      fileType ===
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
-      ext === ".docx"
-    ) {
-      const mammoth = await import("mammoth");
-      const result = await mammoth.extractRawText({ buffer: fileBuffer });
-      return result.value;
-    }
-
-    // .xlsx / .xls — xlsx (SheetJS) reads both formats transparently.
-    // Every sheet's cells are flattened into rows of text.
-    if (
-      fileType ===
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
-      fileType === "application/vnd.ms-excel" ||
-      [".xlsx", ".xls"].includes(ext)
-    ) {
-      const XLSX = await import("xlsx");
-      const workbook = XLSX.read(fileBuffer, { type: "buffer" });
-      const sheetTexts = workbook.SheetNames.map((name) => {
-        const sheet = workbook.Sheets[name];
-        const csv = XLSX.utils.sheet_to_csv(sheet);
-        return `--- ${name} ---\n${csv}`;
-      });
-      return sheetTexts.join("\n\n");
-    }
-
-    // .pptx — a zip of XML; slide text lives in <a:t> runs inside
-    // ppt/slides/slideN.xml.
-    if (
-      fileType ===
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation" ||
-      ext === ".pptx"
-    ) {
-      const JSZip = (await import("jszip")).default;
-      const zip = await JSZip.loadAsync(fileBuffer);
-
-      const slideFiles = Object.keys(zip.files)
-        .filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name))
-        .sort((a, b) => {
-          const numA = Number(a.match(/slide(\d+)\.xml$/)?.[1] ?? 0);
-          const numB = Number(b.match(/slide(\d+)\.xml$/)?.[1] ?? 0);
-          return numA - numB;
-        });
-
-      const slideTexts = await Promise.all(
-        slideFiles.map(async (name, i) => {
-          const xml = await zip.files[name].async("string");
-          const text = [...xml.matchAll(/<a:t>([^<]*)<\/a:t>/g)]
-            .map((m) => m[1])
-            .join(" ");
-          return `--- Slide ${i + 1} ---\n${text}`;
-        }),
-      );
-      return slideTexts.join("\n\n");
-    }
-  } catch (err) {
-    console.error("extractTextContent failed (non-fatal):", err);
-  }
-  return undefined;
 };
 
 /**
@@ -684,6 +569,13 @@ export const createDocument = async (
           fileKey: file.filename,
           fileUrl,
           fileSize: file.size,
+          // Set only for direct-to-S3 uploads too big to extract inline
+          // (see services/documentDirectUpload.ts): "indexed" = searchable
+          // from a partial read, "pending" = background indexer will do it,
+          // "skipped" = not indexable.
+          indexState: (file as any).indexState,
+          indexedAt:
+            (file as any).indexState === "indexed" ? new Date() : undefined,
           modifiedBy: new mongoose.Types.ObjectId(req.user!.userId),
           modifiedAt: new Date(),
           priority:
@@ -699,11 +591,15 @@ export const createDocument = async (
           status: "draft",
         });
 
-        await enqueueDocumentProcessing({
-          documentId: doc._id.toString(),
-          fileKey: file.filename,
-          fileType: file.mimetype,
-        });
+        // Very large direct-to-S3 files are stored but not text-indexed
+        // (extraction needs the whole file in a serverless function's memory).
+        if (!(file as any).skipProcessing) {
+          await enqueueDocumentProcessing({
+            documentId: doc._id.toString(),
+            fileKey: file.filename,
+            fileType: file.mimetype,
+          });
+        }
         await invalidateCache(req.user!.userId);
         await createAuditLog({
           documentId: doc._id.toString(),
@@ -2027,6 +1923,23 @@ export const replaceFile = async (
       doc.modifiedBy = new mongoose.Types.ObjectId(req.user!.userId);
       doc.modifiedAt = new Date();
       if (extracted !== undefined) doc.contentText = extracted;
+
+      // Index bookkeeping for the new file (see services/documentDirectUpload.ts).
+      // An ordinary small replace carries no state, which clears any old one.
+      const idx = (req.file as any).indexState as
+        | "indexed"
+        | "pending"
+        | "skipped"
+        | undefined;
+      doc.indexState = idx;
+      doc.indexAttempts = 0;
+      if (idx === "pending" || idx === "skipped") {
+        // The old file's text no longer describes this file.
+        doc.contentText = "";
+        doc.indexedAt = undefined as any;
+      } else if (idx === "indexed") {
+        doc.indexedAt = new Date();
+      }
 
       await doc.save();
     } catch (err) {

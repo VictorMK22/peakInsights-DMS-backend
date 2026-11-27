@@ -65,6 +65,11 @@ export interface IClient extends Document {
   needsReallocation?: boolean;
   releasedAt?: Date;
   formerAssignees?: IFormerAssignee[];
+  // Monthly Management Accounts configuration. Every served client owes MAs
+  // by the 15th of each month unless the CEO/supervisor exempts them.
+  maRequired?: boolean; // default true; false = exempt / different frequency
+  maStartPeriod?: string; // "YYYY-MM" — first reporting month the client owes
+  maExemptReason?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -111,6 +116,9 @@ const ClientSchema = new Schema<IClient>(
     needsReallocation: { type: Boolean, default: false },
     releasedAt: { type: Date },
     formerAssignees: { type: [FormerAssigneeSchema], default: undefined },
+    maRequired: { type: Boolean, default: true },
+    maStartPeriod: { type: String, match: /^\d{4}-(0[1-9]|1[0-2])$/ },
+    maExemptReason: { type: String, trim: true },
   },
   { timestamps: true },
 );

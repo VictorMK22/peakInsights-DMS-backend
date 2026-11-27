@@ -28,6 +28,7 @@ import whatsappWebhookRoutes from "./routes/whatsappWebhook";
 import emailIntegrationRoutes from "./routes/emailIntegrationRoutes";
 import zohoCalendarRoutes from "./routes/zohoCalendarRoutes";
 import cronRoutes from "./routes/cron";
+import reportRoutes from "./routes/reports";
 import shareRoutes from "./routes/share";
 import filesRoutes from "./routes/files";
 import departmentRoutes from "./routes/departments";
@@ -184,6 +185,7 @@ app.use("/webhooks/whatsapp", whatsappWebhookRoutes);
 // Secret-protected (not user auth) — called by an external scheduler,
 // see routes/cron.ts and middleware/cronAuth.ts.
 app.use("/api/cron", cronRoutes);
+app.use("/api/reports", reportRoutes);
 app.use("/api", shareRoutes);
 app.use("/api/files", filesRoutes);
 app.use("/api/departments", departmentRoutes);

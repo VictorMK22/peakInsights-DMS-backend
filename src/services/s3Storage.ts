@@ -236,3 +236,26 @@ export async function headObject(
     throw err;
   }
 }
+
+/**
+ * Reads part of an object (inclusive byte range) — used to sniff a file's
+ * first / last bytes (e.g. the %PDF header) without downloading all of it.
+ * A negative `start` with no `end` reads the last `-start` bytes.
+ */
+export async function readObjectRange(
+  key: string,
+  start: number,
+  end?: number,
+): Promise<Buffer> {
+  const range =
+    start < 0 ? `bytes=${start}` : `bytes=${start}-${end ?? start + 1023}`;
+  const res = await s3.send(
+    new GetObjectCommand({ Bucket: BUCKET, Key: key, Range: range }),
+  );
+  const stream = res.Body as NodeJS.ReadableStream;
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}

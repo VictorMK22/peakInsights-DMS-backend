@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { authenticate, requireIctAccess } from "../middleware/auth";
 import { uploadToLocal } from "../middleware/upload";
+import { resolveAttachmentUploads } from "../services/documentDirectUpload";
 import {
   listDeployments,
   createDeployment,
@@ -22,6 +23,7 @@ router.put("/:id", updateDeployment);
 router.post(
   "/:id/attachments",
   uploadToLocal.any(),
+  resolveAttachmentUploads,
   makeAddAttachments(Deployment),
 );
 router.delete(

@@ -2,6 +2,8 @@ import { Request, Response } from "express";
 import { waitUntil } from "@vercel/functions";
 import { DocumentModel } from "../models/Document";
 import { processDocumentDirectly } from "../services/documentProcessor";
+import { EXTRACT_MAX_BYTES, sweepOrphanUploads } from "../services/documentDirectUpload";
+import { indexPendingLargeDocuments } from "../services/largeDocumentIndexer";
 import { syncAllConnectedMailboxes } from "../services/emailSyncService";
 import {
   runMeetingReminderSweep,
@@ -19,6 +21,7 @@ import {
 import { sendSalesWeeklyReportEmail } from "../services/emailService";
 import { sweepBookingRequests } from "../services/bookingService";
 import { scheduleErrorReport } from "../services/errorReportService";
+import { runMaDeadlineMonitor } from "../services/maTrackingService";
 
 // ═════════════════════════════════════════════════════════════════
 // These two endpoints replace the BullMQ-queued background jobs used
@@ -93,11 +96,32 @@ export const runDocumentRetrySweep = async (_req: Request, res: Response) => {
   const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
 
   try {
+    // This sweep loads each file fully into memory, so it only takes files
+    // small enough for that, and gives up on a file after 5 failed tries.
+    // Big files are indexed (or skipped) by runLargeDocumentIndex instead —
+    // without these filters it would re-download them forever.
     const stuck = await DocumentModel.find({
       fileKey: { $exists: true, $ne: "" },
-      $or: [
-        { status: "failed" },
-        { indexedAt: { $exists: false }, createdAt: { $lt: twoMinutesAgo } },
+      indexState: { $nin: ["pending", "indexed", "skipped", "failed"] },
+      $and: [
+        {
+          $or: [
+            { fileSize: { $exists: false } },
+            { fileSize: { $lte: EXTRACT_MAX_BYTES } },
+          ],
+        },
+        {
+          $or: [
+            { indexAttempts: { $exists: false } },
+            { indexAttempts: { $lt: 5 } },
+          ],
+        },
+        {
+          $or: [
+            { status: "failed" },
+            { indexedAt: { $exists: false }, createdAt: { $lt: twoMinutesAgo } },
+          ],
+        },
       ],
     })
       .select("_id fileKey fileType")
@@ -121,6 +145,40 @@ export const runDocumentRetrySweep = async (_req: Request, res: Response) => {
   } catch (err) {
     console.error("Cron document retry sweep failed:", err);
     res.status(500).json({ success: false, message: "Retry sweep failed" });
+  }
+};
+
+/**
+ * POST /api/cron/index-large-documents — call every ~10 minutes.
+ * Extracts searchable text for big .docx/.pptx/.xlsx uploads that were stored
+ * without it (indexState "pending"). Served by its own long-running function,
+ * see api/index-large.ts and vercel.json.
+ */
+export const runLargeDocumentIndex = async (_req: Request, res: Response) => {
+  try {
+    const summary = await indexPendingLargeDocuments({
+      maxDocs: 5,
+      budgetMs: 200_000,
+    });
+    res.json({ success: true, message: "Large-document indexing run completed", ...summary });
+  } catch (err) {
+    console.error("Cron large-document indexing failed:", err);
+    res.status(500).json({ success: false, message: "Large-document indexing failed" });
+  }
+};
+
+/**
+ * POST /api/cron/sweep-uploads — call hourly.
+ * Deletes S3 files that were uploaded straight from the browser but never
+ * attached to a document/task/ticket (see sweepOrphanUploads).
+ */
+export const runUploadSweep = async (_req: Request, res: Response) => {
+  try {
+    const summary = await sweepOrphanUploads();
+    res.json({ success: true, message: "Orphan upload sweep completed", ...summary });
+  } catch (err) {
+    console.error("Cron orphan upload sweep failed:", err);
+    res.status(500).json({ success: false, message: "Orphan upload sweep failed" });
   }
 };
 
@@ -226,5 +284,44 @@ export const runSalesWeeklyReport = async (_req: Request, res: Response) => {
     res
       .status(500)
       .json({ success: false, message: "Sales weekly report failed" });
+  }
+};
+
+/**
+ * POST /api/cron/ma-deadlines — call once a day (e.g. 06:00 EAT) or more often;
+ * it is idempotent. Creates the month's Management Accounts tracking rows,
+ * flags MAs still unsent after the 15th (Africa/Nairobi), keeps the hub
+ * alerts in step with the review workflow and notifies BOTH assigned
+ * accountants — once per day at most, with reminders spaced out.
+ * It needs no one to open a dashboard. Responds 500 if any client failed (the
+ * rest are still processed) so the scheduler/alerts notice.
+ */
+export const runMaDeadlines = async (_req: Request, res: Response) => {
+  try {
+    const summary = await runMaDeadlineMonitor();
+    if (summary.failures.length) {
+      scheduleErrorReport({
+        source: "server",
+        error: new Error(
+          `MA deadline monitor: ${summary.failures.length} failure(s): ${summary.failures[0].error}`,
+        ),
+        title: "Management Accounts deadline monitor had failures",
+        context: { kind: "cron", method: "POST", route: "/api/cron/ma-deadlines" },
+      });
+    }
+    res.status(summary.failures.length ? 500 : 200).json({
+      success: summary.failures.length === 0,
+      message: `MA monitor (${summary.period}): ${summary.alertsActive} active alert(s), ${summary.notificationsSent} notification(s), ${summary.failures.length} failure(s)`,
+      ...summary,
+    });
+  } catch (err) {
+    console.error("Cron MA deadline monitor failed:", err);
+    scheduleErrorReport({
+      source: "server",
+      error: err,
+      title: "Management Accounts deadline monitor failed",
+      context: { kind: "cron", method: "POST", route: "/api/cron/ma-deadlines" },
+    });
+    res.status(500).json({ success: false, message: "MA deadline monitor failed" });
   }
 };

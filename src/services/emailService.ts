@@ -156,6 +156,8 @@ async function send(
     fromName?: string;
     /** Send as this mailbox instead of the shared address. Caller must ensure its domain is verified in Resend. */
     fromAddress?: string;
+    /** Resend de-duplicates sends that share a key (safe retries / double clicks). */
+    idempotencyKey?: string;
   },
 ): Promise<SentMessageInfo | null> {
   const client = getClient();
@@ -182,7 +184,8 @@ async function send(
 
   try {
     // The Resend SDK reports API failures through `error` instead of throwing.
-    const { data, error } = await client.emails.send({
+    const { data, error } = await client.emails.send(
+      {
       from: buildFrom(opts?.fromName, opts?.fromAddress),
       to,
       cc: opts?.cc?.length ? opts.cc : undefined,
@@ -197,7 +200,9 @@ async function send(
         path: a.path,
         contentType: a.contentType,
       })),
-    });
+      },
+      opts?.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : undefined,
+    );
 
     if (error) {
       throw new Error(`${error.name}: ${error.message}`);
@@ -1436,4 +1441,164 @@ export async function sendErrorReportStatusEmail(
     html,
   );
   return sent !== null;
+}
+
+// ═════════════════════════════════════════════════════════════════
+// MANAGEMENT ACCOUNTS & REPORTS — client delivery + overdue notices
+// ═════════════════════════════════════════════════════════════════
+
+/**
+ * Why a report cannot be sent as the CEO. Callers surface `message` to the
+ * person who clicked Send; nothing is sent from any other identity.
+ */
+export class CeoSenderNotConfiguredError extends Error {
+  readonly code = "CEO_SENDER_NOT_CONFIGURED";
+  constructor(message: string) {
+    super(message);
+  }
+}
+
+const domainOf = (address: string) =>
+  address.slice(address.lastIndexOf("@") + 1).trim().toLowerCase();
+
+/**
+ * Domains the CEO's address may be on. Deliberately does NOT depend on
+ * MAIL_FROM_DOMAIN being set (setting it changes other flows, e.g. invites
+ * would start going out from individual mailboxes): the domain of
+ * MAIL_FROM_ADDRESS counts too, because the mail provider already sends from
+ * it successfully, i.e. it is a verified domain.
+ */
+function verifiedSenderDomains(): Set<string> {
+  const domains = new Set<string>();
+  if (MAIL_DOMAIN) domains.add(MAIL_DOMAIN);
+  const from = getDefaultFromAddress();
+  if (from.includes("@")) domains.add(domainOf(from));
+  return domains;
+}
+
+/**
+ * The CEO's official sending identity must be authorised: either an
+ * administrator named it explicitly (CEO_SENDER_EMAIL — `explicit`), or it is
+ * on a domain already verified with the mail provider. We refuse (rather than
+ * silently falling back to the shared address or to the supervisor's own
+ * address) when neither holds. If an explicit address is on a domain the
+ * provider has not verified, the provider rejects the send and the report
+ * shows "Delivery Failed" with its reason — nothing goes out from anyone else.
+ */
+export function assertCeoCanSendAs(
+  ceoEmail?: string | null,
+  opts: { explicit?: boolean } = {},
+): string {
+  const email = ceoEmail?.trim().toLowerCase();
+  if (!email || !email.includes("@")) {
+    throw new CeoSenderNotConfiguredError(
+      "The CEO's official email address is not set up. Set CEO_SENDER_EMAIL on the server (or make sure the CEO account has an email) before sending reports to clients.",
+    );
+  }
+  if (!opts.explicit && !verifiedSenderDomains().has(domainOf(email))) {
+    const known = [...verifiedSenderDomains()];
+    throw new CeoSenderNotConfiguredError(
+      `Sending as ${email} is not authorised: its domain is not a verified sending domain${known.length ? ` (${known.join(", ")})` : " (none is configured)"}. Set CEO_SENDER_EMAIL on the server to authorise the CEO's official address.`,
+    );
+  }
+  return email;
+}
+
+export interface ClientReportEmailOptions {
+  ceo: { name: string; email: string; title?: string };
+  toEmail: string;
+  toName?: string;
+  ccEmails: string[];
+  clientName: string;
+  reportLabel: string; // "Management Accounts"
+  periodLabel: string; // "October 2026"
+  subject: string;
+  attachments: MailAttachment[];
+  /** Same key => the provider will not deliver the same send twice. */
+  idempotencyKey: string;
+}
+
+/**
+ * The client-facing report email. Deliberately plain and professional — no
+ * Hub branding, no internal chatter — and sent from the CEO's own address
+ * (From and Reply-To), so it never looks like it came from the accountants or
+ * from the supervisor who pressed Send.
+ */
+export async function sendClientReportEmail(
+  o: ClientReportEmailOptions,
+): Promise<{ messageId: string; providerId?: string }> {
+  const fromEmail = assertCeoCanSendAs(o.ceo.email);
+
+  const greeting = o.toName?.trim()
+    ? `Dear ${esc(o.toName.trim())},`
+    : `Dear ${esc(o.clientName)} team,`;
+  const para = (t: string) =>
+    `<p style="margin:0 0 14px;font-size:15px;color:#1f2937;line-height:1.65;">${t}</p>`;
+  const signatureLines = [
+    `<strong>${esc(o.ceo.name)}</strong>`,
+    esc(o.ceo.title ?? "Chief Executive Officer"),
+    "PeakInsights",
+    `<a href="mailto:${esc(fromEmail)}" style="color:#0369a1;">${esc(fromEmail)}</a>`,
+  ].join("<br/>");
+
+  const html = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" /><title>${esc(o.subject)}</title></head>
+<body style="margin:0;padding:24px;background:#ffffff;font-family:'Segoe UI',Arial,sans-serif;">
+  <div style="max-width:620px;">
+    ${para(greeting)}
+    ${para(`I hope you are well. Please find attached the <strong>${esc(o.reportLabel)}</strong> for <strong>${esc(o.clientName)}</strong> for the period <strong>${esc(o.periodLabel)}</strong>.`)}
+    ${para("The approved report documents are attached to this email as PDF files. Please let us know if you would like us to take you through them or if you have any questions.")}
+    <p style="margin:24px 0 0;font-size:15px;color:#1f2937;line-height:1.6;">Kind regards,<br/><br/>${signatureLines}</p>
+  </div>
+</body></html>`;
+
+  const result = await send(
+    o.toEmail,
+    o.subject,
+    html,
+    fromEmail, // replies go to the CEO
+    undefined,
+    o.attachments,
+    {
+      cc: o.ccEmails,
+      throwOnError: true,
+      fromName: o.ceo.name,
+      fromAddress: fromEmail,
+      idempotencyKey: o.idempotencyKey,
+    },
+  );
+  if (!result?.messageId) throw new Error("Email send failed");
+  return { messageId: result.messageId, providerId: result.resendId };
+}
+
+/** Overdue Management Accounts notice to an assigned accountant. */
+export async function sendMaOverdueEmail(
+  to: string,
+  d: {
+    toName: string;
+    clientName: string;
+    periodLabel: string;
+    deadlineLabel: string; // "15 November 2026"
+    daysOverdue: number;
+    link: string;
+    reminder?: boolean;
+  },
+): Promise<boolean> {
+  const sent = await send(
+    to,
+    `${d.reminder ? "Reminder: " : ""}Overdue Management Accounts – ${d.clientName}`,
+    wrap(
+      "Overdue Management Accounts",
+      `
+      ${h1("Overdue Management Accounts – " + esc(d.clientName))}
+      ${p("Hi " + esc(d.toName) + ",")}
+      ${p(
+        `The Management Accounts for <strong>${esc(d.periodLabel)}</strong> were due on <strong>${esc(d.deadlineLabel)}</strong> and have not yet been sent to the client. They are now <strong>${d.daysOverdue} day${d.daysOverdue === 1 ? "" : "s"} overdue</strong>.`,
+      )}
+      ${p("Please complete the Management Accounts and submit them for review as soon as possible.")}
+      ${btn("Open Management Accounts", d.link, "#dc2626")}
+    `,
+    ),
+  );
+  return !!sent;
 }

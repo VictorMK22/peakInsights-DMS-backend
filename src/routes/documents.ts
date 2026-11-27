@@ -29,13 +29,20 @@ import {
   moveDocument,
   getDocumentActivity,
 } from "../controllers/documentController";
+import {
+  presignDocumentUploads,
+  resolveDocumentUploads,
+} from "../services/documentDirectUpload";
 
 const router = Router();
 router.use(authenticate);
 
 // ── Document ──────────────────────────────────────────────────────
 router.get("/", getDocuments);
-router.post("/", uploadToLocal.any(), createDocument);
+// Bigger-than-4.5MB files skip this API: presign → browser uploads to S3 →
+// POST here with `uploads` refs (resolveDirectUploads fills req.files).
+router.post("/uploads/presign", presignDocumentUploads);
+router.post("/", uploadToLocal.any(), resolveDocumentUploads, createDocument);
 router.post("/check-duplicates", checkDuplicateFilenames);
 // Must be registered before /:id so "type-counts" isn't consumed by it.
 router.get("/type-counts", getDocumentTypeCounts);
@@ -55,7 +62,13 @@ router.patch("/:id/star", toggleStarDocument);
 router.post("/:id/copy", copyDocument);
 
 // ── Replace file (no versioning) ─────────────────────────────────
-router.post("/:id/replace", uploadToLocal.single("file"), replaceFile);
+// Same direct-to-S3 path as create: send `uploads` instead of a `file` part.
+router.post(
+  "/:id/replace",
+  uploadToLocal.single("file"),
+  resolveDocumentUploads,
+  replaceFile,
+);
 
 // ── Comments ──────────────────────────────────────────────────────
 router.post("/:id/comments", createComment);

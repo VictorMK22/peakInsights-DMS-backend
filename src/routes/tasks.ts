@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { authenticate, authorize } from "../middleware/auth";
 import { uploadToLocal } from "../middleware/upload";
+import { resolveAttachmentUploads } from "../services/documentDirectUpload";
 import {
   createTask,
   getTasks,
@@ -61,7 +62,7 @@ router.delete("/:id/reminder", clearTaskReminder);
 router.get("/", getTasks);
 // CEO/Supervisor can upload briefing files when creating a task.
 // uploadToLocal.any() accepts any field name and any number of files.
-router.post("/", uploadToLocal.any(), createTask);
+router.post("/", uploadToLocal.any(), resolveAttachmentUploads, createTask);
 
 router.get("/:id", getTask);
 router.put("/:id", updateTask);

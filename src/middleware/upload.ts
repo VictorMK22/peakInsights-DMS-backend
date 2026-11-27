@@ -36,10 +36,9 @@ const fileFilter = (
 const multerUpload = multer({
   storage: memoryStorage,
   fileFilter,
-  limits: {
-    fileSize: 100 * 1024 * 1024, // 100 MB per file
-    files: 200, // max 200 files per request (folder uploads)
-  },
+  // No `limits`: neither file size nor file count is capped here. (Request
+  // bodies through Vercel are still capped at 4.5 MB by the platform — larger
+  // files go direct to S3, see services/documentDirectUpload.ts.)
 });
 
 /**

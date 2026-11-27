@@ -6,7 +6,16 @@
   "functions": {
     "api/index.ts": {
       "maxDuration": 60
+    },
+    "api/index-large.ts": {
+      "maxDuration": 300
     }
   },
-  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
+  "rewrites": [
+    {
+      "source": "/api/cron/index-large-documents",
+      "destination": "/api/index-large"
+    },
+    { "source": "/(.*)", "destination": "/api/index" }
+  ]
 }

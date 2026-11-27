@@ -7,6 +7,13 @@ export interface IDocument extends Document {
   description?: string;
   fileType: string;
   indexedAt: Date;
+  // Full-text indexing state for files too big to extract during the upload
+  // request. Unset for ordinary documents. "pending" is picked up by the
+  // background indexer (cron: index-large-documents); "indexed" has text
+  // (possibly from just the first part of a big text file); "skipped" is a
+  // file we can't or won't extract text from; "failed" exhausted its retries.
+  indexState?: "pending" | "indexed" | "skipped" | "failed";
+  indexAttempts?: number;
   contentText: string;
   // No versioning — a document has exactly one current file, which a
   // new upload replaces in place. Nothing is kept of the old file.
@@ -68,6 +75,11 @@ const DocumentSchema = new Schema<IDocument>(
     fileType: { type: String, required: true },
     contentText: { type: String },
     indexedAt: { type: Date },
+    indexState: {
+      type: String,
+      enum: ["pending", "indexed", "skipped", "failed"],
+    },
+    indexAttempts: { type: Number, default: 0 },
 
     documentType: {
       type: String,
@@ -137,6 +149,7 @@ const DocumentSchema = new Schema<IDocument>(
 DocumentSchema.index({ folderId: 1, createdAt: -1 });
 DocumentSchema.index({ clientId: 1, clientFolderId: 1, createdAt: -1 });
 DocumentSchema.index({ ownerId: 1, status: 1 });
+DocumentSchema.index({ indexState: 1, createdAt: 1 }, { sparse: true });
 DocumentSchema.index({ ownerId: 1, documentType: 1, createdAt: -1 });
 DocumentSchema.index({ supervisorId: 1, documentType: 1, createdAt: -1 });
 DocumentSchema.index({ documentType: 1, createdAt: -1 });

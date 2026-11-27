@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { authenticate, requireIctAccess } from "../middleware/auth";
 import { uploadToLocal } from "../middleware/upload";
+import { resolveAttachmentUploads } from "../services/documentDirectUpload";
 import {
   listTickets,
   createTicket,
@@ -24,6 +25,7 @@ router.post("/:id/notes", addTicketNote);
 router.post(
   "/:id/attachments",
   uploadToLocal.any(),
+  resolveAttachmentUploads,
   makeAddAttachments(Ticket),
 );
 router.delete("/:id/attachments/:attachmentId", makeRemoveAttachment(Ticket));

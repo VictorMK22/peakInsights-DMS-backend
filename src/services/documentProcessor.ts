@@ -30,7 +30,8 @@ export const processDocumentDirectly = async (
 
   try {
     const buffer = await downloadFromS3(fileKey);
-    const contentText = await extractDocumentText(buffer, fileType);
+    // Same Mongo 16 MB document ceiling as upload-time extraction.
+    const contentText = (await extractDocumentText(buffer, fileType)).slice(0, 2_000_000);
 
     await DocumentModel.findByIdAndUpdate(documentId, {
       contentText,
@@ -44,6 +45,8 @@ export const processDocumentDirectly = async (
     console.error(`❌ Inline processing failed for ${documentId}:`, err);
     await DocumentModel.findByIdAndUpdate(documentId, {
       status: "failed",
+      // Counted so the retry sweep gives up on a file that keeps failing.
+      $inc: { indexAttempts: 1 },
     }).catch(() => undefined);
     return false;
   }
