@@ -21,6 +21,12 @@ import { EmailIntegrationModel } from "../models/EmailIntegration";
 import { getAccountantSupervisorIds } from "../utils/accountantSupervisors";
 import mongoose, { PipelineStage } from "mongoose";
 import { logClientActivity } from "../utils/clientAudit";
+import { clientLabel } from "../utils/clientLabel";
+import {
+  allClientAddresses,
+  normalizeAdditionalEmails,
+  isValidEmail,
+} from "../utils/clientEmails";
 import * as XLSX from "xlsx";
 
 // ── helpers ───────────────────────────────────────────────────────
@@ -82,8 +88,6 @@ const servingOnly = async (
  * (that is who the firm works for), falling back to the contact person's name
  * for clients that have no company recorded.
  */
-const clientLabel = (c: { name: string; company?: string | null }): string =>
-  c.company?.trim() || c.name;
 
 /**
  * Emails a newly assigned accountant / supervisor. Best-effort: a mail
@@ -197,6 +201,14 @@ export const createClient = async (req: AuthRequest, res: Response) => {
     });
   try {
     const { name, email, phone, company, industry, address, notes } = req.body;
+    const emailLabel = String(req.body.emailLabel ?? "").trim().slice(0, 40);
+    if (email?.trim() && !isValidEmail(String(email).trim()))
+      return res
+        .status(400)
+        .json({ success: false, message: "Enter a valid email address" });
+    const extra = normalizeAdditionalEmails(req.body.additionalEmails, email);
+    if (extra.error)
+      return res.status(400).json({ success: false, message: extra.error });
     if (!name?.trim())
       return res
         .status(400)
@@ -215,6 +227,8 @@ export const createClient = async (req: AuthRequest, res: Response) => {
     const client = await ClientModel.create({
       name: name.trim(),
       email,
+      emailLabel: emailLabel || undefined,
+      additionalEmails: extra.value.length ? extra.value : undefined,
       phone,
       company,
       industry,
@@ -902,8 +916,32 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
     const { name, email, phone, company, industry, address, notes } = req.body;
 
     const before = await ClientModel.findById(req.params.id)
-      .select("name email phone company industry address notes")
+      .select(
+        "name email emailLabel additionalEmails phone company industry address notes",
+      )
       .lean();
+    if (!before) return res.status(404).json({ success: false });
+
+    if (email?.trim() && !isValidEmail(String(email).trim()))
+      return res
+        .status(400)
+        .json({ success: false, message: "Enter a valid email address" });
+    // Only touch the extra-address fields when the form actually sent them,
+    // so older callers that don't know about them can't wipe them.
+    const emailFields: Record<string, unknown> = {};
+    if (req.body.emailLabel !== undefined)
+      emailFields.emailLabel = String(req.body.emailLabel ?? "")
+        .trim()
+        .slice(0, 40);
+    if (req.body.additionalEmails !== undefined) {
+      const extra = normalizeAdditionalEmails(
+        req.body.additionalEmails,
+        email ?? before.email,
+      );
+      if (extra.error)
+        return res.status(400).json({ success: false, message: extra.error });
+      emailFields.additionalEmails = extra.value;
+    }
 
     const client = await ClientModel.findByIdAndUpdate(
       req.params.id,
@@ -911,6 +949,7 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
         $set: {
           name,
           email,
+          ...emailFields,
           phone,
           company,
           industry,
@@ -922,11 +961,20 @@ export const updateClient = async (req: AuthRequest, res: Response) => {
     ).populate("assignedTo", "name email role profilePicture");
     if (!client) return res.status(404).json({ success: false });
     const changes: Record<string, { from: unknown; to: unknown }> = {};
-    for (const k of ["name", "email", "phone", "company", "industry", "address", "notes"] as const) {
+    for (const k of ["name", "email", "emailLabel", "phone", "company", "industry", "address", "notes"] as const) {
       const from = (before as any)?.[k] ?? "";
       const to = (client as any)[k] ?? "";
       if (String(from) !== String(to)) changes[k] = { from, to };
     }
+    const addrList = (v: unknown) =>
+      ((v as { label: string; email: string }[] | undefined) ?? [])
+        .map((a) => `${a.label}: ${a.email}`)
+        .join(", ");
+    if (addrList(before.additionalEmails) !== addrList(client.additionalEmails))
+      changes.additionalEmails = {
+        from: addrList(before.additionalEmails),
+        to: addrList(client.additionalEmails),
+      };
     if (Object.keys(changes).length > 0)
       await logClientActivity(req, {
         clientId: client._id as mongoose.Types.ObjectId,
@@ -1698,7 +1746,7 @@ export const updateClientStage = async (req: AuthRequest, res: Response) => {
             .map((u) =>
               createNotification(
                 String(u._id),
-                `${client.name} was won${actor?.name ? ` by ${actor.name}` : ""} — allocate an accountant to serve them`,
+                `${clientLabel(client)} was won${actor?.name ? ` by ${actor.name}` : ""} — allocate an accountant to serve them`,
                 "client_won",
                 { clientId: String(client._id) },
               ),
@@ -1857,13 +1905,33 @@ export const sendClientEmail = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ success: false, message: "Access denied" });
 
     const client = await ClientModel.findById(req.params.id).select(
-      "email name",
+      "email emailLabel additionalEmails name company",
     );
     if (!client) return res.status(404).json({ success: false });
-    if (!client.email)
+    const addresses = allClientAddresses(client);
+    if (addresses.length === 0)
       return res
         .status(400)
         .json({ success: false, message: "Client has no email address" });
+
+    // ── To: all of the client's addresses, or only the ones picked ─────
+    // Only addresses already saved on the client are accepted (never
+    // free-typed ones), so this can't be used to mail arbitrary people.
+    // `toEmails` omitted = the main address, which is what this endpoint
+    // always did before a client could have several.
+    const requestedTo = [
+      ...new Set(parseIdList(req.body?.toEmails).map((e) => e.trim().toLowerCase())),
+    ].filter(Boolean);
+    const known = new Set(addresses.map((a) => a.email));
+    if (requestedTo.some((e) => !known.has(e)))
+      return res.status(400).json({
+        success: false,
+        message: "One or more recipients are not email addresses of this client",
+      });
+    const recipients = requestedTo.length
+      ? requestedTo
+      : [(addresses.find((a) => a.primary) ?? addresses[0]).email];
+    const toLine = recipients.join(", ");
 
     const { subject, body } = req.body as { subject: string; body: string };
     if (!subject?.trim())
@@ -1928,7 +1996,7 @@ export const sendClientEmail = async (req: AuthRequest, res: Response) => {
       direction: "outbound",
       subject: subject.trim(),
       body: body.trim(),
-      toEmail: client.email,
+      toEmail: toLine,
       cc: cc.length ? cc : undefined,
       attachments,
       status: "sent",
@@ -1939,7 +2007,9 @@ export const sendClientEmail = async (req: AuthRequest, res: Response) => {
     const sender = await User.findById(req.user!.userId).select("name email");
     try {
       await sendDirectUserEmail({
-        toEmail: client.email,
+        // nodemailer takes a comma-separated list; everyone is on one To line,
+        // so the client's people can reply-all to each other.
+        toEmail: toLine,
         ccEmails: cc.length ? cc.map((c) => c.email) : undefined,
         subject: subject.trim(),
         body: body.trim(),
@@ -1965,8 +2035,8 @@ export const sendClientEmail = async (req: AuthRequest, res: Response) => {
       clientName: client.name,
       category: "email",
       action: record.status === "failed" ? "email_failed" : "email_sent",
-      summary: `${record.status === "failed" ? "Failed to send" : "Sent"} email "${record.subject}" to ${client.email}`,
-      details: { subject: record.subject, to: client.email, attachments: attachments.length },
+      summary: `${record.status === "failed" ? "Failed to send" : "Sent"} email "${record.subject}" to ${toLine}`,
+      details: { subject: record.subject, to: recipients, attachments: attachments.length },
     });
     const populated = await record.populate(
       "authorId",

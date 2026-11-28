@@ -1,3 +1,4 @@
+import { clientLabel } from "../utils/clientLabel";
 import { Types } from "mongoose";
 import { ClientModel, IClient } from "../models/Client";
 import { User } from "../models/User";
@@ -523,7 +524,7 @@ export async function exemptMaPeriod(
   const who = await User.findById(actor.userId).select("name").lean();
   await notifyUsers(
     [period.primaryAccountantId, ...period.secondaryAccountantIds].filter(Boolean) as Id[],
-    `${who?.name ?? "A manager"} marked the ${period.periodLabel} Management Accounts for ${client.name} as not required: ${why.slice(0, 160)}`,
+    `${who?.name ?? "A manager"} marked the ${period.periodLabel} Management Accounts for ${clientLabel(client)} as not required: ${why.slice(0, 160)}`,
     "ma_period_exempted",
     { clientId: String(period.clientId), periodKey: period.periodKey, audience: "accountant" },
     actor.userId,
@@ -553,7 +554,7 @@ export async function reinstateMaPeriod(actor: Actor, periodId: string): Promise
   });
   await notifyUsers(
     [period.primaryAccountantId, ...period.secondaryAccountantIds].filter(Boolean) as Id[],
-    `The ${period.periodLabel} Management Accounts for ${client.name} are required again.`,
+    `The ${period.periodLabel} Management Accounts for ${clientLabel(client)} are required again.`,
     "ma_period_exempted",
     { clientId: String(period.clientId), periodKey: period.periodKey, audience: "accountant" },
     actor.userId,
@@ -642,7 +643,7 @@ export async function submitForReview(
   });
   if (updated.maPeriodId) await syncMaPeriod(updated.maPeriodId, now, actor.userId);
 
-  const label = `${reportLabel(updated)} – ${client.name} – ${updated.periodLabel}`;
+  const label = `${reportLabel(updated)} – ${clientLabel(client)} – ${updated.periodLabel}`;
   await Promise.all([
     notifyUsers(
       reviewers.map((r) => r._id),
@@ -701,7 +702,7 @@ export async function returnForCorrections(
   const client = await loadClient(s.clientId);
   await notifyUsers(
     accountantIds(updated),
-    `Returned for corrections: ${reportLabel(updated)} – ${client.name} – ${updated.periodLabel}. ${text.slice(0, 160)}`,
+    `Returned for corrections: ${reportLabel(updated)} – ${clientLabel(client)} – ${updated.periodLabel}. ${text.slice(0, 160)}`,
     "report_returned",
     baseMeta(updated, "accountant"),
   );
@@ -748,7 +749,7 @@ export async function approveReport(
   const client = await loadClient(s.clientId);
   await notifyUsers(
     accountantIds(updated),
-    `Approved: ${reportLabel(updated)} – ${client.name} – ${updated.periodLabel}. It is awaiting delivery to the client.`,
+    `Approved: ${reportLabel(updated)} – ${clientLabel(client)} – ${updated.periodLabel}. It is awaiting delivery to the client.`,
     "report_approved",
     baseMeta(updated, "accountant"),
   );
@@ -809,7 +810,7 @@ export async function reopenReport(
   const client = await loadClient(s.clientId);
   await notifyUsers(
     accountantIds(updated),
-    `Re-opened for corrections: ${reportLabel(updated)} – ${client.name} – ${updated.periodLabel}. ${text.slice(0, 160)}`,
+    `Re-opened for corrections: ${reportLabel(updated)} – ${clientLabel(client)} – ${updated.periodLabel}. ${text.slice(0, 160)}`,
     "report_returned",
     baseMeta(updated, "accountant"),
   );
@@ -1041,7 +1042,7 @@ export async function sendReportToClient(
   }
 
   const { cc } = await computeRecipients(s, client.email, actor.userId);
-  const subject = `${reportLabel(s)} – ${client.name} – ${s.periodLabel}`;
+  const subject = `${reportLabel(s)} – ${clientLabel(client)} – ${s.periodLabel}`;
 
   // ── Atomic claim ────────────────────────────────────────────────
   const now = new Date();
@@ -1223,7 +1224,7 @@ export async function sendReportToClient(
   if (updated.maPeriodId) await syncMaPeriod(updated.maPeriodId, sentAt, actor.userId);
   await notifyUsers(
     accountantIds(updated),
-    `Sent to client: ${reportLabel(updated)} – ${client.name} – ${updated.periodLabel}`,
+    `Sent to client: ${reportLabel(updated)} – ${clientLabel(client)} – ${updated.periodLabel}`,
     "report_sent",
     baseMeta(updated, "accountant"),
   );
@@ -1288,9 +1289,9 @@ export async function listReports(
     .limit(300)
     .lean();
   const clients = await ClientModel.find({ _id: { $in: rows.map((r) => r.clientId) } })
-    .select("name")
+    .select("name company")
     .lean();
-  const clientName = new Map(clients.map((c) => [String(c._id), c.name]));
+  const clientName = new Map(clients.map((c) => [String(c._id), clientLabel(c)]));
   const names = await userNames(
     rows.flatMap((r) => [r.primaryAccountantId, ...r.secondaryAccountantIds]),
   );
@@ -1383,7 +1384,7 @@ export async function getReportDetail(actor: Actor, id: string) {
     deliveryPreview = {
       to: r.to,
       cc: r.cc,
-      subject: `${reportLabel(s)} – ${client?.name ?? ""} – ${s.periodLabel}`,
+      subject: `${reportLabel(s)} – ${client ? clientLabel(client) : ""} – ${s.periodLabel}`,
     };
     try {
       const ceo = await getCeoSender();

@@ -220,12 +220,21 @@ async function syncOneMailbox(
   // Two lookups: known clients (external comms) and known staff (internal
   // comms) — this is the whole filter. Anything that matches neither is
   // unrelated personal mail and is never logged.
+  // A client can have several addresses (CEO, manager, HR…) — mail to or from
+  // any of them belongs to the same client thread.
   const clients = await ClientModel.find({
-    email: { $exists: true, $ne: "" },
-  }).select("email");
-  const clientByEmail = new Map(
-    clients.map((c) => [String(c.email).toLowerCase(), c._id]),
-  );
+    $or: [
+      { email: { $exists: true, $ne: "" } },
+      { "additionalEmails.0": { $exists: true } },
+    ],
+  }).select("email additionalEmails");
+  const clientByEmail = new Map<string, (typeof clients)[number]["_id"]>();
+  for (const c of clients) {
+    if (c.email) clientByEmail.set(String(c.email).toLowerCase(), c._id);
+    for (const a of c.additionalEmails ?? [])
+      if (a.email && !clientByEmail.has(a.email.toLowerCase()))
+        clientByEmail.set(a.email.toLowerCase(), c._id);
+  }
 
   const staff = await User.find({
     _id: { $ne: integration.userId },

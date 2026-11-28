@@ -139,6 +139,8 @@ function buildFrom(senderName?: string, fromAddress?: string): string {
 
 // ─── Helpers ──────────────────────────────────────────────────────
 const APP_URL = process.env.FRONTEND_URL ?? "http://localhost:5173";
+// Served from the frontend's /public folder (public/peakinsights-logo.png).
+const LOGO_URL = `${APP_URL.replace(/\/+$/, "")}/peakinsights-logo.png`;
 
 /** Send a single email. Never throws unless `throwOnError` — logs on failure. */
 async function send(
@@ -233,9 +235,10 @@ function wrap(title: string, body: string): string {
       <table width="600" cellpadding="0" cellspacing="0"
              style="background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08);">
         <tr>
-          <td style="background:linear-gradient(135deg,#0ea5e9,#7c3aed);padding:28px 32px;">
-            <p style="margin:0;font-size:22px;font-weight:700;color:#fff;letter-spacing:-.5px;">⚡ PeakInsights Hub</p>
-            <p style="margin:4px 0 0;font-size:13px;color:rgba(255,255,255,.75);">Business Operations Hub</p>
+          <td align="center" style="background:#ffffff;padding:28px 32px 18px;border-bottom:4px solid #7c3aed;">
+            <img src="${LOGO_URL}" alt="PeakInsights" width="190"
+                 style="display:block;margin:0 auto;width:190px;max-width:100%;height:auto;border:0;" />
+            <p style="margin:10px 0 0;font-size:13px;font-weight:600;letter-spacing:.6px;color:#475569;text-align:center;">Business Operations Hub</p>
           </td>
         </tr>
         <tr>

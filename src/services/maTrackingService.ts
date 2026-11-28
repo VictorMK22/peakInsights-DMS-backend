@@ -1,3 +1,4 @@
+import { clientLabel } from "../utils/clientLabel";
 import { Types } from "mongoose";
 import { ClientModel, IClient } from "../models/Client";
 import { User } from "../models/User";
@@ -233,13 +234,13 @@ export async function buildMaViews(
   if (!periods.length) return [];
   const [clients, subs] = await Promise.all([
     ClientModel.find({ _id: { $in: periods.map((p) => p.clientId) } })
-      .select("name")
+      .select("name company")
       .lean(),
     ReportSubmission.find({
       _id: { $in: periods.map((p) => p.submissionId).filter(Boolean) },
     }).lean(),
   ]);
-  const clientName = new Map(clients.map((c) => [String(c._id), c.name]));
+  const clientName = new Map(clients.map((c) => [String(c._id), clientLabel(c)]));
   const subById = new Map(subs.map((s) => [String(s._id), s]));
   const names = await nameMap(
     periods.flatMap((p) => [
@@ -490,7 +491,7 @@ export async function runMaDeadlineMonitor(
   const clientDocs = new Map(
     (
       await ClientModel.find({ _id: { $in: open.map((p) => p.clientId) } }).select(
-        "name maRequired maStartPeriod",
+        "name company maRequired maStartPeriod",
       )
     ).map((c) => [String(c._id), c]),
   );
@@ -517,7 +518,7 @@ export async function runMaDeadlineMonitor(
       if (!synced.alertActive) continue;
       summary.alertsActive++;
 
-      const result = await notifyOverdue(synced, client?.name ?? "Client", now);
+      const result = await notifyOverdue(synced, client ? clientLabel(client) : "Client", now);
       summary.notificationsSent += result.sent;
       summary.skippedDuplicates += result.skipped;
     } catch (err: any) {

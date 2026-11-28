@@ -527,7 +527,7 @@ export async function createBookingForLink(
   // Tie a confirmed meeting to a CRM client when this email is already one.
   const knownClient = link.requireApproval
     ? null
-    : await ClientModel.findOne({ email }).select("_id").lean();
+    : await ClientModel.findOne({ $or: [{ email }, { "additionalEmails.email": email }] }).select("_id").lean();
 
   // Verify-then-create must be ONE step per owner. Without the lock, two
   // people booking the same slot at the same instant can both pass the
@@ -744,7 +744,7 @@ export async function approveBookingRequest(
   const hostName = owner?.name ?? "Your host";
   // The link may have been edited or deleted since the request was made.
   const link = await BookingLinkModel.findById(req.linkId);
-  const knownClient = await ClientModel.findOne({ email: req.email }).select("_id").lean();
+  const knownClient = await ClientModel.findOne({ $or: [{ email: req.email }, { "additionalEmails.email": req.email }] }).select("_id").lean();
   const callType: CallType = req.callType ?? "video";
   const title = `${req.linkTitle} – ${req.name}${callTypeSuffix(callType)}`;
 
@@ -1032,7 +1032,7 @@ async function bookViaOffer(
   // An accepted offer keeps the kind of call the client originally asked for.
   const callType: CallType = offer.callType ?? "video";
   const title = `${offer.linkTitle} – ${input.name}${callTypeSuffix(callType)}`;
-  const knownClient = await ClientModel.findOne({ email }).select("_id").lean();
+  const knownClient = await ClientModel.findOne({ $or: [{ email }, { "additionalEmails.email": email }] }).select("_id").lean();
 
   let meeting: IMeeting;
   try {

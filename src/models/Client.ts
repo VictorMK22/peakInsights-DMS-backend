@@ -30,9 +30,20 @@ export interface IFormerAssignee {
   releasedAt: Date;
 }
 
+// An extra, labelled email address for the client (e.g. "CEO", "HR").
+export interface IClientEmailAddress {
+  label: string;
+  email: string;
+}
+
 export interface IClient extends Document {
   name: string;
   email?: string;
+  // What the main address is for (e.g. "CEO"); optional.
+  emailLabel?: string;
+  // More addresses for the same client — managers, HR, finance… An email sent
+  // from the hub can go to all of them or just the ones picked.
+  additionalEmails?: IClientEmailAddress[];
   phone?: string;
   company?: string;
   industry?: string;
@@ -94,10 +105,20 @@ const FormerAssigneeSchema = new Schema<IFormerAssignee>(
   { _id: false },
 );
 
+const ClientEmailAddressSchema = new Schema<IClientEmailAddress>(
+  {
+    label: { type: String, trim: true, default: "Other", maxlength: 40 },
+    email: { type: String, required: true, trim: true, lowercase: true },
+  },
+  { _id: false },
+);
+
 const ClientSchema = new Schema<IClient>(
   {
     name: { type: String, required: true, trim: true },
     email: { type: String, trim: true, lowercase: true },
+    emailLabel: { type: String, trim: true, maxlength: 40 },
+    additionalEmails: { type: [ClientEmailAddressSchema], default: undefined },
     phone: { type: String, trim: true },
     company: { type: String, trim: true },
     industry: { type: String, trim: true },
@@ -124,6 +145,7 @@ const ClientSchema = new Schema<IClient>(
 );
 
 ClientSchema.index({ createdBy: 1 });
+ClientSchema.index({ "additionalEmails.email": 1 });
 ClientSchema.index({ assignedTo: 1 });
 ClientSchema.index({ isSalesLead: 1, salesStage: 1 });
 ClientSchema.index({ salesStage: 1, allocatedAccountant: 1 });
